@@ -521,8 +521,13 @@ async fn client_mode(cmd: &str) -> Result<()> {
     let addr = format!("{}:{}", host, client_port);
     
     // Attempt connection loop (Connect -> Handshake -> if fail -> Bootstrap -> Retry)
+    // TODO: The bootstrap relies on evil-winrm, an interactive pentesting shell that never
+    // exits on its own and must be killed after a hardcoded timeout. For a definitive fix,
+    // replace evil-winrm with a native Rust WinRM crate (e.g. `winrs` or `winrm`) that
+    // executes the remote command and returns immediately, eliminating the arbitrary 15s
+    // timeout and the need to kill the local process.
     let mut attempt = 0;
-    let max_attempts = 2;
+    let max_attempts = 5;
     
     let mut socket = loop {
         attempt += 1;
@@ -683,7 +688,32 @@ async fn bootstrap_server() -> Result<()> {
         }
     }
 
+    // Poll for the server to come up instead of a fixed sleep.
+    // The remote process may take longer than 5s on slow disks, AV scans, or first boot.
+    // Try connecting every 2s for up to 30s before giving up.
     println!("Waiting for server to start...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    let host = env::var("WINBOAT_HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let client_port = env::var("WINBOAT_CLIENT_PORT")
+        .unwrap_or_else(|_| "47330".to_string());
+    let addr = format!("{}:{}", host, client_port);
+
+    let mut connected = false;
+    for i in 1..=15 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            TcpStream::connect(addr.as_str())
+        ).await;
+        if let Ok(Ok(_)) = result {
+            println!("Server is up (after {}s).", i * 2);
+            connected = true;
+            break;
+        }
+        println!("Server not ready yet, retrying ({}s elapsed)...", i * 2);
+    }
+    if !connected {
+        eprintln!("Warning: server did not come up within 30s after bootstrap.");
+    }
     Ok(())
 }
