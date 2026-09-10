@@ -168,9 +168,14 @@ Go on, click that star. You know you want to! 😉
 | Problem              | Possible Cause          | Solution |
 |-----------------------|--------------------------|-----------|
 | The command "hangs" | Zombie connection       | Ctrl+C and restart; the client will force a new bootstrap. |
-| Connection Refused    | Wrong port mapping     | Check with `docker ps` that port 47330 is open. |
+| Connection Refused    | Wrong port mapping     | Check with `docker ps` that port 47330 is open (local) or `nc -zv <host> 5330` (remote). |
 | "WINBOAT_EXE_PATH must be set" | .env file not found or wrong syntax | Verify that the .env file exists and uses double backslashes (`\\`) without quotes. Run with `--help` to see the message `[DEBUG] Loaded .env from: ...` |
 | .env parsing error   | Wrong syntax          | Use double backslashes (`\\`) for Windows paths and DO NOT use quotes. |
+| Bootstrap succeeds but client still can't connect | `WINBOAT_EXE_PATH` points to a non-existent file on the remote host | Run `Test-Path "<path>"` on the remote host via WinRM/PowerShell to verify the executable exists at the configured path. |
+| Bootstrap fails with "Connection refused" | WinRM not enabled on the remote host | Run `Enable-PSRemoting -Force` on the remote Windows host and open port 5985 in the firewall (`Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -RemoteAddress Any`). |
+| Bootstrap fails with auth error | Wrong user/domain format | Use the UPN format `user@domain` in `WINBOAT_USER` (e.g. `user@domain.com`). Avoid `DOMAIN\user` (backslash escaping issues in .env). |
+| Wrong .env loaded (points to `127.0.0.1`) | A stale `.env` exists in `target/release/` and takes precedence | Check the `[DEBUG] Loaded .env from: ...` line. If it points to `target/release/.env`, update that file too (or remove it to fall back to the project root `.env`). |
+| `WINBOAT_CLIENT_PORT` mismatch on remote host | Remote host doesn't use Docker port mapping | Set `WINBOAT_CLIENT_PORT` to the actual port the server listens on (default `5330`), not the Docker-mapped `47330`. |
 
 ### .env Loading Debug
 
