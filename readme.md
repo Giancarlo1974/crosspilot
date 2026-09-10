@@ -3,7 +3,9 @@
 
 ![Windows server running with .env configuration](docs/quickstart-images/header.png)
 
-WinBoat Bridge is an orchestration tool that allows a Linux system to run commands inside a virtualized Windows environment (WinBoat) transparently.
+WinBoat Bridge is an orchestration tool that allows a Linux system to run commands inside a Windows environment transparently.
+
+It was born for [WinBoat](https://github.com/Giancarlo1974/winboat) (a virtualized Windows container), but works with **any Windows machine** reachable over the network: a local Docker container, a VM, a bare-metal server, or a remote host on your LAN.
 
 Unlike standard solutions like SSH or WinRM (used only for bootstrap), WinBoat Bridge provides a direct and fast channel, ideal for Continuous Integration (CI) pipelines and test automation.
 
@@ -30,7 +32,7 @@ WINBOAT_LOG_PATH=C:\\Users\\gianca\\server.log
 
 Main parameters:
 - **WINBOAT_EXE_PATH**: Absolute path (on Windows side) where the server is located
-- **WINBOAT_HOST / PORT**: Address and port for bootstrap (WinRM)
+- **WINBOAT_HOST / PORT**: Address and port for bootstrap (WinRM). The same host is used by the client for the TCP bridge connection
 - **WINBOAT_CLIENT_PORT**: Port on the Linux system (Host) mapped to the container
 - **WINBOAT_SERVER_PORT**: Internal port of the Windows container that the server listens on
 
@@ -74,17 +76,22 @@ cargo build --release
 
 ## 3. Global Installation (Linux)
 
-To run winboat-bridge from any folder, create a symbolic link in the user binaries directory. Following the XDG standard, the correct directory is ~/.local/bin.
+Once you have compiled the Linux client (`cargo build --release`), copy the resulting binary into
+`~/.local/bin` so that the executable stays available even if you delete or move the repository later.
 
 ```bash
 # Create the directory if it doesn't exist
 mkdir -p ~/.local/bin
 
-# Create a symbolic link to the newly compiled binary
-ln -sf "$(pwd)/target/release/winboat-bridge" ~/.local/bin/winboat-bridge
+# Remove any stale symlink left over from previous attempts
+rm -f ~/.local/bin/winboat-bridge
+
+# Copy the freshly built binary into place with the correct permissions
+install -Dm755 target/release/winboat-bridge ~/.local/bin/winboat-bridge
 ```
 
-Note: Make sure ~/.local/bin is in your $PATH (check ~/.bashrc or ~/.zshrc).
+This guarantees `/home/gianca/.local/bin/winboat-bridge` is a real executable and avoids "required file not found"
+errors when the project directory disappears. Make sure `~/.local/bin` is in your `$PATH` (check `~/.bashrc` or `~/.zshrc`).
 
 ## 4. Docker Compose Integration
 
@@ -102,17 +109,51 @@ services:
 
 Once the .env file is configured, the Linux client will handle everything automatically (including starting the Windows server if it's off).
 
-Verify connection:
+### A. Local WinBoat container (default)
+
+Default configuration points to a local Docker-mapped WinBoat container (`127.0.0.1`):
 
 ```bash
 winboat-bridge -c "ipconfig"
 ```
 
-Run PowerShell script:
+Run a PowerShell script inside the container:
 
 ```bash
 winboat-bridge -c "powershell -File C:\Scripts\Setup-Test.ps1"
 ```
+
+### B. Remote Windows host
+
+Point `WINBOAT_HOST` to the remote machine and `WINBOAT_CLIENT_PORT` to the port the bridge server is listening on. Both the bootstrap (WinRM) and the TCP data channel use the same host, only the ports differ.
+
+`.env` for a remote host at `172.16.0.101`:
+
+```bash
+WINBOAT_HOST=172.16.0.101
+WINBOAT_PORT=5985              # WinRM port on the remote host (for bootstrap)
+WINBOAT_CLIENT_PORT=5330       # TCP bridge port on the remote host
+```
+
+Verify the connection to the remote host:
+
+```bash
+winboat-bridge -c "hostname"
+```
+
+Run a command on the remote Windows machine:
+
+```bash
+winboat-bridge -c "dir C:\Users"
+```
+
+Run a PowerShell script remotely:
+
+```bash
+winboat-bridge -c "powershell -File C:\Scripts\Setup-Test.ps1"
+```
+
+> **Note:** If the bridge server is already running on the remote host, the client connects directly. If it's down, the client will try to bootstrap it via WinRM using `WINBOAT_HOST`/`WINBOAT_PORT`/`WINBOAT_USER`/`WINBOAT_PASS` — make sure those credentials are valid for the remote machine.
 
 ## 6. Support the project (aka "The Star Section" ⭐)
 

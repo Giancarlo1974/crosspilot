@@ -512,10 +512,13 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
 }
 
 async fn client_mode(cmd: &str) -> Result<()> {
+    // Same host as bootstrap (WinRM): WINBOAT_HOST. Only the port differs.
+    let host = env::var("WINBOAT_HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
     // Port mapped on host: 47330 -> Container: 5330
     let client_port = env::var("WINBOAT_CLIENT_PORT")
         .unwrap_or_else(|_| "47330".to_string());
-    let addr = format!("127.0.0.1:{}", client_port); 
+    let addr = format!("{}:{}", host, client_port);
     
     // Attempt connection loop (Connect -> Handshake -> if fail -> Bootstrap -> Retry)
     let mut attempt = 0;
