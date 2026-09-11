@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
@@ -8,6 +8,13 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use std::env;
 use std::io::ErrorKind;
+use std::time::Duration;
+
+// Moduli del transfer file (vedi docs/transfer-spec.md).
+mod proto;
+mod path;
+mod verify;
+mod transfer;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -104,6 +111,20 @@ enum Commands {
         #[arg(short, long, default_value = "5330", help = "TCP port for server to listen on")]
         port: u16,
     },
+    /// Upload (put) di un file locale verso il server remoto (transfer delta stile rsync).
+    Put {
+        /// Path sorgente locale (Linux).
+        local_src: String,
+        /// Path destinazione remoto (Windows, es. C:\ci\app.exe).
+        remote_dst: String,
+    },
+    /// Download (get) di un file remoto verso un path locale (transfer delta stile rsync).
+    Get {
+        /// Path sorgente remoto (Windows, es. C:\ci\log.txt).
+        remote_src: String,
+        /// Path destinazione locale (Linux).
+        local_dst: String,
+    },
 }
 
 #[tokio::main]
@@ -198,27 +219,47 @@ async fn main() -> Result<()> {
     } else if let Some(cmd) = cli.cmd {
         client_mode(&cmd).await?;
     } else {
-        println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
-        println!("---------------------------------------------------------------");
-        println!("Usage:");
-        println!("  winboat-bridge --server          # Run in Server Mode (Windows side)");
-        println!("  winboat-bridge -c <COMMAND>      # Execute command remotely (Linux side)");
-        println!("");
-        println!("Examples:");
-        println!("  1. Check remote IP:");
-        println!("     winboat-bridge -c \"ipconfig\"");
-        println!("");
-        println!("  2. List remote directory:");
-        println!("     winboat-bridge -c \"dir C:\\Users\"");
-        println!("");
-        println!("  3. Run PowerShell script:");
-        println!("     winboat-bridge -c \"powershell -File C:\\Scripts\\test.ps1\"");
-        println!("");
-        println!("  4. Close remote server:");
-        println!("     winboat-bridge -c \"quit\"");
-        println!("-------------------------------------");
-        println!("For detailed help on all parameters, run:");
-        println!("  winboat-bridge -h");
+        match cli.command {
+            // Transfer file: upload (put) lato client.
+            Some(Commands::Put { local_src, remote_dst }) => {
+                client_transfer_put(&local_src, &remote_dst).await?;
+            }
+            // Transfer file: download (get) lato client.
+            Some(Commands::Get { remote_src, local_dst }) => {
+                client_transfer_get(&remote_src, &local_dst).await?;
+            }
+            _ => {
+                println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
+                println!("---------------------------------------------------------------");
+                println!("Usage:");
+                println!("  winboat-bridge --server          # Run in Server Mode (Windows side)");
+                println!("  winboat-bridge -c <COMMAND>      # Execute command remotely (Linux side)");
+                println!("  winboat-bridge put <local> <remote>   # Upload file (rsync delta)");
+                println!("  winboat-bridge get <remote> <local>   # Download file (rsync delta)");
+                println!("");
+                println!("Examples:");
+                println!("  1. Check remote IP:");
+                println!("     winboat-bridge -c \"ipconfig\"");
+                println!("");
+                println!("  2. List remote directory:");
+                println!("     winboat-bridge -c \"dir C:\\Users\"");
+                println!("");
+                println!("  3. Run PowerShell script:");
+                println!("     winboat-bridge -c \"powershell -File C:\\Scripts\\test.ps1\"");
+                println!("");
+                println!("  4. Close remote server:");
+                println!("     winboat-bridge -c \"quit\"");
+                println!("");
+                println!("  5. Upload a file:");
+                println!("     winboat-bridge put ./app.exe C:\\ci\\app.exe");
+                println!("");
+                println!("  6. Download a file:");
+                println!("     winboat-bridge get  C:\\ci\\log.txt ./log.txt");
+                println!("-------------------------------------");
+                println!("For detailed help on all parameters, run:");
+                println!("  winboat-bridge -h");
+            }
+        }
     }
 
     Ok(())
@@ -374,7 +415,62 @@ async fn kill_listener_on_port_windows(port: u16) -> Result<()> {
 }
 
 async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) -> Result<()> {
-    // 1. Read command
+    // Detection modalità (spec §5): peek cumulativo fino a 4 byte.
+    // Se i 4 byte == magic "DFB1" -> modo file (transfer). Altrimenti -> modo shell.
+    // peek (non read) non consuma i byte: il socket è intatto per entrambe le modalità.
+    let mut peek_buf = [0u8; 4];
+    let mut filled = 0;
+    let mut timed_out = false;
+    loop {
+        let peek_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            socket.peek(&mut peek_buf[filled..]),
+        )
+        .await;
+        match peek_result {
+            Ok(Ok(0)) => {
+                // Client disconnesso prima di inviare dati.
+                return Ok(());
+            }
+            Ok(Ok(k)) => {
+                filled += k;
+                if filled >= 4 {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+            Err(_) => {
+                // Timeout: tratta come shell mode.
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    // Se abbiamo 4 byte e corrispondono al magic "DFB1" -> modo file transfer.
+    if filled == 4 && peek_buf == *b"DFB1" {
+        eprintln!("[DEBUG] handle_connection: rilevata modalità file transfer (magic DFB1)");
+        // Delega al modulo transfer. Il socket non è stato consumato (peek).
+        if let Err(e) = handle_file_mode(socket).await {
+            eprintln!("[ERROR] file transfer fallito: {}", e);
+        }
+        return Ok(());
+    }
+
+    // Altrimenti -> modo shell (comportamento invariato). Se il peek è incompleto
+    // (meno di 4 byte in 2s), avvisa: un client file-mode routato per sbaglio in
+    // shell mode produce errori incomprensibili ("sh: DFB1: command not found").
+    if filled < 4 {
+        eprintln!(
+            "[WARN] peek incomplete ({} bytes in 2s), falling back to shell mode",
+            filled
+        );
+    }
+    if timed_out {
+        eprintln!("[DEBUG] handle_connection: peek timeout, modalità shell");
+    }
+
+    // 1. Read command (read riparte dall'inizio: peek non ha consumato i byte).
     let mut buf = [0; 1024];
     let n = socket.read(&mut buf).await?;
     if n == 0 {
@@ -508,6 +604,124 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
     let _ = stderr_handle.await;
     let _ = writer_handle.await;
 
+    Ok(())
+}
+
+/// Gestisce la modalità file transfer lato server (spec §5, §6).
+/// Legge il primo messaggio framed (PUT_REQ o GET_REQ) e delega al modulo transfer.
+async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
+    // Legge il primo messaggio: il magic "DFB1" è già stato peek-ato ma non consumato,
+    // quindi read_msg lo rilegge da capo insieme a version/msg_type/payload.
+    let (msg_type, payload) = proto::read_msg(&mut socket).await?;
+
+    match msg_type {
+        proto::MSG_PUT_REQ => {
+            let req = proto::decode_put_req(&payload)?;
+            eprintln!("[DEBUG] handle_file_mode: PUT_REQ dst={} ({} byte)", req.path, req.total_new_size);
+            transfer::put_server(&mut socket, req).await?;
+        }
+        proto::MSG_GET_REQ => {
+            let req = proto::decode_get_req(&payload)?;
+            eprintln!("[DEBUG] handle_file_mode: GET_REQ src={}", req.path);
+            transfer::get_server(&mut socket, req).await?;
+        }
+        _ => {
+            // Tipo di messaggio non riconosciuto: invia ERR protocollo.
+            let err = proto::ErrMsg {
+                code: proto::ERR_PROTO,
+                message: format!("tipo di messaggio non valido per apertura: {}", msg_type),
+            };
+            let _ = proto::send_err(&mut socket, &err).await;
+            bail!("tipo di messaggio non valido: {}", msg_type);
+        }
+    }
+    Ok(())
+}
+
+/// Stabilisce la connessione TCP al server e verifica l'handshake READY.
+/// Riutilizzata sia dai comandi shell (-c) che dal transfer file (put/get).
+async fn connect_and_handshake() -> Result<TcpStream> {
+    let host = env::var("WINBOAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let client_port = env::var("WINBOAT_CLIENT_PORT").unwrap_or_else(|_| "47330".to_string());
+    let addr = format!("{}:{}", host, client_port);
+
+    // Loop di tentativi con bootstrap (come client_mode esistente).
+    let mut attempt = 0;
+    let max_attempts = 5;
+    let socket = loop {
+        attempt += 1;
+        eprintln!("Connecting to {} (Attempt {})...", addr, attempt);
+
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(addr.as_str()),
+        )
+        .await;
+
+        let mut s = match connect_result {
+            Ok(Ok(s)) => s,
+            _ => {
+                if attempt >= max_attempts {
+                    return Err(anyhow::anyhow!(
+                        "Failed to connect to server after bootstrap attempt"
+                    ));
+                }
+                eprintln!("Connection failed or timed out. Bootstrapping...");
+                bootstrap_server().await?;
+                continue;
+            }
+        };
+
+        // Handshake: legge "READY\n".
+        let mut buf = [0u8; 6];
+        let handshake_result = tokio::time::timeout(
+            Duration::from_millis(1000),
+            s.read_exact(&mut buf),
+        )
+        .await;
+
+        match handshake_result {
+            Ok(Ok(_)) if &buf == b"READY\n" => {
+                eprintln!("Connected and verified.");
+                break s;
+            }
+            _ => {
+                if attempt >= max_attempts {
+                    return Err(anyhow::anyhow!("Handshake failed (Zombie connection?)"));
+                }
+                eprintln!("Connected but no READY signal (likely Docker zombie port). Bootstrapping...");
+                bootstrap_server().await?;
+                continue;
+            }
+        }
+    };
+
+    Ok(socket)
+}
+
+/// Lato client: PUT (upload) di un file locale verso il server.
+/// Stabilisce la connessione, handshake, poi delega a transfer::put_client.
+/// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
+async fn client_transfer_put(local_src: &str, remote_dst: &str) -> Result<()> {
+    // Valida il path sorgente locale prima di connettersi (fail-fast, exit code 2).
+    if let Err(e) = path::require_local_file_exists(local_src) {
+        eprintln!("[ERROR] put: {}", e);
+        std::process::exit(2);
+    }
+
+    let mut socket = connect_and_handshake().await?;
+    transfer::put_client(&mut socket, local_src, remote_dst).await?;
+    eprintln!("put: trasferimento completato ({} -> {})", local_src, remote_dst);
+    Ok(())
+}
+
+/// Lato client: GET (download) di un file remoto verso un path locale.
+/// Stabilisce la connessione, handshake, poi delega a transfer::get_client.
+/// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
+async fn client_transfer_get(remote_src: &str, local_dst: &str) -> Result<()> {
+    let mut socket = connect_and_handshake().await?;
+    transfer::get_client(&mut socket, remote_src, local_dst).await?;
+    eprintln!("get: trasferimento completato ({} -> {})", remote_src, local_dst);
     Ok(())
 }
 
