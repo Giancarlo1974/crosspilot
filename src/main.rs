@@ -15,6 +15,10 @@ mod proto;
 mod path;
 mod verify;
 mod transfer;
+// Modulo directory sync v2 (vedi docs/sync-spec.md).
+mod sync;
+// Handler server per sync v2 (separato da sync.rs per dimensione, best-practice < 1000 righe).
+mod sync_server;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -125,6 +129,38 @@ enum Commands {
         /// Path destinazione locale (Linux).
         local_dst: String,
     },
+    /// Diff read-only tra directory locale e remota (sync v2, vedi docs/sync-spec.md).
+    Status {
+        /// Directory locale (Linux). Deve esistere.
+        local_dir: String,
+        /// Directory remota (Windows, path assoluto).
+        remote_dir: String,
+        /// Confronta via SHA-256 invece di size (accurato, rileva corruzione).
+        #[arg(long)]
+        checksum: bool,
+        /// Output minimo (solo riepilogo numerico su stderr, per CI).
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Mirror one-way upload (Linux -> Windows) della directory (sync v2).
+    Sync {
+        /// Directory sorgente locale (Linux). Deve esistere.
+        local_dir: String,
+        /// Directory destinazione remota (Windows, path assoluto).
+        remote_dir: String,
+        /// Cancella su dest i file/directory non presenti nel source (default OFF).
+        #[arg(long)]
+        delete: bool,
+        /// Mostra cosa farebbe senza eseguire (nessun file scritto/cancellato).
+        #[arg(long)]
+        dry_run: bool,
+        /// Confronta via SHA-256 invece di size (accurato, rileva corruzione).
+        #[arg(long)]
+        checksum: bool,
+        /// Output minimo (solo riepilogo numerico su stderr, per CI).
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 #[tokio::main]
@@ -228,6 +264,14 @@ async fn main() -> Result<()> {
             Some(Commands::Get { remote_src, local_dst }) => {
                 client_transfer_get(&remote_src, &local_dst).await?;
             }
+            // Directory sync v2: status (diff read-only) lato client.
+            Some(Commands::Status { local_dir, remote_dir, checksum, quiet }) => {
+                client_sync_status(&local_dir, &remote_dir, checksum, quiet).await?;
+            }
+            // Directory sync v2: sync (mirror one-way upload) lato client.
+            Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet }) => {
+                client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet).await?;
+            }
             _ => {
                 println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
@@ -236,25 +280,33 @@ async fn main() -> Result<()> {
                 println!("  winboat-bridge -c <COMMAND>      # Execute command remotely (Linux side)");
                 println!("  winboat-bridge put <local> <remote>   # Upload file (rsync delta)");
                 println!("  winboat-bridge get <remote> <local>   # Download file (rsync delta)");
-                println!("");
+                println!("  winboat-bridge status <local> <remote>  # Diff directory (read-only)");
+                println!("  winboat-bridge sync   <local> <remote>  # Mirror directory (upload)");
+                println!();
                 println!("Examples:");
                 println!("  1. Check remote IP:");
                 println!("     winboat-bridge -c \"ipconfig\"");
-                println!("");
+                println!();
                 println!("  2. List remote directory:");
                 println!("     winboat-bridge -c \"dir C:\\Users\"");
-                println!("");
+                println!();
                 println!("  3. Run PowerShell script:");
                 println!("     winboat-bridge -c \"powershell -File C:\\Scripts\\test.ps1\"");
-                println!("");
+                println!();
                 println!("  4. Close remote server:");
                 println!("     winboat-bridge -c \"quit\"");
-                println!("");
+                println!();
                 println!("  5. Upload a file:");
                 println!("     winboat-bridge put ./app.exe C:\\ci\\app.exe");
-                println!("");
+                println!();
                 println!("  6. Download a file:");
                 println!("     winboat-bridge get  C:\\ci\\log.txt ./log.txt");
+                println!();
+                println!("  7. Diff directory (status):");
+                println!("     winboat-bridge status ./artifacts C:\\ci\\artifacts");
+                println!();
+                println!("  8. Mirror directory (sync):");
+                println!("     winboat-bridge sync   ./artifacts C:\\ci\\artifacts --delete");
                 println!("-------------------------------------");
                 println!("For detailed help on all parameters, run:");
                 println!("  winboat-bridge -h");
@@ -625,6 +677,22 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
             eprintln!("[DEBUG] handle_file_mode: GET_REQ src={}", req.path);
             transfer::get_server(&mut socket, req).await?;
         }
+        // Directory sync v2 (sync-spec §5): nuovi messaggi server.
+        proto::MSG_LIST_REQ => {
+            let req = proto::decode_list_req(&payload)?;
+            eprintln!("[DEBUG] handle_file_mode: LIST_REQ path={} recursive={} with_hash={}", req.path, req.recursive, req.with_hash);
+            sync_server::list_server(&mut socket, &req).await?;
+        }
+        proto::MSG_MKDIR_BATCH_REQ => {
+            let req = proto::decode_mkdir_batch_req(&payload)?;
+            eprintln!("[DEBUG] handle_file_mode: MKDIR_BATCH_REQ count={}", req.paths.len());
+            sync_server::mkdir_batch_server(&mut socket, &req).await?;
+        }
+        proto::MSG_DELETE_BATCH_REQ => {
+            let req = proto::decode_delete_batch_req(&payload)?;
+            eprintln!("[DEBUG] handle_file_mode: DELETE_BATCH_REQ count={}", req.items.len());
+            sync_server::delete_batch_server(&mut socket, &req).await?;
+        }
         _ => {
             // Tipo di messaggio non riconosciuto: invia ERR protocollo.
             let err = proto::ErrMsg {
@@ -722,6 +790,80 @@ async fn client_transfer_get(remote_src: &str, local_dst: &str) -> Result<()> {
     let mut socket = connect_and_handshake().await?;
     transfer::get_client(&mut socket, remote_src, local_dst).await?;
     eprintln!("get: trasferimento completato ({} -> {})", remote_src, local_dst);
+    Ok(())
+}
+
+/// Lato client: status (diff read-only) tra directory locale e remota.
+/// sync-spec §6. Exit code: 0 ok (anche con differenze), 1 errore, 2 path invalido.
+async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, quiet: bool) -> Result<()> {
+    // Valida local_dir prima di connettersi (fail-fast, exit code 2).
+    if let Err(e) = path::require_local_dir_exists(local_dir) {
+        eprintln!("[ERROR] status: {}", e);
+        std::process::exit(2);
+    }
+
+    // 1 connessione per LIST (sync-spec §5: una connessione = una operazione).
+    let mut socket = connect_and_handshake().await?;
+    let remote_entries = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
+
+    // Walk locale (skip non-UTF8 + nomi riservati Windows, sync-spec §8.3).
+    let local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+
+    // Diff (con lowercase per case-insensitivity Windows, sync-spec §8.1).
+    let diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+
+    // Output testuale (o riepilogo numerico se --quiet).
+    sync::print_status(&diff, quiet);
+
+    Ok(())
+}
+
+/// Lato client: sync (mirror one-way upload) della directory.
+/// sync-spec §7. Exit code: 0 se tutto ok, 1 se almeno un errore (ma sync completa
+/// tutti i file possibili), 2 path invalido.
+async fn client_sync(
+    local_dir: &str,
+    remote_dir: &str,
+    delete: bool,
+    dry_run: bool,
+    checksum: bool,
+    quiet: bool,
+) -> Result<()> {
+    // Valida local_dir prima di connettersi (fail-fast, exit code 2).
+    if let Err(e) = path::require_local_dir_exists(local_dir) {
+        eprintln!("[ERROR] sync: {}", e);
+        std::process::exit(2);
+    }
+
+    // 1 connessione per LIST (sync-spec §5).
+    let mut socket = connect_and_handshake().await?;
+    let remote_entries = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
+
+    // Walk locale.
+    let local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+
+    // Diff + piano.
+    let diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+    let plan = sync::build_plan(&diff, delete);
+
+    // Esecuzione: connect_and_handshake è la callback per ogni nuova connessione
+    // (LIST, put, MKDIR, DELETE). Niente parallele (best-practice).
+    let params = sync::SyncParams {
+        local_dir: local_dir.to_string(),
+        remote_dir: remote_dir.to_string(),
+        delete,
+        dry_run,
+        quiet,
+    };
+    let report = sync::execute_sync(&plan, &params, || async { connect_and_handshake().await }).await?;
+
+    // Report finale.
+    sync::print_sync_report(&report, quiet);
+
+    // Exit code 1 se almeno un errore (sync-spec §11).
+    if report.error_count > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

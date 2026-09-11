@@ -11,6 +11,10 @@
 //!
 //! I messaggi sono: PUT_REQ(1), GET_REQ(2), META(7), SIGNATURE(3),
 //! DELTA(4), ACK(5), ERR(6). Vedi `docs/transfer-spec.md` sezione 6.
+//!
+//! Messaggi directory sync v2 (vedi `docs/sync-spec.md` sezione 5):
+//! LIST_REQ(8), LIST_RES(9), MKDIR_BATCH_REQ(10), MKDIR_BATCH_RES(11),
+//! DELETE_BATCH_REQ(12), DELETE_BATCH_RES(13).
 
 use anyhow::{anyhow, bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +34,18 @@ pub const MSG_DELTA: u8 = 4;
 pub const MSG_ACK: u8 = 5;
 pub const MSG_ERR: u8 = 6;
 pub const MSG_META: u8 = 7;
+
+// Messaggi directory sync v2 (sync-spec §5).
+pub const MSG_LIST_REQ: u8 = 8;
+pub const MSG_LIST_RES: u8 = 9;
+pub const MSG_MKDIR_BATCH_REQ: u8 = 10;
+pub const MSG_MKDIR_BATCH_RES: u8 = 11;
+pub const MSG_DELETE_BATCH_REQ: u8 = 12;
+pub const MSG_DELETE_BATCH_RES: u8 = 13;
+
+/// Cap massimo sul numero di entry restituite da LIST_RES (sync-spec §5).
+/// Oltre questo limite il server risponde ERR 5 esplicito (non payload da 1 GB).
+pub const LIST_ENTRY_CAP: u32 = 100_000;
 
 /// Dimensione fissa dell'header: magic(4) + version(1) + msg_type(1) + payload_len(4) = 10 byte.
 const HEADER_LEN: usize = 10;
@@ -596,6 +612,483 @@ pub async fn send_err<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Messaggi directory sync v2 (sync-spec §5, §9).
+// ---------------------------------------------------------------------------
+
+/// Richiesta LIST (C→S): path assoluto remoto + flag recursive + with_hash.
+#[derive(Debug, Clone)]
+pub struct ListReq {
+    /// Path assoluto della directory da listare (UTF-8, senza null).
+    pub path: String,
+    /// 1 = ricorsivo (tutto l'albero), 0 = solo top-level.
+    pub recursive: u8,
+    /// 1 = includi SHA-256 di ogni file nella risposta (un solo passaggio).
+    pub with_hash: u8,
+}
+
+/// Singola entry di LIST_RES: path relativo + size + tipo + hash opzionale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEntry {
+    /// Path relativo alla dir richiesta, normalizzato con '/' come separatore.
+    pub rel_path: String,
+    /// Dimensione in byte (0 per directory).
+    pub size: u64,
+    /// 1 = directory, 0 = file.
+    pub is_dir: u8,
+    /// SHA-256 del file; presente SOLO se with_hash=1 e is_dir=0.
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// Risposta LIST (S→C): lista di entry (eventualmente vuota).
+#[derive(Debug, Clone, Default)]
+pub struct ListRes {
+    /// Entry enumerate (entry_count sul wire).
+    pub entries: Vec<ListEntry>,
+}
+
+/// Singolo item di un batch DELETE: path + flag recursive.
+#[derive(Debug, Clone)]
+pub struct DeleteItem {
+    /// Path assoluto remoto da eliminare.
+    pub path: String,
+    /// 1 = elimina ricorsivamente (directory), 0 = solo file.
+    pub recursive: u8,
+}
+
+/// Richiesta MKDIR batch (C→S): lista di path assoluti da creare (mkdir -p).
+#[derive(Debug, Clone, Default)]
+pub struct MkdirBatchReq {
+    /// Path assoluti remoti da creare.
+    pub paths: Vec<String>,
+}
+
+/// Risposta MKDIR batch (S→C): per-path status.
+#[derive(Debug, Clone, Default)]
+pub struct MkdirBatchRes {
+    /// Risultati per-path, nello stesso ordine della richiesta.
+    pub results: Vec<BatchResult>,
+}
+
+/// Richiesta DELETE batch (C→S): lista di item (path + recursive).
+#[derive(Debug, Clone, Default)]
+pub struct DeleteBatchReq {
+    /// Item da eliminare.
+    pub items: Vec<DeleteItem>,
+}
+
+/// Risposta DELETE batch (S→C): per-path status.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteBatchRes {
+    /// Risultati per-path, nello stesso ordine della richiesta.
+    pub results: Vec<BatchResult>,
+}
+
+/// Risultato per-path di un'operazione batch (MKDIR/DELETE).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchResult {
+    /// 0 = ok, 1 = not found (solo DELETE, non fatale), 2 = error.
+    pub status: u8,
+    /// Codice di errore (0 se ok, ERR_* se errore).
+    pub code: u16,
+    /// Messaggio descrittivo UTF-8 (vuoto se ok).
+    pub message: String,
+}
+
+impl BatchResult {
+    /// Crea un risultato ok (status=0, code=0, messaggio vuoto).
+    pub fn ok() -> Self {
+        Self {
+            status: 0,
+            code: 0,
+            message: String::new(),
+        }
+    }
+
+    /// Crea un risultato di errore (status=2) con codice e messaggio.
+    pub fn error(code: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: 2,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Crea un risultato "not found" (status=1, non fatale, solo DELETE).
+    pub fn not_found() -> Self {
+        Self {
+            status: 1,
+            code: 0,
+            message: String::new(),
+        }
+    }
+}
+
+// --- LIST_REQ / LIST_RES ---------------------------------------------------
+
+/// Codifica una ListReq in payload (path\0 + recursive u8 + with_hash u8).
+pub fn encode_list_req(req: &ListReq) -> Result<Vec<u8>> {
+    if req.path.contains('\0') {
+        bail!("ListReq: path contiene null");
+    }
+    let path_bytes = req.path.as_bytes();
+    let mut payload = Vec::with_capacity(path_bytes.len() + 1 + 1 + 1);
+    payload.extend_from_slice(path_bytes);
+    payload.push(0); // terminatore null del path
+    payload.push(req.recursive);
+    payload.push(req.with_hash);
+    Ok(payload)
+}
+
+/// Decodifica una ListReq dal payload.
+pub fn decode_list_req(payload: &[u8]) -> Result<ListReq> {
+    let null_pos = payload
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| anyhow!("ListReq: terminatore null mancante"))?;
+    let path_bytes = &payload[..null_pos];
+    let path = String::from_utf8(path_bytes.to_vec())
+        .map_err(|e| anyhow!("ListReq: path non UTF-8 valido: {}", e))?;
+    let rest = &payload[null_pos + 1..];
+    if rest.len() < 2 {
+        bail!("ListReq: payload troppo corto dopo il path ({} byte, attesi 2)", rest.len());
+    }
+    let recursive = rest[0];
+    let with_hash = rest[1];
+    Ok(ListReq { path, recursive, with_hash })
+}
+
+/// Codifica una ListRes in payload (u32 LE entry_count + [entry]×N).
+pub fn encode_list_res(res: &ListRes) -> Result<Vec<u8>> {
+    let count = res.entries.len() as u32;
+    let mut payload = Vec::new();
+    let count_bytes = count.to_le_bytes();
+    payload.extend_from_slice(&count_bytes);
+    for entry in &res.entries {
+        encode_list_entry(&mut payload, entry)?;
+    }
+    Ok(payload)
+}
+
+/// Decodifica una ListRes dal payload. Verifica il cap di 100k entry.
+/// `with_hash` indica se il server ha incluso SHA-256 per i file (deve
+/// corrispondere al flag della ListReq originale): senza di esso il decoder
+/// non può distinguere i 32 byte dell'hash dai byte della entry successiva.
+pub fn decode_list_res(payload: &[u8], with_hash: bool) -> Result<ListRes> {
+    if payload.len() < 4 {
+        bail!("ListRes: payload troppo corto ({} byte, attesi almeno 4)", payload.len());
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if count > LIST_ENTRY_CAP {
+        bail!(
+            "ListRes: entry_count {} supera il cap di {}",
+            count,
+            LIST_ENTRY_CAP
+        );
+    }
+    let mut offset = 4usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut i = 0u32;
+    while i < count {
+        let entry = decode_list_entry(payload, &mut offset, with_hash)?;
+        entries.push(entry);
+        i += 1;
+    }
+    Ok(ListRes { entries })
+}
+
+/// Codifica una singola entry e l'appende al payload.
+/// Formato: u16 LE rel_path_len + rel_path UTF-8 + u64 LE size + u8 is_dir
+///          + [u8;32] sha256 (solo se Some).
+fn encode_list_entry(out: &mut Vec<u8>, entry: &ListEntry) -> Result<()> {
+    let path_bytes = entry.rel_path.as_bytes();
+    let path_len = path_bytes.len() as u16;
+    let path_len_bytes = path_len.to_le_bytes();
+    out.extend_from_slice(&path_len_bytes);
+    out.extend_from_slice(path_bytes);
+    let size_bytes = entry.size.to_le_bytes();
+    out.extend_from_slice(&size_bytes);
+    out.push(entry.is_dir);
+    if let Some(hash) = &entry.sha256 {
+        out.extend_from_slice(hash);
+    }
+    Ok(())
+}
+
+/// Decodifica una singola entry a partire da offset (avanza offset).
+/// `with_hash` indica se attenderci i 32 byte di SHA-256 per i file.
+fn decode_list_entry(payload: &[u8], offset: &mut usize, with_hash: bool) -> Result<ListEntry> {
+    // rel_path_len u16 LE.
+    if payload.len() < *offset + 2 {
+        bail!("ListRes: payload troncato in rel_path_len");
+    }
+    let path_len = u16::from_le_bytes([payload[*offset], payload[*offset + 1]]) as usize;
+    *offset += 2;
+    // rel_path UTF-8.
+    if payload.len() < *offset + path_len {
+        bail!("ListRes: payload troncato in rel_path");
+    }
+    let path_bytes = &payload[*offset..*offset + path_len];
+    let rel_path = String::from_utf8(path_bytes.to_vec())
+        .map_err(|e| anyhow!("ListRes: rel_path non UTF-8 valido: {}", e))?;
+    *offset += path_len;
+    // size u64 LE.
+    if payload.len() < *offset + 8 {
+        bail!("ListRes: payload troncato in size");
+    }
+    let size = u64::from_le_bytes([
+        payload[*offset], payload[*offset + 1], payload[*offset + 2], payload[*offset + 3],
+        payload[*offset + 4], payload[*offset + 5], payload[*offset + 6], payload[*offset + 7],
+    ]);
+    *offset += 8;
+    // is_dir u8.
+    if payload.len() < *offset + 1 {
+        bail!("ListRes: payload troncato in is_dir");
+    }
+    let is_dir = payload[*offset];
+    *offset += 1;
+    // sha256 opzionale: presente SOLO se with_hash=1 e is_dir=0.
+    // Il flag with_hash arriva dal chiamante (corrisponde alla ListReq originale):
+    // senza di esso non si potrebbe distinguere l'hash dai byte della entry successiva.
+    let sha256 = if with_hash && is_dir == 0 {
+        if payload.len() < *offset + 32 {
+            bail!("ListRes: payload troncato in sha256");
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&payload[*offset..*offset + 32]);
+        *offset += 32;
+        Some(hash)
+    } else {
+        None
+    };
+    Ok(ListEntry { rel_path, size, is_dir, sha256 })
+}
+
+// --- MKDIR_BATCH_REQ / MKDIR_BATCH_RES -------------------------------------
+
+/// Codifica una MkdirBatchReq in payload (u32 LE count + [u16 LE len + path]×N).
+pub fn encode_mkdir_batch_req(req: &MkdirBatchReq) -> Result<Vec<u8>> {
+    let count = req.paths.len() as u32;
+    let mut payload = Vec::new();
+    let count_bytes = count.to_le_bytes();
+    payload.extend_from_slice(&count_bytes);
+    for path in &req.paths {
+        if path.contains('\0') {
+            bail!("MkdirBatchReq: path contiene null: {}", path);
+        }
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len() as u16;
+        let path_len_bytes = path_len.to_le_bytes();
+        payload.extend_from_slice(&path_len_bytes);
+        payload.extend_from_slice(path_bytes);
+    }
+    Ok(payload)
+}
+
+/// Decodifica una MkdirBatchReq dal payload.
+pub fn decode_mkdir_batch_req(payload: &[u8]) -> Result<MkdirBatchReq> {
+    if payload.len() < 4 {
+        bail!("MkdirBatchReq: payload troppo corto ({} byte, attesi 4)", payload.len());
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let mut offset = 4usize;
+    let mut paths = Vec::with_capacity(count);
+    let mut i = 0usize;
+    while i < count {
+        if payload.len() < offset + 2 {
+            bail!("MkdirBatchReq: payload troncato in path_len");
+        }
+        let path_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        if payload.len() < offset + path_len {
+            bail!("MkdirBatchReq: payload troncato in path");
+        }
+        let path_bytes = &payload[offset..offset + path_len];
+        let path = String::from_utf8(path_bytes.to_vec())
+            .map_err(|e| anyhow!("MkdirBatchReq: path non UTF-8 valido: {}", e))?;
+        offset += path_len;
+        paths.push(path);
+        i += 1;
+    }
+    Ok(MkdirBatchReq { paths })
+}
+
+/// Codifica una MkdirBatchRes in payload (u32 LE count + [status+code+msg]×N).
+pub fn encode_mkdir_batch_res(res: &MkdirBatchRes) -> Result<Vec<u8>> {
+    encode_batch_res_inner(MSG_MKDIR_BATCH_RES, &res.results)
+}
+
+/// Decodifica una MkdirBatchRes dal payload. Verifica count == expected.
+pub fn decode_mkdir_batch_res(payload: &[u8], expected: usize) -> Result<MkdirBatchRes> {
+    let results = decode_batch_res_inner(payload, "MkdirBatchRes", expected)?;
+    Ok(MkdirBatchRes { results })
+}
+
+// --- DELETE_BATCH_REQ / DELETE_BATCH_RES -----------------------------------
+
+/// Codifica una DeleteBatchReq in payload
+/// (u32 LE count + [u16 LE len + path + u8 recursive]×N).
+pub fn encode_delete_batch_req(req: &DeleteBatchReq) -> Result<Vec<u8>> {
+    let count = req.items.len() as u32;
+    let mut payload = Vec::new();
+    let count_bytes = count.to_le_bytes();
+    payload.extend_from_slice(&count_bytes);
+    for item in &req.items {
+        if item.path.contains('\0') {
+            bail!("DeleteBatchReq: path contiene null: {}", item.path);
+        }
+        let path_bytes = item.path.as_bytes();
+        let path_len = path_bytes.len() as u16;
+        let path_len_bytes = path_len.to_le_bytes();
+        payload.extend_from_slice(&path_len_bytes);
+        payload.extend_from_slice(path_bytes);
+        payload.push(item.recursive);
+    }
+    Ok(payload)
+}
+
+/// Decodifica una DeleteBatchReq dal payload.
+pub fn decode_delete_batch_req(payload: &[u8]) -> Result<DeleteBatchReq> {
+    if payload.len() < 4 {
+        bail!("DeleteBatchReq: payload troppo corto ({} byte, attesi 4)", payload.len());
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let mut offset = 4usize;
+    let mut items = Vec::with_capacity(count);
+    let mut i = 0usize;
+    while i < count {
+        if payload.len() < offset + 2 {
+            bail!("DeleteBatchReq: payload troncato in path_len");
+        }
+        let path_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        if payload.len() < offset + path_len + 1 {
+            bail!("DeleteBatchReq: payload troncato in path/recursive");
+        }
+        let path_bytes = &payload[offset..offset + path_len];
+        let path = String::from_utf8(path_bytes.to_vec())
+            .map_err(|e| anyhow!("DeleteBatchReq: path non UTF-8 valido: {}", e))?;
+        offset += path_len;
+        let recursive = payload[offset];
+        offset += 1;
+        items.push(DeleteItem { path, recursive });
+        i += 1;
+    }
+    Ok(DeleteBatchReq { items })
+}
+
+/// Codifica una DeleteBatchRes in payload (u32 LE count + [status+code+msg]×N).
+pub fn encode_delete_batch_res(res: &DeleteBatchRes) -> Result<Vec<u8>> {
+    encode_batch_res_inner(MSG_DELETE_BATCH_RES, &res.results)
+}
+
+/// Decodifica una DeleteBatchRes dal payload. Verifica count == expected.
+pub fn decode_delete_batch_res(payload: &[u8], expected: usize) -> Result<DeleteBatchRes> {
+    let results = decode_batch_res_inner(payload, "DeleteBatchRes", expected)?;
+    Ok(DeleteBatchRes { results })
+}
+
+/// Codifica la parte comune di MKDIR_BATCH_RES / DELETE_BATCH_RES.
+/// Formato: u32 LE count + [u8 status + u16 LE code + u16 LE msg_len + msg]×N.
+fn encode_batch_res_inner(_msg_type: u8, results: &[BatchResult]) -> Result<Vec<u8>> {
+    let count = results.len() as u32;
+    let mut payload = Vec::new();
+    let count_bytes = count.to_le_bytes();
+    payload.extend_from_slice(&count_bytes);
+    for r in results {
+        payload.push(r.status);
+        let code_bytes = r.code.to_le_bytes();
+        payload.extend_from_slice(&code_bytes);
+        let msg_bytes = r.message.as_bytes();
+        let msg_len = msg_bytes.len() as u16;
+        let msg_len_bytes = msg_len.to_le_bytes();
+        payload.extend_from_slice(&msg_len_bytes);
+        payload.extend_from_slice(msg_bytes);
+    }
+    Ok(payload)
+}
+
+/// Decodifica la parte comune di MKDIR_BATCH_RES / DELETE_BATCH_RES.
+/// Verifica che count == expected (sync-spec §9: count mismatch -> ERR 5).
+fn decode_batch_res_inner(
+    payload: &[u8],
+    label: &str,
+    expected: usize,
+) -> Result<Vec<BatchResult>> {
+    if payload.len() < 4 {
+        bail!("{}: payload troppo corto ({} byte, attesi 4)", label, payload.len());
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    // sync-spec §9: count mismatch -> il client stoppa immediatamente (ERR 5).
+    if count != expected {
+        bail!(
+            "{}: count mismatch (atteso {}, ricevuto {}) - bug di protocollo o troncamento",
+            label,
+            expected,
+            count
+        );
+    }
+    let mut offset = 4usize;
+    let mut results = Vec::with_capacity(count);
+    let mut i = 0usize;
+    while i < count {
+        if payload.len() < offset + 1 {
+            bail!("{}: payload troncato in status", label);
+        }
+        let status = payload[offset];
+        offset += 1;
+        if payload.len() < offset + 2 {
+            bail!("{}: payload troncato in code", label);
+        }
+        let code = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        if payload.len() < offset + 2 {
+            bail!("{}: payload troncato in msg_len", label);
+        }
+        let msg_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        if payload.len() < offset + msg_len {
+            bail!("{}: payload troncato in message", label);
+        }
+        let msg_bytes = &payload[offset..offset + msg_len];
+        let message = String::from_utf8(msg_bytes.to_vec())
+            .unwrap_or_else(|_| "<messaggio non UTF-8>".to_string());
+        offset += msg_len;
+        results.push(BatchResult { status, code, message });
+        i += 1;
+    }
+    Ok(results)
+}
+
+// --- Helper di alto livello per sync (invio/ricezione tipizzati) -----------
+
+/// Invia una ListReq.
+pub async fn send_list_req<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    req: &ListReq,
+) -> Result<()> {
+    let payload = encode_list_req(req)?;
+    write_msg(writer, MSG_LIST_REQ, &payload).await
+}
+
+/// Invia una MkdirBatchReq.
+pub async fn send_mkdir_batch_req<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    req: &MkdirBatchReq,
+) -> Result<()> {
+    let payload = encode_mkdir_batch_req(req)?;
+    write_msg(writer, MSG_MKDIR_BATCH_REQ, &payload).await
+}
+
+/// Invia una DeleteBatchReq.
+pub async fn send_delete_batch_req<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    req: &DeleteBatchReq,
+) -> Result<()> {
+    let payload = encode_delete_batch_req(req)?;
+    write_msg(writer, MSG_DELETE_BATCH_REQ, &payload).await
+}
+
+// ---------------------------------------------------------------------------
 // Test di roundtrip encode/decode (spec §17 passo 2).
 // ---------------------------------------------------------------------------
 
@@ -809,5 +1302,221 @@ mod tests {
         let mut cursor = std::io::Cursor::new(bad);
         let result = read_msg(&mut cursor).await;
         assert!(result.is_err());
+    }
+
+    // --- Test directory sync v2 (sync-spec §15 passo 1) -------------------
+
+    #[test]
+    fn roundtrip_list_req() {
+        let req = ListReq {
+            path: r"C:\ci\artifacts".to_string(),
+            recursive: 1,
+            with_hash: 1,
+        };
+        let payload = encode_list_req(&req).unwrap();
+        let decoded = decode_list_req(&payload).unwrap();
+        assert_eq!(decoded.path, req.path);
+        assert_eq!(decoded.recursive, 1);
+        assert_eq!(decoded.with_hash, 1);
+    }
+
+    #[test]
+    fn list_req_rejects_null_in_path() {
+        let req = ListReq {
+            path: "bad\0path".to_string(),
+            recursive: 1,
+            with_hash: 0,
+        };
+        assert!(encode_list_req(&req).is_err());
+    }
+
+    #[test]
+    fn roundtrip_list_res_without_hash() {
+        // with_hash=0: nessun sha256 nelle entry file.
+        let entries = vec![
+            ListEntry {
+                rel_path: "app.exe".to_string(),
+                size: 1024,
+                is_dir: 0,
+                sha256: None,
+            },
+            ListEntry {
+                rel_path: "lib".to_string(),
+                size: 0,
+                is_dir: 1,
+                sha256: None,
+            },
+            ListEntry {
+                rel_path: "lib/core.dll".to_string(),
+                size: 2048,
+                is_dir: 0,
+                sha256: None,
+            },
+        ];
+        let res = ListRes { entries };
+        let payload = encode_list_res(&res).unwrap();
+        let decoded = decode_list_res(&payload, false).unwrap();
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].rel_path, "app.exe");
+        assert_eq!(decoded.entries[0].size, 1024);
+        assert_eq!(decoded.entries[0].is_dir, 0);
+        assert!(decoded.entries[0].sha256.is_none());
+        assert_eq!(decoded.entries[1].is_dir, 1);
+        assert_eq!(decoded.entries[2].rel_path, "lib/core.dll");
+    }
+
+    #[test]
+    fn roundtrip_list_res_with_hash() {
+        // with_hash=1: i file hanno sha256, le directory no.
+        let mut hash1 = [0u8; 32];
+        hash1[0] = 0xAB;
+        let entries = vec![
+            ListEntry {
+                rel_path: "app.exe".to_string(),
+                size: 1024,
+                is_dir: 0,
+                sha256: Some(hash1),
+            },
+            ListEntry {
+                rel_path: "lib".to_string(),
+                size: 0,
+                is_dir: 1,
+                sha256: None,
+            },
+        ];
+        let res = ListRes { entries };
+        let payload = encode_list_res(&res).unwrap();
+        let decoded = decode_list_res(&payload, true).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(decoded.entries[0].sha256, Some(hash1));
+        assert!(decoded.entries[1].sha256.is_none());
+    }
+
+    #[test]
+    fn list_res_empty() {
+        // Directory vuota o non esistente -> 0 entry.
+        let res = ListRes::default();
+        let payload = encode_list_res(&res).unwrap();
+        let decoded = decode_list_res(&payload, false).unwrap();
+        assert!(decoded.entries.is_empty());
+    }
+
+    #[test]
+    fn list_res_rejects_cap_exceeded() {
+        // entry_count > LIST_ENTRY_CAP -> errore (ERR 5 lato server).
+        let mut payload = Vec::new();
+        let over_cap = LIST_ENTRY_CAP + 1;
+        let count_bytes = over_cap.to_le_bytes();
+        payload.extend_from_slice(&count_bytes);
+        let result = decode_list_res(&payload, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roundtrip_mkdir_batch_req() {
+        let paths = vec![
+            r"C:\ci\artifacts".to_string(),
+            r"C:\ci\artifacts\lib".to_string(),
+            r"C:\ci\artifacts\lib\sub".to_string(),
+        ];
+        let req = MkdirBatchReq { paths };
+        let payload = encode_mkdir_batch_req(&req).unwrap();
+        let decoded = decode_mkdir_batch_req(&payload).unwrap();
+        assert_eq!(decoded.paths.len(), 3);
+        assert_eq!(decoded.paths[0], r"C:\ci\artifacts");
+        assert_eq!(decoded.paths[2], r"C:\ci\artifacts\lib\sub");
+    }
+
+    #[test]
+    fn mkdir_batch_req_empty() {
+        let req = MkdirBatchReq::default();
+        let payload = encode_mkdir_batch_req(&req).unwrap();
+        let decoded = decode_mkdir_batch_req(&payload).unwrap();
+        assert!(decoded.paths.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_mkdir_batch_res() {
+        let results = vec![
+            BatchResult::ok(),
+            BatchResult::error(ERR_IO, "permesso negato"),
+        ];
+        let res = MkdirBatchRes { results };
+        let payload = encode_mkdir_batch_res(&res).unwrap();
+        let decoded = decode_mkdir_batch_res(&payload, 2).unwrap();
+        assert_eq!(decoded.results.len(), 2);
+        assert_eq!(decoded.results[0].status, 0);
+        assert_eq!(decoded.results[1].status, 2);
+        assert_eq!(decoded.results[1].code, ERR_IO);
+        assert_eq!(decoded.results[1].message, "permesso negato");
+    }
+
+    #[test]
+    fn mkdir_batch_res_count_mismatch() {
+        // sync-spec §9: count mismatch -> errore (client stoppa).
+        let results = vec![BatchResult::ok()];
+        let res = MkdirBatchRes { results };
+        let payload = encode_mkdir_batch_res(&res).unwrap();
+        // expected=3 ma la risposta ne ha 1 -> errore.
+        let result = decode_mkdir_batch_res(&payload, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roundtrip_delete_batch_req() {
+        let items = vec![
+            DeleteItem { path: r"C:\ci\old.dat".to_string(), recursive: 0 },
+            DeleteItem { path: r"C:\ci\old_dir".to_string(), recursive: 1 },
+        ];
+        let req = DeleteBatchReq { items };
+        let payload = encode_delete_batch_req(&req).unwrap();
+        let decoded = decode_delete_batch_req(&payload).unwrap();
+        assert_eq!(decoded.items.len(), 2);
+        assert_eq!(decoded.items[0].path, r"C:\ci\old.dat");
+        assert_eq!(decoded.items[0].recursive, 0);
+        assert_eq!(decoded.items[1].recursive, 1);
+    }
+
+    #[test]
+    fn roundtrip_delete_batch_res() {
+        let results = vec![
+            BatchResult::ok(),
+            BatchResult::not_found(),
+            BatchResult::error(ERR_IO, "busy"),
+        ];
+        let res = DeleteBatchRes { results };
+        let payload = encode_delete_batch_res(&res).unwrap();
+        let decoded = decode_delete_batch_res(&payload, 3).unwrap();
+        assert_eq!(decoded.results.len(), 3);
+        assert_eq!(decoded.results[0].status, 0);
+        assert_eq!(decoded.results[1].status, 1); // not found
+        assert_eq!(decoded.results[2].status, 2);
+        assert_eq!(decoded.results[2].message, "busy");
+    }
+
+    #[test]
+    fn delete_batch_res_count_mismatch() {
+        let results = vec![BatchResult::ok()];
+        let res = DeleteBatchRes { results };
+        let payload = encode_delete_batch_res(&res).unwrap();
+        let result = decode_delete_batch_res(&payload, 5);
+        assert!(result.is_err());
+    }
+
+    /// Roundtrip framing dei nuovi messaggi sync via write_msg/read_msg.
+    #[tokio::test]
+    async fn framing_list_req_roundtrip() {
+        let mut buf: Vec<u8> = Vec::new();
+        let req = ListReq {
+            path: r"C:\ci\art".to_string(),
+            recursive: 1,
+            with_hash: 1,
+        };
+        send_list_req(&mut buf, &req).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (msg_type, payload) = read_msg(&mut cursor).await.unwrap();
+        assert_eq!(msg_type, MSG_LIST_REQ);
+        let decoded = decode_list_req(&payload).unwrap();
+        assert_eq!(decoded.path, req.path);
     }
 }
