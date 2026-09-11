@@ -221,7 +221,7 @@ fn atomic_replace(part_path: &Path, dest_path: &Path) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn atomic_replace_windows(part_path: &Path, dest_path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use winapi::um::fileapi::MoveFileExW;
+    use winapi::um::winbase::MoveFileExW;
     use winapi::um::winbase::MOVEFILE_REPLACE_EXISTING;
 
     // Converte i path in stringhe wide (UTF-16) terminate da null per l'API Win32.
