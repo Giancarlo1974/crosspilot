@@ -8,6 +8,12 @@ tokio = { version = "1.0", features = ["full"] }
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 dotenvy = "0.15"
+# Algoritmo rsync (rolling checksum + strong hash + delta) puro Rust, lineage Dropbox.
+# Usato per il transfer delta stile rsync (vedi docs/transfer-spec.md).
+fast_rsync = "0.2"
+# SHA-256 whole-file: fast_rsync usa MD4 (insicuro) come strong hash per-blocco.
+# SHA-256 sul file ricostruito garantisce integrità end-to-end (delta sbagliato -> mismatch -> ERR 4).
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["jobapi2", "processthreadsapi", "winnt", "handleapi", "synchapi"] }
+winapi = { version = "0.3", features = ["jobapi2", "processthreadsapi", "winnt", "handleapi", "synchapi", "fileapi", "winbase"] }
