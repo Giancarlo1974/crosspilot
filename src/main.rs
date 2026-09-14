@@ -19,6 +19,9 @@ mod transfer;
 mod sync;
 // Handler server per sync v2 (separato da sync.rs per dimensione, best-practice < 1000 righe).
 mod sync_server;
+// Modulo bootstrap WinRM (separato da main.rs per dimensione, best-practice < 1000 righe).
+mod bootstrap;
+mod deploy;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -735,7 +738,7 @@ async fn connect_and_handshake() -> Result<TcpStream> {
                     ));
                 }
                 eprintln!("Connection failed or timed out. Bootstrapping...");
-                bootstrap_server().await?;
+                bootstrap::bootstrap_server().await?;
                 continue;
             }
         };
@@ -758,7 +761,7 @@ async fn connect_and_handshake() -> Result<TcpStream> {
                     return Err(anyhow::anyhow!("Handshake failed (Zombie connection?)"));
                 }
                 eprintln!("Connected but no READY signal (likely Docker zombie port). Bootstrapping...");
-                bootstrap_server().await?;
+                bootstrap::bootstrap_server().await?;
                 continue;
             }
         }
@@ -877,11 +880,7 @@ async fn client_mode(cmd: &str) -> Result<()> {
     let addr = format!("{}:{}", host, client_port);
     
     // Attempt connection loop (Connect -> Handshake -> if fail -> Bootstrap -> Retry)
-    // TODO: The bootstrap relies on evil-winrm, an interactive pentesting shell that never
-    // exits on its own and must be killed after a hardcoded timeout. For a definitive fix,
-    // replace evil-winrm with a native Rust WinRM crate (e.g. `winrs` or `winrm`) that
-    // executes the remote command and returns immediately, eliminating the arbitrary 15s
-    // timeout and the need to kill the local process.
+    // Il bootstrap usa winrm-rs (puro Rust, NTLMv2) — vedi bootstrap::bootstrap_server().
     let mut attempt = 0;
     let max_attempts = 5;
     
@@ -901,7 +900,7 @@ async fn client_mode(cmd: &str) -> Result<()> {
                      return Err(anyhow::anyhow!("Failed to connect to server after bootstrap attempt"));
                 }
                 eprintln!("Connection failed or timed out. Bootstrapping...");
-                bootstrap_server().await?;
+                bootstrap::bootstrap_server().await?;
                 continue;
             }
         };
@@ -923,7 +922,7 @@ async fn client_mode(cmd: &str) -> Result<()> {
                      return Err(anyhow::anyhow!("Handshake failed (Zombie connection?)"));
                 }
                 println!("Connected but no READY signal (likely Docker zombie port). Bootstrapping...");
-                bootstrap_server().await?;
+                bootstrap::bootstrap_server().await?;
                 continue;
             }
         }
@@ -944,132 +943,5 @@ async fn client_mode(cmd: &str) -> Result<()> {
         stdout.flush().await?;
     }
 
-    Ok(())
-}
-
-async fn bootstrap_server() -> Result<()> {
-    let exe_path = env::var("WINBOAT_EXE_PATH")
-        .context("WINBOAT_EXE_PATH must be set in the .env file")?;
-    
-    let log_path = env::var("WINBOAT_LOG_PATH")
-        .unwrap_or_else(|_| r"C:\Users\gianca\server.log".to_string());
-    
-    let err_path = env::var("WINBOAT_ERR_PATH")
-        .unwrap_or_else(|_| r"C:\Users\gianca\server.err".to_string());
-    
-    // Use PowerShell Start-Process to spawn the process in a detached state.
-    // -WindowStyle Hidden: Hides the window
-    // -PassThru: Returns the process object (useful for debugging, though we ignore it here)
-    // We direct output to files for debugging since we can't see it easily in detached mode.
-    let ps_command = format!(
-        "Start-Process -FilePath '{}' -ArgumentList '--server' -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'",
-        exe_path, log_path, err_path
-    );
-    
-    // Direct evil-winrm invocation details
-    let host = env::var("WINBOAT_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = env::var("WINBOAT_PORT")
-        .unwrap_or_else(|_| "47320".to_string());
-    let user = env::var("WINBOAT_USER")
-        .unwrap_or_else(|_| "gianca".to_string());
-    let pass = env::var("WINBOAT_PASS")
-        .unwrap_or_else(|_| "gianca".to_string());
-
-    println!("Bootstrapping server via evil-winrm...");
-    println!("PowerShell Command: {}", ps_command);
-
-    // We pipe the command to evil-winrm stdin, similar to how the shell script did it.
-    // This avoids complex escaping issues with passing the command as an argument to evil-winrm directly.
-    let mut child = Command::new("evil-winrm")
-        .arg("-i").arg(host)
-        .arg("-P").arg(port)
-        .arg("-u").arg(user)
-        .arg("-p").arg(pass)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn evil-winrm")?;
-
-    let mut stdin = child.stdin.take().context("Failed to open evil-winrm stdin")?;
-    
-    // Wrap the command in powershell execution
-    let full_command = format!("powershell -Command \"{}\"", ps_command);
-    stdin.write_all(full_command.as_bytes()).await?;
-    stdin.write_all(b"\n").await?; // Add newline to execute command
-    stdin.write_all(b"exit\n").await?; // Ensure shell exits
-    drop(stdin); // Close stdin to signal we're done sending the command
-
-    // Consume stdout and stderr concurrently to prevent deadlocks
-    let mut stdout = child.stdout.take().context("Failed to open stdout")?;
-    let mut stderr = child.stderr.take().context("Failed to open stderr")?;
-
-    let stdout_handle = tokio::spawn(async move {
-        let mut data = Vec::new();
-        let _ = stdout.read_to_end(&mut data).await;
-        data
-    });
-
-    let stderr_handle = tokio::spawn(async move {
-        let mut data = Vec::new();
-        let _ = stderr.read_to_end(&mut data).await;
-        data
-    });
-
-    // Wait for evil-winrm to exit, with a timeout
-    println!("Waiting for bootstrap command to complete...");
-    let wait_result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(15),
-        child.wait()
-    ).await;
-
-    match wait_result {
-        Ok(Ok(status)) => {
-            // Wait for I/O to finish
-            let _ = stdout_handle.await; 
-            let stderr_data = stderr_handle.await.unwrap_or_default();
-            
-             if !status.success() {
-                let stderr_str = String::from_utf8_lossy(&stderr_data);
-                println!("Bootstrap returned non-zero. Stderr: {}", stderr_str);
-            } else {
-                println!("Bootstrap command executed successfully.");
-            }
-        },
-        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to wait for evil-winrm: {}", e)),
-        Err(_) => {
-            println!("Bootstrap command timed out (evil-winrm hang). Killing local process and assuming remote started.");
-            let _ = child.kill().await;
-        }
-    }
-
-    // Poll for the server to come up instead of a fixed sleep.
-    // The remote process may take longer than 5s on slow disks, AV scans, or first boot.
-    // Try connecting every 2s for up to 30s before giving up.
-    println!("Waiting for server to start...");
-    let host = env::var("WINBOAT_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
-    let client_port = env::var("WINBOAT_CLIENT_PORT")
-        .unwrap_or_else(|_| "47330".to_string());
-    let addr = format!("{}:{}", host, client_port);
-
-    let mut connected = false;
-    for i in 1..=15 {
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            TcpStream::connect(addr.as_str())
-        ).await;
-        if let Ok(Ok(_)) = result {
-            println!("Server is up (after {}s).", i * 2);
-            connected = true;
-            break;
-        }
-        println!("Server not ready yet, retrying ({}s elapsed)...", i * 2);
-    }
-    if !connected {
-        eprintln!("Warning: server did not come up within 30s after bootstrap.");
-    }
     Ok(())
 }

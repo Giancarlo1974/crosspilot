@@ -31,6 +31,24 @@ docker compose restart
 
 ## 2. Set up the Windows server
 
+### Option A: Auto-deploy (Recommended)
+
+With the auto-deploy feature, you **don't need to manually copy the Windows exe**. The Linux binary embeds the Windows server exe and uploads it automatically via WinRM when the client detects it's missing or outdated on the remote host.
+
+Just configure the `.env` with valid WinRM credentials (see step 4) and run:
+
+```bash
+winboat-bridge -c "hostname"
+```
+
+The client will:
+1. Try to connect to the bridge server on the configured port
+2. If the server is down, bootstrap it via WinRM
+3. If the exe is missing on the remote host, auto-deploy the embedded copy
+4. Start the server and execute the command
+
+### Option B: Manual deployment
+
 1. Download `winboat-bridge.exe` for Windows from the [GitHub Releases page](https://github.com/Giancarlo1974/winboat-bridge/releases).
 2. Copy it into the shared folder used by the Windows VM, for example:
 
@@ -46,6 +64,7 @@ docker compose restart
 ## 3. Set up the Linux client
 
 1. Download the Linux binary `winboat-bridge` from the same [Releases page](https://github.com/Giancarlo1974/winboat-bridge/releases).
+   > The release binary includes the Windows server exe **embedded** — no separate download needed for auto-deploy.
 2. Move it to `/usr/local/bin` or another folder already in your `PATH`.
 3. Make it executable:
 

@@ -1,0 +1,87 @@
+[package]
+name = "winrm-rs"
+version = "1.2.2"
+edition = "2024"
+rust-version = "1.98.0"
+description = "Async WinRM (WS-Management) client for Rust with NTLMv2, Basic, Kerberos, and Certificate authentication"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/muchiny/winrm-rs"
+keywords = ["winrm", "windows", "remote-management", "ntlm", "kerberos"]
+categories = ["network-programming", "os::windows-apis"]
+readme = "README.md"
+documentation = "https://docs.rs/winrm-rs"
+homepage = "https://github.com/muchiny/winrm-rs"
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+    "CHANGELOG.md",
+]
+
+[features]
+default = []
+kerberos = ["dep:cross-krb5"]
+# EXPERIMENTAL. CredSSP (double-hop delegation) is not yet end-to-end
+# validated. The OpenSSL dependency is required for the inner TLS 1.2
+# in-memory handshake: a `rustls` implementation was attempted and the
+# Microsoft CredSSP server silently drops the context after Type3 +
+# pubKeyAuth. See the comment block in `src/auth/credssp.rs` around the
+# `build_inner_openssl_tls` function for the full background.
+credssp = ["dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "dep:http-body-util", "dep:bytes", "dep:http", "dep:x509-cert", "dep:openssl"]
+# Internal-only. Re-exports crate internals needed by `fuzz/` targets.
+# NOT part of the public API. Do not enable from downstream code — any
+# item gated by this feature may change or disappear without a SemVer
+# bump.
+__internal = []
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks"] }
+cross-krb5 = { version = "0.5", optional = true }
+tokio = { version = "1", features = ["time", "macros"] }
+base64 = "0.23"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+md4 = "0.11"
+md-5 = "0.11"
+hmac = "0.13"
+rand = "0.10"
+secrecy = { version = "0.10", features = ["serde"] }
+tracing = "0.1"
+zeroize = { version = "1.8", features = ["derive"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+rustls = { version = "0.23", features = ["ring"] }
+sha2 = "0.11"
+subtle = "2.6"
+webpki-roots = "1.0.6"
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+x509-cert = { version = "0.3", optional = true }
+openssl = { version = "0.10", optional = true }
+
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unreadable_literal = "warn"
+needless_raw_string_hashes = "warn"
+map_unwrap_or = "warn"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
+serde_json = "1"
+tracing-test = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"

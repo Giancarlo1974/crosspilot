@@ -14,6 +14,37 @@ fast_rsync = "0.2"
 # SHA-256 whole-file: fast_rsync usa MD4 (insicuro) come strong hash per-blocco.
 # SHA-256 sul file ricostruito garantisce integrità end-to-end (delta sbagliato -> mismatch -> ERR 4).
 sha2 = "0.10"
+# Client WinRM nativo (puro Rust, async, NTLMv2) per il bootstrap del server remoto.
+# Sostituisce evil-winrm (shell Ruby interattiva) che non gestiva lo stdin piped
+# in modo deterministico, causando il bug "server did not come up within 30s".
+# Vedi bootstrap_server() in src/bootstrap.rs per i dettagli del bug.
+winrm-rs = "1.2.2"
+
+[patch.crates-io]
+# PATCH LOCALE: winrm-rs 1.2.2 ha un bug in create_shell_request (soap/envelope.rs):
+# emette <wsman:OptionSet> FUORI da </s:Header>, producendo un envelope SOAP 1.2
+# invalido. Il server WinRM rifiuta con HTTP 500 *dopo* l'auth NTLM riuscita.
+# Fix applicata in vendor/winrm-rs: OptionSet inserito dentro <s:Header> via
+# header.replace("</s:Header>", ...), come già fa create_psrp_shell_request.
+# TODO: rimuovere quando upstream fixa (segnalare su github.com/muchiny/winrm-rs).
+winrm-rs = { path = "vendor/winrm-rs" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["jobapi2", "processthreadsapi", "winnt", "handleapi", "synchapi", "fileapi", "winbase"] }
+
+[dev-dependencies]
+# Solo per examples/winrm_test.rs: debug tracing del handshake WinRM/NTLM.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Strip simboli debug: riduce drasticamente la dimensione del binario
+# (specialmente l'exe Windows cross-compilato, che altrimenti include
+# ~130MB di debug info). Necessario per l'embed via include_bytes!.
+strip = true
+# LTO per ridurre ulteriormente la dimensione.
+lto = true
+# Single codegen unit per ottimizzazioni migliori.
+codegen-units = 1
+# Ottimizza per size (l'exe Windows viene embeddato nel binario Linux).
+opt-level = "z"

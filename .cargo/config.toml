@@ -1,4 +1,11 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
-rustflags = ["-C", "target-feature=+crt-static"]
+# Non usiamo +crt-static: il toolchain mingw su Nix usa mcfgthread (non pthreads),
+# e crt-static forza -l:libpthread.a che non esiste in questo toolchain.
+# Il binario risultante richiede mcfgthread.dll sul target (inclusa in Windows 10+).
+# rustc hard-coda -l:libpthread.a nel target spec x86_64-pc-windows-gnu, ma il
+# toolchain mingw di Nix usa mcfgthread (no libpthread.a). Stub vuoto come workaround.
+rustflags = [
+    "-C", "link-arg=-L/home/gianca/progetti/rust/winboat-bridge/.cargo/mingw-stubs",
+]

@@ -16,6 +16,7 @@ If you are in a hurry and want to skip building from source, check the simple qu
 ### Remote command execution (v1)
 - Run any shell/PowerShell command inside the Windows environment: `winboat-bridge -c "<command>"`
 - Automatic server bootstrap via WinRM if the bridge server is down
+- **Auto-deploy**: if the Windows server exe is missing or outdated on the remote host, the client automatically uploads the embedded copy via WinRM (no manual deployment needed)
 
 ### Single-file transfer with rsync-style delta (v1)
 - `put` — upload a local file to the remote host (delta transfer, only changed blocks are sent)
@@ -73,21 +74,42 @@ The .env file is automatically searched in:
 The project generates a single binary. It must be compiled for Windows (Server) and Linux (Client).
 Both targets can be built as **statically-linked binaries** (no runtime DLL/shared-library dependencies), which is the recommended approach for deployment to containers and clean hosts.
 
-### A. Build for Windows (Server) — static
+### A. Build release with embedded Windows exe (Recommended)
 
-The Windows build is already static: `build_windows.sh` passes `-C target-feature=+crt-static` so the resulting `.exe` has no external DLL dependency (not even the MSVC runtime).
+The Linux client binary embeds the Windows server exe (`include_bytes!`) so that it can auto-deploy the server on any remote Windows host via WinRM — no need to manually copy the exe or have the source tree on the client machine.
 
-You have two options, depending on where you are:
-
-#### Option 1: Cross-compilation from Linux (Recommended for CI/CD)
-
-If you're working on NixOS or Linux, use the dedicated script:
+Use the dedicated build script:
 
 ```bash
-./build_windows.sh
+./scripts/build-release.sh           # release (optimized)
+./scripts/build-release.sh --debug   # debug build
 ```
 
-The static executable is produced at:
+The script:
+1. Cross-compiles the Windows exe (`x86_64-pc-windows-gnu`)
+2. Copies it to `assets/winboat-bridge.exe`
+3. Compiles the Linux binary (embeds the exe via `include_bytes!`)
+
+The result is a single self-contained Linux binary (`target/release/winboat-bridge`) that can be distributed to any Linux machine. When the client detects that the remote exe is missing or outdated, it uploads the embedded copy automatically.
+
+**Requirements:**
+- Rust target: `rustup target add x86_64-pc-windows-gnu`
+- MinGW cross-compiler: `x86_64-w64-mingw32-gcc` in PATH
+- On NixOS: `nix-shell -p rustc cargo pkgsCross.mingwW64.buildPackages.gcc`
+
+> **Important:** Always use `build-release.sh` for releases. Running `cargo build` alone will either fail (if `assets/winboat-bridge.exe` is missing) or embed a stale copy.
+
+### B. Build for Windows only (Server) — manual
+
+If you only need the Windows server exe (e.g. for manual deployment without auto-deploy):
+
+#### Option 1: Cross-compilation from Linux
+
+```bash
+cargo build --release --target x86_64-pc-windows-gnu --bin winboat-bridge
+```
+
+The executable is produced at:
 ```
 target/x86_64-pc-windows-gnu/release/winboat-bridge.exe
 ```
@@ -105,11 +127,9 @@ If you have direct access to a Windows system with Rust installed:
 
 Make sure the file is in the shared folder and that the path in .env (WINBOAT_EXE_PATH) points correctly to this binary.
 
-### B. Build for Linux (Client)
+### C. Build for Linux only (Client) — without embed
 
-#### Standard (dynamically linked, links against glibc)
-
-On your Linux machine, compile normally:
+For development/testing without the Windows embed (the auto-deploy will fail if the remote exe is missing):
 
 ```bash
 cargo build --release
@@ -330,7 +350,8 @@ Go on, click that star. You know you want to! 😉
 | Connection Refused    | Wrong port mapping     | Check with `docker ps` that port 47330 is open (local) or `nc -zv <host> 5330` (remote). |
 | "WINBOAT_EXE_PATH must be set" | .env file not found or wrong syntax | Verify that the .env file exists and uses double backslashes (`\\`) without quotes. Run with `--help` to see the message `[DEBUG] Loaded .env from: ...` |
 | .env parsing error   | Wrong syntax          | Use double backslashes (`\\`) for Windows paths and DO NOT use quotes. |
-| Bootstrap succeeds but client still can't connect | `WINBOAT_EXE_PATH` points to a non-existent file on the remote host | Run `Test-Path "<path>"` on the remote host via WinRM/PowerShell to verify the executable exists at the configured path. |
+| Bootstrap succeeds but client still can't connect | `WINBOAT_EXE_PATH` points to a non-existent file on the remote host | The client auto-deploys the embedded exe if missing. If auto-deploy fails, check WinRM connectivity and that the target directory is writable. Run `Test-Path "<path>"` on the remote host to verify. |
+| Auto-deploy fails with "Binario locale non trovato" | The Linux binary was built without `build-release.sh` (no embedded exe) | Rebuild with `./scripts/build-release.sh` to embed the Windows exe. |
 | Bootstrap fails with "Connection refused" | WinRM not enabled on the remote host | Run `Enable-PSRemoting -Force` on the remote Windows host and open port 5985 in the firewall (`Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -RemoteAddress Any`). |
 | Bootstrap fails with auth error | Wrong user/domain format | Use the UPN format `user@domain` in `WINBOAT_USER` (e.g. `user@domain.com`). Avoid `DOMAIN\user` (backslash escaping issues in .env). |
 | Wrong .env loaded (points to `127.0.0.1`) | A stale `.env` exists in `target/release/` and takes precedence | Check the `[DEBUG] Loaded .env from: ...` line. If it points to `target/release/.env`, update that file too (or remove it to fall back to the project root `.env`). |
