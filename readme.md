@@ -14,7 +14,8 @@ If you are in a hurry and want to skip building from source, check the simple qu
 ## Features
 
 ### Remote command execution (v1)
-- Run any shell/PowerShell command inside the Windows environment: `winboat-bridge -c "<command>"`
+- Run any shell/PowerShell command inside the Windows environment: `winboat-bridge -- <command>`
+- The `--` form passes everything after it literally to `cmd.exe` on the remote Windows host, with no shell escaping — write commands exactly as you would on a Windows console
 - Automatic server bootstrap via WinRM if the bridge server is down
 - **Auto-deploy**: if the Windows server exe is missing or outdated on the remote host, the client automatically uploads the embedded copy via WinRM (no manual deployment needed)
 
@@ -206,13 +207,13 @@ Once the .env file is configured, the Linux client will handle everything automa
 Default configuration points to a local Docker-mapped WinBoat container (`127.0.0.1`):
 
 ```bash
-winboat-bridge -c "ipconfig"
+winboat-bridge -- ipconfig
 ```
 
 Run a PowerShell script inside the container:
 
 ```bash
-winboat-bridge -c "powershell -File C:\Scripts\Setup-Test.ps1"
+winboat-bridge -- powershell -File C:\Scripts\Setup-Test.ps1
 ```
 
 ### B. Remote Windows host
@@ -230,19 +231,19 @@ WINBOAT_CLIENT_PORT=5330       # TCP bridge port on the remote host
 Verify the connection to the remote host:
 
 ```bash
-winboat-bridge -c "hostname"
+winboat-bridge -- hostname
 ```
 
 Run a command on the remote Windows machine:
 
 ```bash
-winboat-bridge -c "dir C:\Users"
+winboat-bridge -- dir 'C:\Users'
 ```
 
 Run a PowerShell script remotely:
 
 ```bash
-winboat-bridge -c "powershell -File C:\Scripts\Setup-Test.ps1"
+winboat-bridge -- powershell -File C:\Scripts\Setup-Test.ps1
 ```
 
 > **Note:** If the bridge server is already running on the remote host, the client connects directly. If it's down, the client will try to bootstrap it via WinRM using `WINBOAT_HOST`/`WINBOAT_PORT`/`WINBOAT_USER`/`WINBOAT_PASS` — make sure those credentials are valid for the remote machine.
@@ -325,7 +326,7 @@ A common CI pattern: build artifacts locally, mirror them to the Windows host, r
 winboat-bridge sync ./artifacts C:\ci\artifacts --delete
 
 # 3. Run the Windows test suite
-winboat-bridge -c "C:\ci\run_tests.bat"
+winboat-bridge -- C:\ci\run_tests.bat
 
 # 4. Pull back the test logs
 winboat-bridge get  C:\ci\artifacts\test-results.log ./test-results.log

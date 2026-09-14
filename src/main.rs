@@ -96,7 +96,14 @@ mod win_job {
       WINBOAT_LOG_PATH      - Server log output path (default: C:\\\\Users\\\\gianca\\\\server.log)\n\
       WINBOAT_ERR_PATH      - Server error output path (default: C:\\\\Users\\\\gianca\\\\server.err)\n\
       WINBOAT_SERVER_PORT   - Server listening port (default: 5330)\n\
-      WINBOAT_CLIENT_PORT   - Client connection port (default: 47330)")]
+      WINBOAT_CLIENT_PORT   - Client connection port (default: 47330)\n\n\
+    Usage:\n\
+      winboat-bridge -- <COMMAND>   Execute a command on the remote Windows server\n\
+      winboat-bridge --server       Run in server mode (Windows side)\n\
+      winboat-bridge put|get|status|sync  File transfer and directory sync\n\n\
+    The -- form passes everything after it literally to cmd.exe on the remote\n\
+    Windows host, with no shell escaping. Use single quotes around paths with\n\
+    trailing backslashes: winboat-bridge -- dir 'c:\\'")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -105,9 +112,24 @@ struct Cli {
     #[arg(long, help = "Run in server mode - listens for incoming command requests")]
     server: bool,
 
-    /// Command to execute on remote server (Client mode)
-    #[arg(short, long, help = "Execute a command on the remote Windows server", value_name = "COMMAND")]
-    cmd: Option<String>,
+    /// Comando da eseguire sul server Windows remoto.
+    ///
+    /// Tutto ciò che segue `--` viene preso letteralmente (i token sono uniti
+    /// con spazi) e inviato a cmd.exe sul server Windows. Evita l'escaping
+    /// della shell Linux.
+    ///
+    /// Esempi:
+    ///   winboat-bridge -- dir 'c:\\'
+    ///   winboat-bridge -- powershell -Command "Get-ChildItem 'C:\\Program Files'"
+    ///   winboat-bridge -- echo "hello 'world' \"test\""
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 1..,
+        value_name = "COMMAND",
+        help = "Command to execute on the remote Windows server (use -- to pass it)"
+    )]
+    raw_cmd: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -255,7 +277,11 @@ async fn main() -> Result<()> {
             5330
         };
         server_mode(port).await?;
-    } else if let Some(cmd) = cli.cmd {
+    } else if !cli.raw_cmd.is_empty() {
+        // Forma raw: `winboat-bridge -- dir c:\`. I token dopo `--` sono
+        // presi letteralmente da clap (allow_hyphen_values + trailing_var_arg)
+        // e uniti con spazi per ricostruire il comando cmd.exe.
+        let cmd = cli.raw_cmd.join(" ");
         client_mode(&cmd).await?;
     } else {
         match cli.command {
@@ -279,25 +305,29 @@ async fn main() -> Result<()> {
                 println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
                 println!("Usage:");
-                println!("  winboat-bridge --server          # Run in Server Mode (Windows side)");
-                println!("  winboat-bridge -c <COMMAND>      # Execute command remotely (Linux side)");
+                println!("  winboat-bridge -- <COMMAND>   # Execute command remotely (Linux side)");
+                println!("  winboat-bridge --server       # Run in Server Mode (Windows side)");
                 println!("  winboat-bridge put <local> <remote>   # Upload file (rsync delta)");
                 println!("  winboat-bridge get <remote> <local>   # Download file (rsync delta)");
                 println!("  winboat-bridge status <local> <remote>  # Diff directory (read-only)");
                 println!("  winboat-bridge sync   <local> <remote>  # Mirror directory (upload)");
                 println!();
+                println!("The -- form passes everything after it literally to cmd.exe on the");
+                println!("remote Windows host, with no shell escaping. Use single quotes around");
+                println!("paths with trailing backslashes.");
+                println!();
                 println!("Examples:");
                 println!("  1. Check remote IP:");
-                println!("     winboat-bridge -c \"ipconfig\"");
+                println!("     winboat-bridge -- ipconfig");
                 println!();
-                println!("  2. List remote directory:");
-                println!("     winboat-bridge -c \"dir C:\\Users\"");
+                println!("  2. List remote directory (note: single quotes around the path):");
+                println!("     winboat-bridge -- dir 'c:\\'");
                 println!();
                 println!("  3. Run PowerShell script:");
-                println!("     winboat-bridge -c \"powershell -File C:\\Scripts\\test.ps1\"");
+                println!("     winboat-bridge -- powershell -File C:\\Scripts\\test.ps1");
                 println!();
                 println!("  4. Close remote server:");
-                println!("     winboat-bridge -c \"quit\"");
+                println!("     winboat-bridge -- quit");
                 println!();
                 println!("  5. Upload a file:");
                 println!("     winboat-bridge put ./app.exe C:\\ci\\app.exe");
