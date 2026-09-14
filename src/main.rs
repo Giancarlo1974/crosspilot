@@ -549,6 +549,22 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
     #[cfg(not(target_os = "windows"))]
     let (shell, flag) = ("sh", "-c");
 
+    // BUG FIX: su Windows usiamo raw_arg per il command line, altrimenti
+    // std::process::Command auto-quota gli argomenti che contengono spazi
+    // (es. `dir c:\` diventa `cmd /C "dir c:\"`) e cmd.exe interpreta il
+    // backslash finale come escape della quote → "filename syntax incorrect".
+    // raw_arg passa la stringa così com'è a cmd.exe, consentendo di scrivere
+    // `winboat-bridge -c "dir c:\"` esattamente come su una console Windows.
+    #[cfg(target_os = "windows")]
+    let mut child = Command::new(shell)
+        .arg(flag)
+        .raw_arg(&command_line)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // .stdin(Stdio::piped()) // Future improvement for interactive
+        .spawn()
+        .context("Failed to spawn command")?;
+    #[cfg(not(target_os = "windows"))]
     let mut child = Command::new(shell)
         .arg(flag)
         .arg(&command_line)
