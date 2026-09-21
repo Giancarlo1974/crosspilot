@@ -101,8 +101,11 @@ mod win_job {
       WINBOAT_ENV           - Active environment name (see below)\n\n\
     Multiple environments: the .env can hold N named host configs as\n\
       WINBOAT_<NAME>_<FIELD> (e.g. WINBOAT_PROD_HOST). WINBOAT_ENV selects\n\
-      the active one; unprefixed keys are the fallback. Manage them with:\n\
-      winboat-bridge env list|show|add|set|remove|use\n\n\
+      the active one; unprefixed keys are the fallback for missing fields.\n\
+      Fields: HOST PORT USER PASS EXE_PATH CLIENT_PORT SERVER_PORT\n\
+      LOG_PATH ERR_PATH SEGMENT_SIZE.\n\
+      Manage them with: winboat-bridge env list|show|add|set|remove|use\n\
+      (details: winboat-bridge env -h / winboat-bridge env <action> -h)\n\n\
     Usage:\n\
       winboat-bridge -- <COMMAND>   Execute a command on the remote Windows server\n\
       winboat-bridge --server       Run in server mode (Windows side)\n\
@@ -209,11 +212,18 @@ async fn main() -> Result<()> {
     // (cwd -> exe dir -> project root). Vedi envs.rs.
     envs::load_dotenv();
 
-    // Debug: quale ambiente host e' attivo (WINBOAT_ENV -> WINBOAT_<NOME>_*).
-    match envs::active_name() {
-        Some(name) => eprintln!("[DEBUG] ambiente attivo: {} (variabili WINBOAT_{}_*)", name, name),
-        None => eprintln!("[DEBUG] ambiente attivo: default (variabili WINBOAT_*)"),
-    }
+    // Debug: quale ambiente host e' attivo (WINBOAT_ENV -> WINBOAT_<NOME>_*),
+    // con i valori effettivamente risolti (prefisso -> fallback -> default).
+    let env_label = envs::active_name()
+        .map(|n| format!("{} (WINBOAT_{}_*)", n, n))
+        .unwrap_or_else(|| "default (WINBOAT_*)".to_string());
+    let env_host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let env_winrm = envs::var("PORT").unwrap_or_else(|| "5985".to_string());
+    let env_client = envs::var("CLIENT_PORT").unwrap_or_else(|| "5330".to_string());
+    eprintln!(
+        "[DEBUG] ambiente attivo: {} -> host={} winrm={} client={}",
+        env_label, env_host, env_winrm, env_client
+    );
 
     let cli = Cli::parse();
 
@@ -255,6 +265,10 @@ async fn main() -> Result<()> {
             _ => {
                 println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
+                // Ambiente attivo ben visibile: e' il target di TUTTI i comandi.
+                println!("Ambiente attivo: {} -> host {} (winrm:{}, client:{})",
+                    envs::active_name().unwrap_or_else(|| "default".to_string()),
+                    env_host, env_winrm, env_client);
                 println!("Usage:");
                 println!("  winboat-bridge -- <COMMAND>   # Execute command remotely (Linux side)");
                 println!("  winboat-bridge --server       # Run in Server Mode (Windows side)");
@@ -262,7 +276,15 @@ async fn main() -> Result<()> {
                 println!("  winboat-bridge get <remote> <local>   # Download file (rsync delta)");
                 println!("  winboat-bridge status <local> <remote>  # Diff directory (read-only)");
                 println!("  winboat-bridge sync   <local> <remote>  # Mirror directory (upload)");
-                println!("  winboat-bridge env <list|show|add|set|remove|use>  # Manage .env hosts");
+                println!();
+                println!("Environments (.env multi-host):");
+                println!("  winboat-bridge env list                  # ambienti definiti (* = attivo)");
+                println!("  winboat-bridge env show <nome>           # config effettiva + fallback");
+                println!("  winboat-bridge env add <nome> --host IP  # nuovo ambiente");
+                println!("  winboat-bridge env set <nome> --user ..  # modifica campi");
+                println!("  winboat-bridge env use <nome>            # seleziona l'attivo");
+                println!("  winboat-bridge env remove <nome>         # elimina ambiente");
+                println!("  (dettagli: winboat-bridge env -h; override ad-hoc: WINBOAT_ENV=<nome>)");
                 println!();
                 println!("The -- form passes everything after it literally to cmd.exe on the");
                 println!("remote Windows host, with no shell escaping. Use single quotes around");
@@ -292,6 +314,12 @@ async fn main() -> Result<()> {
                 println!();
                 println!("  8. Mirror directory (sync):");
                 println!("     winboat-bridge sync   ./artifacts C:\\ci\\artifacts --delete");
+                println!();
+                println!("  9. Seleziona un altro host configurato:");
+                println!("     winboat-bridge env use h102   &&   winboat-bridge -- hostname");
+                println!();
+                println!(" 10. Aggiungi un nuovo host:");
+                println!("     winboat-bridge env add srv2 --host 10.0.0.9 --user admin --pass secret");
                 println!("-------------------------------------");
                 println!("For detailed help on all parameters, run:");
                 println!("  winboat-bridge -h");
