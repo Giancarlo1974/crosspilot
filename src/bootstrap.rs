@@ -109,6 +109,10 @@ pub async fn bootstrap_server() -> Result<()> {
     // Split dello username UPN (user@domain) in username + dominio NetBIOS.
     // NTLM usa il dominio NetBIOS (es. AC-S-SRL), non il DNS (es. ac-s-srl.it):
     // il suffisso @ va rimosso dal campo username dell'autenticazione.
+    // Copia per schtasks /RU (tentativo S4U): il raw viene mosso dallo
+    // split qui sotto. Formati accettati da /RU: user, DOMAIN\user, UPN.
+    let schtasks_user = winrm_user_raw.clone();
+
     let (winrm_user, winrm_domain) = if let Some(pos) = winrm_user_raw.rfind('@') {
         let user_part = winrm_user_raw[..pos].to_string();
         // Il dominio NTLM viene comunque auto-rilevato dal challenge Type 2:
@@ -192,10 +196,37 @@ pub async fn bootstrap_server() -> Result<()> {
     // schtasks: il processo è gestito dal Task Scheduler di Windows e
     // sopravvive alla chiusura della shell WinRM. È l'unico modo affidabile
     // per avviare un processo persistente via WinRM.
+    //
+    // Catena di tentativi per privilegi massimi + esecuzione nascosta.
+    // Un task configurato "run whether user is logged on or not" (SYSTEM,
+    // S4U o con password) gira in sessione 0 non interattiva: nessuna
+    // finestra cmd visibile. Il task interattivo (default storico) gira
+    // invece nella sessione utente e mostra la console.
+    //   1) /RU SYSTEM /RL HIGHEST: gira come SYSTEM (privilegi massimi,
+    //      piu' di Administrator) in sessione 0 → hidden. Creare un task
+    //      SYSTEM e' privilegio amministrativo: se l'utente WinRM non e'
+    //      admin, schtasks fallisce con Access Denied → tentativo 2.
+    //   2) /RU <utente> /NP /RL HIGHEST: logon S4U ("run whether user is
+    //      logged on or not" senza password memorizzata): gira come
+    //      l'utente WinRM con token elevato (se admin), sessione 0 →
+    //      hidden. Limite S4U: niente credenziali di rete in uscita
+    //      (bind TCP locale e file locali funzionano).
+    //   3) fallback storico: task interattivo — finestra visibile e token
+    //      non elevato, ma meglio un server visibile che nessun server.
+    // Lo script stampa RUNAS=<mode> per permettere al client di loggare
+    // la modalita' effettivamente selezionata.
     let ps_script = format!(
-        "schtasks /Create /TN winboat-server /TR '\"{}\" --server' /SC ONCE /ST 00:00 /F | Out-Null; \
-         schtasks /Run /TN winboat-server | Out-Null",
-        exe_path
+        "$tn='winboat-server'; $tr='\"{}\" --server'; $mode='FAILED'; \
+         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ $mode='SYSTEM' }} else {{ \
+         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU '{}' /NP /RL HIGHEST /F | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ $mode='USER_S4U' }} else {{ \
+         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /F | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ $mode='INTERACTIVE' }} \
+         }} }}; \
+         Write-Output \"RUNAS=$mode\"; \
+         schtasks /Run /TN $tn | Out-Null",
+        exe_path, schtasks_user
     );
     eprintln!("[DEBUG] bootstrap_server: script PowerShell = {}", ps_script);
 
@@ -223,6 +254,32 @@ pub async fn bootstrap_server() -> Result<()> {
             }
             if !stderr_str.trim().is_empty() {
                 eprintln!("[DEBUG] bootstrap_server: stderr={}", stderr_str.trim());
+            }
+
+            // Individua la modalita' di avvio scelta dalla catena di
+            // fallback nello script (RUNAS=SYSTEM|USER_S4U|INTERACTIVE|FAILED).
+            let mut runas_mode = "";
+            for line in stdout_str.lines() {
+                let trimmed = line.trim();
+                if let Some(mode) = trimmed.strip_prefix("RUNAS=") {
+                    runas_mode = mode;
+                }
+            }
+            match runas_mode {
+                "SYSTEM" => {
+                    println!("Remote server scheduled as SYSTEM (elevated, hidden).");
+                }
+                "USER_S4U" => {
+                    println!("Remote server scheduled as {} (elevated if admin, hidden).", schtasks_user);
+                }
+                "INTERACTIVE" => {
+                    eprintln!("[WARNING] Server avviato in sessione interattiva: finestra cmd visibile e privilegi non elevati.");
+                    eprintln!("          Per privilegi admin + esecuzione nascosta servono diritti admin sull'account WinRM.");
+                }
+                "FAILED" => {
+                    eprintln!("[ERROR] bootstrap_server: creazione task fallita in tutte le modalita'.");
+                }
+                _ => {}
             }
 
             if output.exit_code != 0 {
