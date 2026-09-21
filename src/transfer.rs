@@ -58,9 +58,10 @@ const PART_SUFFIX: &str = ".part";
 // ---------------------------------------------------------------------------
 
 /// Legge la dimensione del segmento da env `WINBOAT_SEGMENT_SIZE` (in byte).
+/// Risoluzione via envs: WINBOAT_<ENV>_SEGMENT_SIZE -> WINBOAT_SEGMENT_SIZE.
 /// Se non impostata usa il default 64 MB. Valida il range [1 MB, 256 MB].
 pub fn read_segment_size_env() -> Result<u64> {
-    let raw = std::env::var("WINBOAT_SEGMENT_SIZE").ok();
+    let raw = crate::envs::var("SEGMENT_SIZE");
     let value = match raw {
         Some(s) => {
             let parsed = s

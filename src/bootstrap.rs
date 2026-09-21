@@ -3,10 +3,71 @@
 
 use anyhow::{Context, Result};
 use tokio::net::TcpStream;
-use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use winrm_rs::WinrmError;
 
 use crate::deploy;
+use crate::envs;
+
+/// Settato quando l'endpoint WinRM risulta irraggiungibile a livello TCP
+/// (connect refused/timeout = servizio non attivo o firewall che droppa).
+/// Letto dal chiamante per arricchire l'errore finale con il remediation.
+static WINRM_UNREACHABLE: AtomicBool = AtomicBool::new(false);
+
+/// Dedup del messaggio di remediation: bootstrap_server viene chiamata nel
+/// retry loop (fino a 4 volte) e ogni chiamata puo' fallire 2 volte
+/// (Test-Path + schtasks). L'hint va stampato una sola volta per processo.
+static HINT_PRINTED: AtomicBool = AtomicBool::new(false);
+
+/// True se il bootstrap ha rilevato l'endpoint WinRM irraggiungibile.
+pub fn winrm_unreachable() -> bool {
+    WINRM_UNREACHABLE.load(Ordering::Relaxed)
+}
+
+/// Stampa una volta il remediation per WinRM non abilitato sull'host remoto.
+fn print_psremoting_hint(host: &str, port: u16) {
+    if HINT_PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!();
+    eprintln!("[HINT] Endpoint WinRM {}:{} non raggiungibile (servizio non attivo o firewall).", host, port);
+    eprintln!("       Sulla macchina Windows remota, da PowerShell come amministratore:");
+    eprintln!();
+    eprintln!("         Enable-PSRemoting -Force");
+    eprintln!();
+    eprintln!("       (crea il listener 5985 e le regole firewall; alternativa: winrm quickconfig)");
+    eprintln!();
+}
+
+/// Logga l'errore WinRM e stampa il remediation appropriato.
+/// Ritorna true se l'errore e' deterministico (endpoint morto o auth rifiutata):
+/// in quel caso ogni ulteriore chiamata WinRM fallirebbe identicamente, quindi
+/// il chiamante puo' saltare i tentativi successivi e passare al polling.
+/// Il transport ritenta gia' internamente gli errori HTTP transitori
+/// (send_soap_with_retry): un Http surfato qui e' quindi un fallimento reale.
+fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool {
+    eprintln!("[ERROR] bootstrap_server: {} fallito: {}", ctx, e);
+    match e {
+        WinrmError::Http(err) => {
+            if err.is_connect() || err.is_timeout() {
+                WINRM_UNREACHABLE.store(true, Ordering::Relaxed);
+                print_psremoting_hint(host, port);
+            }
+            true
+        }
+        WinrmError::AuthFailed(_) => {
+            if !HINT_PRINTED.swap(true, Ordering::Relaxed) {
+                eprintln!();
+                eprintln!("[HINT] Autenticazione WinRM rifiutata da {}:{}.", host, port);
+                eprintln!("       Verificare USER/PASS dell'ambiente attivo: winboat-bridge env show <nome>");
+                eprintln!();
+            }
+            true
+        }
+        _ => false,
+    }
+}
 
 /// Avvia il server remoto su Windows via WinRM.
 ///
@@ -31,18 +92,19 @@ use crate::deploy;
 /// (-EncodedCommand), eliminando i problemi di quoting/escaping.
 pub async fn bootstrap_server() -> Result<()> {
     // --- Path del server remoto (da .env) ---
-    let exe_path = env::var("WINBOAT_EXE_PATH")
-        .context("WINBOAT_EXE_PATH must be set in the .env file")?;
+    // Risoluzione via envs: WINBOAT_<ENV>_EXE_PATH -> fallback WINBOAT_EXE_PATH.
+    let exe_path = envs::var("EXE_PATH")
+        .context("WINBOAT_EXE_PATH (o WINBOAT_<ENV>_EXE_PATH) must be set in the .env file")?;
 
     // --- Credenziali e endpoint WinRM (da .env) ---
-    let host = env::var("WINBOAT_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
-    let winrm_port_str = env::var("WINBOAT_PORT")
-        .unwrap_or_else(|_| "47320".to_string());
-    let winrm_user_raw = env::var("WINBOAT_USER")
-        .unwrap_or_else(|_| "gianca".to_string());
-    let winrm_pass = env::var("WINBOAT_PASS")
-        .unwrap_or_else(|_| "gianca".to_string());
+    let host = envs::var("HOST")
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let winrm_port_str = envs::var("PORT")
+        .unwrap_or_else(|| "47320".to_string());
+    let winrm_user_raw = envs::var("USER")
+        .unwrap_or_else(|| "gianca".to_string());
+    let winrm_pass = envs::var("PASS")
+        .unwrap_or_else(|| "gianca".to_string());
 
     // Split dello username UPN (user@domain) in username + dominio NetBIOS.
     // NTLM usa il dominio NetBIOS (es. AC-S-SRL), non il DNS (es. ac-s-srl.it):
@@ -92,6 +154,10 @@ pub async fn bootstrap_server() -> Result<()> {
     // Distingue "file missing" (bug 3.6) da fallimento WinRM/protocollo.
     let check_script = format!("Test-Path '{}'", exe_path);
     let check_result = client.run_powershell(&host, &check_script).await;
+    // winrm_dead: errore deterministico (endpoint morto / auth rifiutata).
+    // In quel caso deploy e schtasks fallirebbero identicamente: si salta
+    // direttamente al polling (il server potrebbe comunque essere attivo).
+    let mut winrm_dead = false;
     let need_deploy = match check_result {
         Ok(out) => {
             let result_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -99,7 +165,7 @@ pub async fn bootstrap_server() -> Result<()> {
             result_str.eq_ignore_ascii_case("false")
         }
         Err(e) => {
-            eprintln!("[ERROR] bootstrap_server: Test-Path fallito: {}", e);
+            winrm_dead = report_winrm_error("Test-Path", &e, &host, winrm_port);
             // Se non riusciamo a verificare, proviamo ad avviare comunque
             // (il server potrebbe essere già in esecuzione).
             false
@@ -134,8 +200,14 @@ pub async fn bootstrap_server() -> Result<()> {
     eprintln!("[DEBUG] bootstrap_server: script PowerShell = {}", ps_script);
 
     // --- Esecuzione comando remoto ---
-    eprintln!("Bootstrapping server via WinRM...");
-    let ps_result = client.run_powershell(&host, &ps_script).await;
+    // Skip se WinRM e' deterministicamente non utilizzabile: la chiamata
+    // fallirebbe identica dopo ~30s di connect timeout. Il polling resta:
+    // il server potrebbe essere gia' in esecuzione da un avvio precedente.
+    if winrm_dead {
+        eprintln!("[bootstrap] WinRM non utilizzabile: skip avvio schtasks remoto.");
+    } else {
+        eprintln!("Bootstrapping server via WinRM...");
+        let ps_result = client.run_powershell(&host, &ps_script).await;
 
     // Verifica del risultato: il bug precedente ignorava completamente
     // l'output del comando remoto. Ora controlliamo exit_code e stderr.
@@ -169,8 +241,9 @@ pub async fn bootstrap_server() -> Result<()> {
             // Connessione WinRM fallita (rete, credenziali, servizio non attivo).
             // Non ritorniamo errore: il server potrebbe essere già in esecuzione.
             // Il chiamante ritenterà la connessione TCP fino a max_attempts.
-            eprintln!("[ERROR] bootstrap_server: comando WinRM fallito: {}", e);
+            report_winrm_error("comando WinRM", &e, &host, winrm_port);
         }
+    }
     }
 
     // --- Polling: verifica che il server TCP sia effettivamente partito ---
@@ -185,10 +258,10 @@ pub async fn bootstrap_server() -> Result<()> {
 /// per un massimo di 30s. Non ritorna errore — il chiamante gestisce i retry.
 async fn poll_server_startup() {
     println!("Waiting for server to start...");
-    let host = env::var("WINBOAT_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
-    let client_port = env::var("WINBOAT_CLIENT_PORT")
-        .unwrap_or_else(|_| "47330".to_string());
+    let host = envs::var("HOST")
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let client_port = envs::var("CLIENT_PORT")
+        .unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
 
     let mut connected = false;

@@ -6,7 +6,6 @@ use tokio::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use std::env;
 use std::io::ErrorKind;
 use std::time::Duration;
 
@@ -22,6 +21,8 @@ mod sync_server;
 // Modulo bootstrap WinRM (separato da main.rs per dimensione, best-practice < 1000 righe).
 mod bootstrap;
 mod deploy;
+// Modulo ambienti host multipli nel .env (CRUD via sottocomando `env`).
+mod envs;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -96,7 +97,12 @@ mod win_job {
       WINBOAT_LOG_PATH      - Server log output path (default: C:\\\\Users\\\\gianca\\\\server.log)\n\
       WINBOAT_ERR_PATH      - Server error output path (default: C:\\\\Users\\\\gianca\\\\server.err)\n\
       WINBOAT_SERVER_PORT   - Server listening port (default: 5330)\n\
-      WINBOAT_CLIENT_PORT   - Client connection port (default: 47330)\n\n\
+      WINBOAT_CLIENT_PORT   - Client connection port (default: 47330)\n\
+      WINBOAT_ENV           - Active environment name (see below)\n\n\
+    Multiple environments: the .env can hold N named host configs as\n\
+      WINBOAT_<NAME>_<FIELD> (e.g. WINBOAT_PROD_HOST). WINBOAT_ENV selects\n\
+      the active one; unprefixed keys are the fallback. Manage them with:\n\
+      winboat-bridge env list|show|add|set|remove|use\n\n\
     Usage:\n\
       winboat-bridge -- <COMMAND>   Execute a command on the remote Windows server\n\
       winboat-bridge --server       Run in server mode (Windows side)\n\
@@ -186,88 +192,29 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
+    /// Gestione degli ambienti (configurazioni host) nel file .env.
+    ///
+    /// Il .env può contenere N ambienti come WINBOAT_<NOME>_<CAMPO>
+    /// (es. WINBOAT_PROD_HOST). WINBOAT_ENV seleziona l'ambiente attivo;
+    /// le chiavi non prefissate (ambiente "default") fanno da fallback.
+    Env {
+        #[command(subcommand)]
+        action: envs::EnvAction,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Try loading .env from multiple locations
-    let mut env_loaded = false;
-    let mut tried_paths = Vec::new();
-    
-    // 1. Try current working directory
-    let cwd_env = std::env::current_dir().ok().map(|p| p.join(".env"));
-    if let Some(ref path) = cwd_env {
-        tried_paths.push(path.display().to_string());
-        if path.exists() {
-            match dotenvy::from_path(path) {
-                Ok(_) => {
-                    eprintln!("[DEBUG] Loaded .env from: {}", path.display());
-                    env_loaded = true;
-                }
-                Err(e) => {
-                    eprintln!("[DEBUG] Failed to load .env from {}: {}", path.display(), e);
-                }
-            }
-        }
+    // Carica il .env dal primo path candidato disponibile
+    // (cwd -> exe dir -> project root). Vedi envs.rs.
+    envs::load_dotenv();
+
+    // Debug: quale ambiente host e' attivo (WINBOAT_ENV -> WINBOAT_<NOME>_*).
+    match envs::active_name() {
+        Some(name) => eprintln!("[DEBUG] ambiente attivo: {} (variabili WINBOAT_{}_*)", name, name),
+        None => eprintln!("[DEBUG] ambiente attivo: default (variabili WINBOAT_*)"),
     }
-    
-    // 2. Try executable directory
-    if !env_loaded {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let env_path = exe_dir.join(".env");
-                tried_paths.push(env_path.display().to_string());
-                if env_path.exists() {
-                    match dotenvy::from_path(&env_path) {
-                        Ok(_) => {
-                            eprintln!("[DEBUG] Loaded .env from: {}", env_path.display());
-                            env_loaded = true;
-                        }
-                        Err(e) => {
-                            eprintln!("[DEBUG] Failed to load .env from {}: {}", env_path.display(), e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // 3. Try project root (parent of target/release or target/debug)
-    if !env_loaded {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                // If we're in target/release or target/debug, go up two levels
-                if exe_dir.ends_with("release") || exe_dir.ends_with("debug") {
-                    if let Some(target_dir) = exe_dir.parent() {
-                        if let Some(project_root) = target_dir.parent() {
-                            let env_path = project_root.join(".env");
-                            tried_paths.push(env_path.display().to_string());
-                            if env_path.exists() {
-                                match dotenvy::from_path(&env_path) {
-                                    Ok(_) => {
-                                        eprintln!("[DEBUG] Loaded .env from: {}", env_path.display());
-                                        env_loaded = true;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[DEBUG] Failed to load .env from {}: {}", env_path.display(), e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    if !env_loaded {
-        eprintln!("[WARNING] No .env file found in any of these locations:");
-        for path in tried_paths {
-            eprintln!("  - {}", path);
-        }
-        eprintln!("Using defaults or system environment variables.");
-    }
-    
+
     let cli = Cli::parse();
 
     if cli.server || matches!(cli.command, Some(Commands::Server { .. })) {
@@ -301,6 +248,10 @@ async fn main() -> Result<()> {
             Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet }) => {
                 client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet).await?;
             }
+            // CRUD ambienti host nel .env (nessuna connessione richiesta).
+            Some(Commands::Env { action }) => {
+                envs::run(&action)?;
+            }
             _ => {
                 println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
@@ -311,6 +262,7 @@ async fn main() -> Result<()> {
                 println!("  winboat-bridge get <remote> <local>   # Download file (rsync delta)");
                 println!("  winboat-bridge status <local> <remote>  # Diff directory (read-only)");
                 println!("  winboat-bridge sync   <local> <remote>  # Mirror directory (upload)");
+                println!("  winboat-bridge env <list|show|add|set|remove|use>  # Manage .env hosts");
                 println!();
                 println!("The -- form passes everything after it literally to cmd.exe on the");
                 println!("remote Windows host, with no shell escaping. Use single quotes around");
@@ -357,8 +309,7 @@ async fn server_mode(port: u16) -> Result<()> {
         let _ = Command::new("cmd").args(&["/C", "chcp 65001"]).output().await;
     }
 
-    let actual_port = env::var("WINBOAT_SERVER_PORT")
-        .ok()
+    let actual_port = envs::var("SERVER_PORT")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(port);
     
@@ -755,11 +706,28 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Errore finale del retry loop di connessione. Se il bootstrap ha rilevato
+/// l'endpoint WinRM irraggiungibile, allega il remediation (abilitare WinRM
+/// sull'host remoto) invece del messaggio generico.
+fn final_connect_error(addr: &str) -> anyhow::Error {
+    if bootstrap::winrm_unreachable() {
+        return anyhow::anyhow!(
+            "Failed to connect to {} after bootstrap attempts.\n\
+             WinRM non raggiungibile sull'host remoto. Per abilitarlo, sulla macchina\n\
+             Windows eseguire da PowerShell come amministratore:\n  Enable-PSRemoting -Force\n\
+             (oppure: winrm quickconfig)",
+            addr
+        );
+    }
+    anyhow::anyhow!("Failed to connect to server after bootstrap attempt")
+}
+
 /// Stabilisce la connessione TCP al server e verifica l'handshake READY.
 /// Riutilizzata sia dai comandi shell (-c) che dal transfer file (put/get).
 async fn connect_and_handshake() -> Result<TcpStream> {
-    let host = env::var("WINBOAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let client_port = env::var("WINBOAT_CLIENT_PORT").unwrap_or_else(|_| "47330".to_string());
+    // Risoluzione via envs: WINBOAT_<ENV>_<CAMPO> -> fallback WINBOAT_<CAMPO>.
+    let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
 
     // Loop di tentativi con bootstrap (come client_mode esistente).
@@ -779,9 +747,7 @@ async fn connect_and_handshake() -> Result<TcpStream> {
             Ok(Ok(s)) => s,
             _ => {
                 if attempt >= max_attempts {
-                    return Err(anyhow::anyhow!(
-                        "Failed to connect to server after bootstrap attempt"
-                    ));
+                    return Err(final_connect_error(&addr));
                 }
                 eprintln!("Connection failed or timed out. Bootstrapping...");
                 bootstrap::bootstrap_server().await?;
@@ -918,11 +884,12 @@ async fn client_sync(
 
 async fn client_mode(cmd: &str) -> Result<()> {
     // Same host as bootstrap (WinRM): WINBOAT_HOST. Only the port differs.
-    let host = env::var("WINBOAT_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Risoluzione via envs: WINBOAT_<ENV>_<CAMPO> -> fallback WINBOAT_<CAMPO>.
+    let host = envs::var("HOST")
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     // Port mapped on host: 47330 -> Container: 5330
-    let client_port = env::var("WINBOAT_CLIENT_PORT")
-        .unwrap_or_else(|_| "47330".to_string());
+    let client_port = envs::var("CLIENT_PORT")
+        .unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
     
     // Attempt connection loop (Connect -> Handshake -> if fail -> Bootstrap -> Retry)
@@ -943,7 +910,7 @@ async fn client_mode(cmd: &str) -> Result<()> {
             Ok(Ok(s)) => s,
             _ => {
                 if attempt >= max_attempts {
-                     return Err(anyhow::anyhow!("Failed to connect to server after bootstrap attempt"));
+                     return Err(final_connect_error(&addr));
                 }
                 eprintln!("Connection failed or timed out. Bootstrapping...");
                 bootstrap::bootstrap_server().await?;

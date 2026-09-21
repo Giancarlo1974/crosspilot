@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use winrm_rs::WinrmClient;
 
+use crate::envs;
+
 /// Binario Windows embeddato (compilato con scripts/build-release.sh).
 /// Se questo file manca, il build fallisce. Esegui:
 ///   ./scripts/build-release.sh
@@ -163,7 +165,13 @@ pub async fn deploy_exe(
     // Il server remoto ha bisogno di WINBOAT_SERVER_PORT per sapere su quale
     // porta ascoltare. Gli altri parametri (WINBOAT_HOST, WINBOAT_USER, ecc.)
     // servono solo al client Linux e non sono necessari sul server.
-    let env_content = "WINBOAT_SERVER_PORT=5330\n";
+    // La porta viene dalla config attiva (WINBOAT_<ENV>_SERVER_PORT ->
+    // fallback WINBOAT_SERVER_PORT -> 5330).
+    // Nota: niente "\n" nel contenuto: la stringa PowerShell e' single-quoted
+    // e "\n" resterebbe letterale nel file .env remoto.
+    let server_port = envs::var("SERVER_PORT")
+        .unwrap_or_else(|| "5330".to_string());
+    let env_content = format!("WINBOAT_SERVER_PORT={}", server_port);
     let env_remote = format!(
         "{}\\.env",
         remote_exe_path.rfind('\\').map(|i| &remote_exe_path[..i]).unwrap_or("C:\\")
