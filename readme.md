@@ -18,6 +18,7 @@ If you are in a hurry and want to skip building from source, check the simple qu
 - The `--` form passes everything after it literally to `cmd.exe` on the remote Windows host, with no shell escaping — write commands exactly as you would on a Windows console
 - Automatic server bootstrap via WinRM if the bridge server is down
 - **Auto-deploy**: if the Windows server exe is missing or outdated on the remote host, the client automatically uploads the embedded copy via WinRM (no manual deployment needed)
+- **Multiple environments**: the `.env` can hold N named host configs (`WINBOAT_<NAME>_*`); select the active one with `WINBOAT_ENV` and manage them with `winboat-bridge env list|show|add|set|remove|use`
 
 ### Single-file transfer with rsync-style delta (v1)
 - `put` — upload a local file to the remote host (delta transfer, only changed blocks are sent)
@@ -50,8 +51,8 @@ cp .env.example .env
 ```
 
 **⚠️ IMPORTANT - .env File Syntax:**
-- Use **double backslashes** (`\\`) for Windows paths
-- **DO NOT use quotes** for values
+- Use **double backslashes** (`\\`) for Windows paths in unquoted values
+- Quotes are supported: `"C:\\Users\\x"` is unescaped to `C:\Users\x` (the `env` commands write quoted values automatically when needed)
 
 Correct example:
 ```bash
@@ -64,11 +65,41 @@ Main parameters:
 - **WINBOAT_HOST / PORT**: Address and port for bootstrap (WinRM). The same host is used by the client for the TCP bridge connection
 - **WINBOAT_CLIENT_PORT**: Port on the Linux system (Host) mapped to the container
 - **WINBOAT_SERVER_PORT**: Internal port of the Windows container that the server listens on
+- **WINBOAT_ENV**: Active environment name (see "Multiple environments" below)
 
 The .env file is automatically searched in:
 1. Current working directory
 2. Executable directory
 3. Project root (if executable in `target/release`)
+
+### Multiple environments
+
+The `.env` can hold N named host configurations using prefixed keys `WINBOAT_<NAME>_<FIELD>` (e.g. `WINBOAT_PROD_HOST`, `WINBOAT_PROD_USER`). `WINBOAT_ENV=<NAME>` selects the active environment; unprefixed keys (the "default" environment) are the fallback for fields missing in the named env — so a named env only needs to override what differs.
+
+Fields: `HOST`, `PORT` (WinRM), `USER`, `PASS`, `EXE_PATH`, `CLIENT_PORT`, `SERVER_PORT`, `LOG_PATH`, `ERR_PATH`, `SEGMENT_SIZE` (transfer segment bytes, 1MB–256MB).
+Reserved names (they would collide with unprefixed keys): `ENV`, `SERVER`, `CLIENT`, `DEFAULT`.
+
+Manage environments directly from the tool — no manual editing needed:
+
+```bash
+# Create an environment (at least --host is required)
+winboat-bridge env add prod --host 10.0.0.5 --user admin --pass secret \
+    --winrm-port 5985 --exe-path 'C:\tools\winboat-bridge.exe' \
+    --client-port 5330 --server-port 5330
+
+winboat-bridge env list            # list environments (* = active)
+winboat-bridge env show prod       # effective config (password masked; --reveal to show)
+winboat-bridge env set prod --host 10.0.0.9   # update fields
+winboat-bridge env use prod        # set WINBOAT_ENV=PROD in .env
+winboat-bridge env use default     # back to unprefixed keys
+winboat-bridge env remove prod
+```
+
+One-off override without editing the file (shell env vars take precedence over .env):
+
+```bash
+WINBOAT_ENV=staging winboat-bridge -- ipconfig
+```
 
 ## 2. Compilation
 
@@ -220,6 +251,8 @@ winboat-bridge -- powershell -File C:\Scripts\Setup-Test.ps1
 
 Point `WINBOAT_HOST` to the remote machine and `WINBOAT_CLIENT_PORT` to the port the bridge server is listening on. Both the bootstrap (WinRM) and the TCP data channel use the same host, only the ports differ.
 
+> **Tip:** instead of overwriting the default values, you can keep multiple hosts side by side with named environments — `winboat-bridge env add remote --host 172.16.0.101 ...` then `winboat-bridge env use remote`. See "Multiple environments" in section 1.
+
 `.env` for a remote host at `172.16.0.101`:
 
 ```bash
@@ -349,8 +382,8 @@ Go on, click that star. You know you want to! 😉
 |-----------------------|--------------------------|-----------|
 | The command "hangs" | Zombie connection       | Ctrl+C and restart; the client will force a new bootstrap. |
 | Connection Refused    | Wrong port mapping     | Check with `docker ps` that port 47330 is open (local) or `nc -zv <host> 5330` (remote). |
-| "WINBOAT_EXE_PATH must be set" | .env file not found or wrong syntax | Verify that the .env file exists and uses double backslashes (`\\`) without quotes. Run with `--help` to see the message `[DEBUG] Loaded .env from: ...` |
-| .env parsing error   | Wrong syntax          | Use double backslashes (`\\`) for Windows paths and DO NOT use quotes. |
+| "WINBOAT_EXE_PATH (o WINBOAT_<ENV>_EXE_PATH) must be set" | .env file not found, wrong syntax, or the active env doesn't define `EXE_PATH` | Verify that the .env file exists and check `winboat-bridge env show <name>` to see which fields are resolved. Run with `--help` to see the message `[DEBUG] Loaded .env from: ...` |
+| .env parsing error   | Wrong syntax          | Use double backslashes (`\\`) for Windows paths in unquoted values (quoted values are supported and unescaped). |
 | Bootstrap succeeds but client still can't connect | `WINBOAT_EXE_PATH` points to a non-existent file on the remote host | The client auto-deploys the embedded exe if missing. If auto-deploy fails, check WinRM connectivity and that the target directory is writable. Run `Test-Path "<path>"` on the remote host to verify. |
 | Auto-deploy fails with "Binario locale non trovato" | The Linux binary was built without `build-release.sh` (no embedded exe) | Rebuild with `./scripts/build-release.sh` to embed the Windows exe. |
 | Bootstrap fails with "Connection refused" | WinRM not enabled on the remote host | Run `Enable-PSRemoting -Force` on the remote Windows host and open port 5985 in the firewall (`Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -RemoteAddress Any`). |
