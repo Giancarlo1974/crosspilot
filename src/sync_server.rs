@@ -1,4 +1,4 @@
-//! Handler server per directory sync v2 (LIST/MKDIR/DELETE).
+//! Handler server per directory sync (LIST/MKDIR/DELETE).
 //!
 //! Modulo separato da `sync.rs` (che contiene la logica client) per rispettare
 //! la best-practice "unit < 1000 linee". La spec §12 elenca sync.rs con le
@@ -41,7 +41,7 @@ use crate::verify::sha256_file_handle;
 /// Se entry_count supera il cap -> ERR 5. Se path invalido -> ERR 1.
 /// Directory non esistente -> LIST_RES con 0 entry (sync-spec §9 decisione).
 pub async fn list_server(stream: &mut TcpStream, req: &ListReq) -> Result<()> {
-    // Valida il path base (come v1 §12).
+    // Valida il path base (transfer-spec §12).
     let validate_result = path::validate_server_path(&req.path);
     if let Err(e) = validate_result {
         let err_msg = e.to_err_msg();
@@ -250,7 +250,7 @@ pub async fn mkdir_batch_server(stream: &mut TcpStream, req: &MkdirBatchReq) -> 
 
 /// Crea una singola directory (mkdir -p) con validazione path + containment.
 fn mkdir_single(path_str: &str) -> BatchResult {
-    // Valida il path assoluto (come v1 §12).
+    // Valida il path assoluto (transfer-spec §12).
     let validate = path::validate_server_path(path_str);
     if let Err(e) = validate {
         return BatchResult::error(e.code, e.message);
@@ -356,7 +356,7 @@ mod tests {
     async fn mkdir_batch_server_creates_dirs() {
         // sync-spec §14 test 17: MKDIR_BATCH con più directory -> 1 connessione.
         // Test a livello funzione (no rete): verifica mkdir_single + containment.
-        let root = std::env::temp_dir().join("winboat_mkdir_server");
+        let root = std::env::temp_dir().join("crosspilot_mkdir_server");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let p1 = root.join("a").to_string_lossy().into_owned();
@@ -378,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_batch_server_removes() {
-        let root = std::env::temp_dir().join("winboat_delete_server");
+        let root = std::env::temp_dir().join("crosspilot_delete_server");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let file_path = root.join("file.txt");
@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn list_server_walks_and_caps() {
         // sync-spec §14 test 15: directory con entry -> LIST le restituisce.
-        let root = std::env::temp_dir().join("winboat_list_server");
+        let root = std::env::temp_dir().join("crosspilot_list_server");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("f1.txt"), b"one").unwrap();
@@ -432,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn list_server_skips_symlink_escape() {
         // sync-spec §14 test 19: junction/symlink nel walk server -> skip.
-        let root = std::env::temp_dir().join("winboat_list_symlink");
+        let root = std::env::temp_dir().join("crosspilot_list_symlink");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("real.txt"), b"ok").unwrap();

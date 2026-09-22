@@ -124,7 +124,7 @@ pub fn require_local_file_exists(path: &str) -> Result<(), TransferError> {
 }
 
 // ---------------------------------------------------------------------------
-// Estensioni sync v2 (sync-spec §8).
+// Estensioni sync (sync-spec §8).
 // ---------------------------------------------------------------------------
 
 /// Verifica che una directory locale (lato client, per status/sync) esista
@@ -444,7 +444,7 @@ mod tests {
         assert!(require_local_file_exists(&path).is_ok());
     }
 
-    // --- Test sync v2 (sync-spec §15 passo 2) -----------------------------
+    // --- Test sync (sync-spec §15 passo 2) --------------------------------
 
     #[test]
     fn validate_rel_path_ok() {
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn canonicalize_under_ok_for_existing() {
         // Crea una dir temporanea e un file dentro: canonicalize_under ok.
-        let base = std::env::temp_dir().join("winboat_canon_under_test");
+        let base = std::env::temp_dir().join("crosspilot_canon_under_test");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let inner = base.join("sub");
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn canonicalize_under_ok_for_new_path() {
         // Path non ancora esistente sotto base -> ok (no junction possibile).
-        let base = std::env::temp_dir().join("winboat_canon_under_new");
+        let base = std::env::temp_dir().join("crosspilot_canon_under_new");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let new_path = base.join("new").join("deeper").join("file.txt");
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn canonicalize_under_detects_symlink_escape() {
         // sync-spec §14 test 19: symlink che punta fuori da remote_dir.
-        let base = std::env::temp_dir().join("winboat_canon_symlink_test");
+        let base = std::env::temp_dir().join("crosspilot_canon_symlink_test");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         // Crea un symlink dentro base che punta a /etc (fuori da base).
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn canonicalize_under_rejects_parent_component() {
-        let base = std::env::temp_dir().join("winboat_canon_parent_test");
+        let base = std::env::temp_dir().join("crosspilot_canon_parent_test");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         // Path con '..' che escaperebbe.

@@ -1,40 +1,84 @@
 name: Release
 
+# Ogni push su main -> prerelease rolling "latest" (asset sovrascritti).
+# Ogni tag v* -> release stabile versionata.
+# Il "version bump" e' automatico: build-release.sh esporta CROSSPILOT_BUILD_TS
+# (unix ts) condiviso dai 3 artefatti; l'auto-update confronta il ts, non il
+# semver, quindi non serve bumpare Cargo.toml ad ogni push.
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact_path: target/release/winboat-bridge
-            asset_name: winboat-bridge-linux
-          - os: windows-latest
-            artifact_path: target/release/winboat-bridge.exe
-            asset_name: winboat-bridge-windows.exe
+    name: Build artifacts
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust toolchain + cross targets
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # windows-gnu = exe server remoto; musl = sidecar self-update
+          targets: x86_64-pc-windows-gnu,x86_64-unknown-linux-musl
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Install cross toolchain (MinGW per exe Windows, musl-gcc per sidecar)
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 musl-tools
 
-      - name: Upload binaries to release
+      - name: Build release (exe Windows + sidecar musl + host con embeds)
+        env:
+          # ring (dipendenza di rustls) ha build.rs in C: cc-rs cerca
+          # x86_64-linux-musl-gcc, musl-tools fornisce musl-gcc -> alias.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: ./scripts/build-release.sh
+
+      - name: Resolve release tag
+        id: rel
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            # Rolling prerelease: tag fisso 'latest', asset sovrascritti
+            # ad ogni push su main. I client che puntano a 'latest'
+            # ricevono sempre il build piu' recente.
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=latest (rolling build ${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload linux client (gnu, embeds completi)
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ${{ matrix.artifact_path }}
-          asset_name: ${{ matrix.asset_name }}
-          tag: ${{ github.ref }}
+          file: target/release/crosspilot
+          asset_name: crosspilot-linux
+          tag: ${{ steps.rel.outputs.tag }}
+          release_name: ${{ steps.rel.outputs.name }}
+          prerelease: ${{ steps.rel.outputs.prerelease }}
+          overwrite: true
+
+      - name: Upload windows server exe (standalone, deploy manuale)
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: assets/crosspilot.exe
+          asset_name: crosspilot-windows.exe
+          tag: ${{ steps.rel.outputs.tag }}
+          overwrite: true
+
+      - name: "Upload linux musl statico (gira ovunque: Ubuntu/NixOS/Alpine)"
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: assets/crosspilot.linux
+          asset_name: crosspilot-linux-musl
+          tag: ${{ steps.rel.outputs.tag }}
+          overwrite: true

@@ -3,7 +3,7 @@
 //! Ogni messaggio in wire ha questo header:
 //! ```text
 //! u32 LE  magic       = 0x3142_4644   // "DFB1"
-//! u8      version     = 1
+//! u8      version     = 2
 //! u8      msg_type
 //! u32 LE  payload_len
 //! [u8;N]  payload
@@ -12,7 +12,7 @@
 //! I messaggi sono: PUT_REQ(1), GET_REQ(2), META(7), SIGNATURE(3),
 //! DELTA(4), ACK(5), ERR(6). Vedi `docs/transfer-spec.md` sezione 6.
 //!
-//! Messaggi directory sync v2 (vedi `docs/sync-spec.md` sezione 5):
+//! Messaggi directory sync (vedi `docs/sync-spec.md` sezione 5):
 //! LIST_REQ(8), LIST_RES(9), MKDIR_BATCH_REQ(10), MKDIR_BATCH_RES(11),
 //! DELETE_BATCH_REQ(12), DELETE_BATCH_RES(13).
 
@@ -23,8 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Usato dal server per distinguere la modalità file dalla modalità shell (peek 4 byte).
 pub const MAGIC: u32 = 0x3142_4644;
 
-/// Versione del protocollo file transfer (v1).
-pub const VERSION: u8 = 1;
+/// Versione del protocollo (unica, copre file transfer + directory sync).
+pub const VERSION: u8 = 2;
 
 // Identificatori dei tipi di messaggio (msg_type).
 pub const MSG_PUT_REQ: u8 = 1;
@@ -35,7 +35,7 @@ pub const MSG_ACK: u8 = 5;
 pub const MSG_ERR: u8 = 6;
 pub const MSG_META: u8 = 7;
 
-// Messaggi directory sync v2 (sync-spec §5).
+// Messaggi directory sync (sync-spec §5).
 pub const MSG_LIST_REQ: u8 = 8;
 pub const MSG_LIST_RES: u8 = 9;
 pub const MSG_MKDIR_BATCH_REQ: u8 = 10;
@@ -63,11 +63,11 @@ pub const ERR_FILE_NOT_FOUND: u16 = 2;
 pub const ERR_IO: u16 = 3;
 pub const ERR_CHECKSUM_MISMATCH: u16 = 4;
 pub const ERR_PROTO: u16 = 5;
-/// Riservato, non usato in v1.
+/// Riservato, non usato.
 pub const ERR_RESERVED: u16 = 6;
 
 /// Restituisce una descrizione umana del codice di errore (per log server/client).
-/// Referenzia tutti i codici definiti, incluso ERR_RESERVED (documentato ma non usato in v1).
+/// Referenzia tutti i codici definiti, incluso ERR_RESERVED (documentato ma non usato).
 pub fn error_code_description(code: u16) -> &'static str {
     match code {
         ERR_PATH_FORBIDDEN => "path vietato",
@@ -75,7 +75,7 @@ pub fn error_code_description(code: u16) -> &'static str {
         ERR_IO => "errore di I/O",
         ERR_CHECKSUM_MISMATCH => "checksum mismatch",
         ERR_PROTO => "errore di protocollo (magic/version/parametri invalidi)",
-        ERR_RESERVED => "riservato (non usato in v1)",
+        ERR_RESERVED => "riservato (non usato)",
         _ => "codice errore sconosciuto",
     }
 }
@@ -612,7 +612,7 @@ pub async fn send_err<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
-// Messaggi directory sync v2 (sync-spec §5, §9).
+// Messaggi directory sync (sync-spec §5, §9).
 // ---------------------------------------------------------------------------
 
 /// Richiesta LIST (C→S): path assoluto remoto + flag recursive + with_hash.
@@ -1226,7 +1226,7 @@ mod tests {
     }
 
     /// Verifica che i codici di errore del protocollo siano tutti distinti e
-    /// che ERR_RESERVED = 6 (spec §14: riservato, non usato in v1).
+    /// che ERR_RESERVED = 6 (spec §14: riservato, non usato).
     #[test]
     fn error_codes_are_distinct_and_reserved_is_6() {
         let codes = [
@@ -1241,7 +1241,7 @@ mod tests {
         for (i, &c) in codes.iter().enumerate() {
             assert_eq!(c, (i + 1) as u16, "codice errore alla posizione {} non progressivo", i);
         }
-        // ERR_RESERVED è esplicitamente 6 (non usato in v1, ma documentato).
+        // ERR_RESERVED è esplicitamente 6 (non usato, ma documentato).
         assert_eq!(ERR_RESERVED, 6);
     }
 
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(error_code_description(ERR_IO), "errore di I/O");
         assert_eq!(error_code_description(ERR_CHECKSUM_MISMATCH), "checksum mismatch");
         assert_eq!(error_code_description(ERR_PROTO), "errore di protocollo (magic/version/parametri invalidi)");
-        assert_eq!(error_code_description(ERR_RESERVED), "riservato (non usato in v1)");
+        assert_eq!(error_code_description(ERR_RESERVED), "riservato (non usato)");
         assert_eq!(error_code_description(999), "codice errore sconosciuto");
     }
 
@@ -1304,7 +1304,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- Test directory sync v2 (sync-spec §15 passo 1) -------------------
+    // --- Test directory sync (sync-spec §15 passo 1) ----------------------
 
     #[test]
     fn roundtrip_list_req() {

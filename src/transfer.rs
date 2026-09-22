@@ -57,8 +57,8 @@ const PART_SUFFIX: &str = ".part";
 // Config helpers.
 // ---------------------------------------------------------------------------
 
-/// Legge la dimensione del segmento da env `WINBOAT_SEGMENT_SIZE` (in byte).
-/// Risoluzione via envs: WINBOAT_<ENV>_SEGMENT_SIZE -> WINBOAT_SEGMENT_SIZE.
+/// Legge la dimensione del segmento da env `CROSSPILOT_SEGMENT_SIZE` (in byte).
+/// Risoluzione via envs: CROSSPILOT_<ENV>_SEGMENT_SIZE -> CROSSPILOT_SEGMENT_SIZE.
 /// Se non impostata usa il default 64 MB. Valida il range [1 MB, 256 MB].
 pub fn read_segment_size_env() -> Result<u64> {
     let raw = crate::envs::var("SEGMENT_SIZE");
@@ -66,9 +66,9 @@ pub fn read_segment_size_env() -> Result<u64> {
         Some(s) => {
             let parsed = s
                 .parse::<u64>()
-                .with_context(|| format!("WINBOAT_SEGMENT_SIZE non è un numero valido: {}", s))?;
+                .with_context(|| format!("CROSSPILOT_SEGMENT_SIZE non è un numero valido: {}", s))?;
             eprintln!(
-                "[DEBUG] transfer: WINBOAT_SEGMENT_SIZE override = {} byte",
+                "[DEBUG] transfer: CROSSPILOT_SEGMENT_SIZE override = {} byte",
                 parsed
             );
             parsed
@@ -78,7 +78,7 @@ pub fn read_segment_size_env() -> Result<u64> {
 
     if value < MIN_SEGMENT_SIZE || value > MAX_SEGMENT_SIZE {
         bail!(
-            "WINBOAT_SEGMENT_SIZE {} fuori range (min {}, max {})",
+            "CROSSPILOT_SEGMENT_SIZE {} fuori range (min {}, max {})",
             value,
             MIN_SEGMENT_SIZE,
             MAX_SEGMENT_SIZE

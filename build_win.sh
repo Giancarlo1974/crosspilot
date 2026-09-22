@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Script helper per compilare winboat-bridge per Windows su NixOS
+# Script helper per compilare crosspilot per Windows su NixOS
 
 echo "Ricerca libreria pthread per mingw..."
 PTHREAD_LIB=$(find /nix/store -name "libpthread.a" 2>/dev/null | grep mingw | head -n 1)
@@ -17,7 +17,7 @@ RUSTFLAGS="-L native=$PTHREAD_DIR" cargo build --release --target x86_64-pc-wind
 
 if [ $? -eq 0 ]; then
     echo "Compilazione completata con successo!"
-    echo "Eseguibile: target/x86_64-pc-windows-gnu/release/winboat-bridge.exe"
+    echo "Eseguibile: target/x86_64-pc-windows-gnu/release/crosspilot.exe"
 else
     echo "Errore durante la compilazione."
     exit 1

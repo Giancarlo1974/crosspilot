@@ -33,12 +33,12 @@ fn load_dotenv() {
 
 /// Legge le credenziali WinRM dal .env.
 fn load_env() -> (String, String, String, String, String) {
-    let host = env::var("WINBOAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = env::var("WINBOAT_PORT").unwrap_or_else(|_| "5985".to_string());
-    let user = env::var("WINBOAT_USER").unwrap_or_else(|_| "gianca".to_string());
-    let pass = env::var("WINBOAT_PASS").unwrap_or_else(|_| "gianca".to_string());
-    let exe_path = env::var("WINBOAT_EXE_PATH")
-        .unwrap_or_else(|_| r"C:\Users\giancarloalbanese\repos\winboat-bridge\target\release\winboat-bridge.exe".to_string());
+    let host = env::var("CROSSPILOT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = env::var("CROSSPILOT_PORT").unwrap_or_else(|_| "5985".to_string());
+    let user = env::var("CROSSPILOT_USER").unwrap_or_else(|_| "gianca".to_string());
+    let pass = env::var("CROSSPILOT_PASS").unwrap_or_else(|_| "gianca".to_string());
+    let exe_path = env::var("CROSSPILOT_EXE_PATH")
+        .unwrap_or_else(|_| r"C:\Users\giancarloalbanese\repos\crosspilot\target\release\crosspilot.exe".to_string());
     (host, port, user, pass, exe_path)
 }
 
@@ -86,11 +86,11 @@ async fn main() {
     // --- Path locale del binario cross-compilato ---
     let local_exe: PathBuf = env::current_dir()
         .unwrap()
-        .join("target/x86_64-pc-windows-gnu/release/winboat-bridge.exe");
+        .join("target/x86_64-pc-windows-gnu/release/crosspilot.exe");
 
     if !local_exe.exists() {
         eprintln!("ERRORE: binario locale non trovato: {}", local_exe.display());
-        eprintln!("Esegui prima: cargo build --release --target x86_64-pc-windows-gnu --bin winboat-bridge");
+        eprintln!("Esegui prima: cargo build --release --target x86_64-pc-windows-gnu --bin crosspilot");
         std::process::exit(1);
     }
 
@@ -219,7 +219,7 @@ async fn main() {
 
     // --- Step 5: deploya anche il .env minimale per il server ---
     println!("\n[5/6] Deploy .env per il server remoto...");
-    let env_content = "WINBOAT_SERVER_PORT=5330\n";
+    let env_content = "CROSSPILOT_SERVER_PORT=5330\n";
     let env_remote = format!(
         "{}\\.env",
         remote_exe_path.rfind('\\').map(|i| &remote_exe_path[..i]).unwrap_or("C:\\")
@@ -240,7 +240,7 @@ async fn main() {
     test_remote_run(&client, &host, &remote_exe_path).await;
 }
 
-/// Test: esegue `winboat-bridge.exe --help` sul target via WinRM.
+/// Test: esegue `crosspilot.exe --help` sul target via WinRM.
 /// Verifica che il binario giri (mcfgthread.dll presente, ecc.).
 async fn test_remote_run(client: &WinrmClient, host: &str, exe_path: &str) {
     let script = format!("& '{}' --help", exe_path);

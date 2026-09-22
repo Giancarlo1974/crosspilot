@@ -14,15 +14,19 @@ mod proto;
 mod path;
 mod verify;
 mod transfer;
-// Modulo directory sync v2 (vedi docs/sync-spec.md).
+// Modulo directory sync (vedi docs/sync-spec.md).
 mod sync;
-// Handler server per sync v2 (separato da sync.rs per dimensione, best-practice < 1000 righe).
+// Handler server per sync (separato da sync.rs per dimensione, best-practice < 1000 righe).
 mod sync_server;
 // Modulo bootstrap WinRM (separato da main.rs per dimensione, best-practice < 1000 righe).
 mod bootstrap;
 mod deploy;
 // Modulo ambienti host multipli nel .env (CRUD via sottocomando `env`).
 mod envs;
+// Metadati di build (BUILD_TS, TARGET) + parsing .ver per l'auto-update.
+mod version;
+// Self-update del client Linux quando il remote e' piu' nuovo.
+mod self_update;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -83,36 +87,41 @@ mod win_job {
 }
 
 #[derive(Parser)]
-#[command(name = "winboat-bridge")]
-#[command(about = "Bridge to execute commands on WinBoat container via TCP")]
-#[command(long_about = "WinBoat Bridge - Remote Command Executor for Windows Containers\n\n\
+#[command(name = "crosspilot")]
+// NOTA: niente flag clap `version`: il positional raw_cmd ha
+// allow_hyphen_values e catturerebbe `--version` come comando remoto.
+// --version/-V e' gestito manualmente in main() prima di Cli::parse()
+// (stampa "<semver>+<build_ts> (<target>)", usato come functional check
+// da deploy staged e self-update).
+#[command(about = "Bridge to execute commands on CrossPilot container via TCP")]
+#[command(long_about = "CrossPilot - Remote Command Executor for Windows Containers\n\n\
     This tool allows you to execute commands on a Windows container from Linux.\n\
     It operates in two modes: Server (runs on Windows) and Client (runs on Linux).\n\n\
     Configuration via Environment Variables:\n\
-      WINBOAT_EXE_PATH      - Path to winboat-bridge.exe on Windows\n\
-      WINBOAT_HOST          - WinRM host (default: 127.0.0.1)\n\
-      WINBOAT_PORT          - WinRM port (default: 47320)\n\
-      WINBOAT_USER          - WinRM username\n\
-      WINBOAT_PASS          - WinRM password\n\
-      WINBOAT_LOG_PATH      - Server log output path (default: C:\\\\Users\\\\gianca\\\\server.log)\n\
-      WINBOAT_ERR_PATH      - Server error output path (default: C:\\\\Users\\\\gianca\\\\server.err)\n\
-      WINBOAT_SERVER_PORT   - Server listening port (default: 5330)\n\
-      WINBOAT_CLIENT_PORT   - Client connection port (default: 47330)\n\
-      WINBOAT_ENV           - Active environment name (see below)\n\n\
+      CROSSPILOT_EXE_PATH      - Path to crosspilot.exe on Windows\n\
+      CROSSPILOT_HOST          - WinRM host (default: 127.0.0.1)\n\
+      CROSSPILOT_PORT          - WinRM port (default: 47320)\n\
+      CROSSPILOT_USER          - WinRM username\n\
+      CROSSPILOT_PASS          - WinRM password\n\
+      CROSSPILOT_LOG_PATH      - Server log output path (default: C:\\\\Users\\\\gianca\\\\server.log)\n\
+      CROSSPILOT_ERR_PATH      - Server error output path (default: C:\\\\Users\\\\gianca\\\\server.err)\n\
+      CROSSPILOT_SERVER_PORT   - Server listening port (default: 5330)\n\
+      CROSSPILOT_CLIENT_PORT   - Client connection port (default: 47330)\n\
+      CROSSPILOT_ENV           - Active environment name (see below)\n\n\
     Multiple environments: the .env can hold N named host configs as\n\
-      WINBOAT_<NAME>_<FIELD> (e.g. WINBOAT_PROD_HOST). WINBOAT_ENV selects\n\
+      CROSSPILOT_<NAME>_<FIELD> (e.g. CROSSPILOT_PROD_HOST). CROSSPILOT_ENV selects\n\
       the active one; unprefixed keys are the fallback for missing fields.\n\
       Fields: HOST PORT USER PASS EXE_PATH CLIENT_PORT SERVER_PORT\n\
       LOG_PATH ERR_PATH SEGMENT_SIZE.\n\
-      Manage them with: winboat-bridge env list|show|add|set|remove|use\n\
-      (details: winboat-bridge env -h / winboat-bridge env <action> -h)\n\n\
+      Manage them with: crosspilot env list|show|add|set|remove|use\n\
+      (details: crosspilot env -h / crosspilot env <action> -h)\n\n\
     Usage:\n\
-      winboat-bridge -- <COMMAND>   Execute a command on the remote Windows server\n\
-      winboat-bridge --server       Run in server mode (Windows side)\n\
-      winboat-bridge put|get|status|sync  File transfer and directory sync\n\n\
+      crosspilot -- <COMMAND>   Execute a command on the remote Windows server\n\
+      crosspilot --server       Run in server mode (Windows side)\n\
+      crosspilot put|get|status|sync  File transfer and directory sync\n\n\
     The -- form passes everything after it literally to cmd.exe on the remote\n\
     Windows host, with no shell escaping. Use single quotes around paths with\n\
-    trailing backslashes: winboat-bridge -- dir 'c:\\'")]
+    trailing backslashes: crosspilot -- dir 'c:\\'")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -128,9 +137,9 @@ struct Cli {
     /// della shell Linux.
     ///
     /// Esempi:
-    ///   winboat-bridge -- dir 'c:\\'
-    ///   winboat-bridge -- powershell -Command "Get-ChildItem 'C:\\Program Files'"
-    ///   winboat-bridge -- echo "hello 'world' \"test\""
+    ///   crosspilot -- dir 'c:\\'
+    ///   crosspilot -- powershell -Command "Get-ChildItem 'C:\\Program Files'"
+    ///   crosspilot -- echo "hello 'world' \"test\""
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -145,7 +154,7 @@ struct Cli {
 enum Commands {
     /// Start the server (explicit subcommand)
     Server {
-        /// Port to listen on (can also be set via WINBOAT_SERVER_PORT env var)
+        /// Port to listen on (can also be set via CROSSPILOT_SERVER_PORT env var)
         #[arg(short, long, default_value = "5330", help = "TCP port for server to listen on")]
         port: u16,
     },
@@ -163,7 +172,7 @@ enum Commands {
         /// Path destinazione locale (Linux).
         local_dst: String,
     },
-    /// Diff read-only tra directory locale e remota (sync v2, vedi docs/sync-spec.md).
+    /// Diff read-only tra directory locale e remota (vedi docs/sync-spec.md).
     Status {
         /// Directory locale (Linux). Deve esistere.
         local_dir: String,
@@ -176,7 +185,7 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
-    /// Mirror one-way upload (Linux -> Windows) della directory (sync v2).
+    /// Mirror one-way upload (Linux -> Windows) della directory.
     Sync {
         /// Directory sorgente locale (Linux). Deve esistere.
         local_dir: String,
@@ -197,8 +206,8 @@ enum Commands {
     },
     /// Gestione degli ambienti (configurazioni host) nel file .env.
     ///
-    /// Il .env può contenere N ambienti come WINBOAT_<NOME>_<CAMPO>
-    /// (es. WINBOAT_PROD_HOST). WINBOAT_ENV seleziona l'ambiente attivo;
+    /// Il .env può contenere N ambienti come CROSSPILOT_<NOME>_<CAMPO>
+    /// (es. CROSSPILOT_PROD_HOST). CROSSPILOT_ENV seleziona l'ambiente attivo;
     /// le chiavi non prefissate (ambiente "default") fanno da fallback.
     Env {
         #[command(subcommand)]
@@ -208,15 +217,33 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --version/-V gestito PRIMA di clap e del caricamento .env:
+    // 1. raw_cmd (allow_hyphen_values) catturerebbe il flag come comando
+    //    remoto e lo manderebbe a cmd.exe ("--version is not recognized");
+    // 2. deve essere veloce e side-effect-free: e' il functional check
+    //    invocato da deploy staged (remoto) e self_update (locale) per
+    //    provare che un binario appena scritto esegue e riporta il
+    //    build_ts atteso.
+    {
+        let mut argv = std::env::args();
+        let _ = argv.next();
+        let first = argv.next();
+        let rest = argv.next();
+        if matches!(first.as_deref(), Some("--version" | "-V")) && rest.is_none() {
+            println!("crosspilot {}", version::VERSION_STR);
+            return Ok(());
+        }
+    }
+
     // Carica il .env dal primo path candidato disponibile
     // (cwd -> exe dir -> project root). Vedi envs.rs.
     envs::load_dotenv();
 
-    // Debug: quale ambiente host e' attivo (WINBOAT_ENV -> WINBOAT_<NOME>_*),
+    // Debug: quale ambiente host e' attivo (CROSSPILOT_ENV -> CROSSPILOT_<NOME>_*),
     // con i valori effettivamente risolti (prefisso -> fallback -> default).
     let env_label = envs::active_name()
-        .map(|n| format!("{} (WINBOAT_{}_*)", n, n))
-        .unwrap_or_else(|| "default (WINBOAT_*)".to_string());
+        .map(|n| format!("{} (CROSSPILOT_{}_*)", n, n))
+        .unwrap_or_else(|| "default (CROSSPILOT_*)".to_string());
     let env_host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let env_winrm = envs::var("PORT").unwrap_or_else(|| "5985".to_string());
     let env_client = envs::var("CLIENT_PORT").unwrap_or_else(|| "5330".to_string());
@@ -235,7 +262,7 @@ async fn main() -> Result<()> {
         };
         server_mode(port).await?;
     } else if !cli.raw_cmd.is_empty() {
-        // Forma raw: `winboat-bridge -- dir c:\`. I token dopo `--` sono
+        // Forma raw: `crosspilot -- dir c:\`. I token dopo `--` sono
         // presi letteralmente da clap (allow_hyphen_values + trailing_var_arg)
         // e uniti con spazi per ricostruire il comando cmd.exe.
         let cmd = cli.raw_cmd.join(" ");
@@ -250,11 +277,11 @@ async fn main() -> Result<()> {
             Some(Commands::Get { remote_src, local_dst }) => {
                 client_transfer_get(&remote_src, &local_dst).await?;
             }
-            // Directory sync v2: status (diff read-only) lato client.
+            // Directory sync: status (diff read-only) lato client.
             Some(Commands::Status { local_dir, remote_dir, checksum, quiet }) => {
                 client_sync_status(&local_dir, &remote_dir, checksum, quiet).await?;
             }
-            // Directory sync v2: sync (mirror one-way upload) lato client.
+            // Directory sync: sync (mirror one-way upload) lato client.
             Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet }) => {
                 client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet).await?;
             }
@@ -263,28 +290,28 @@ async fn main() -> Result<()> {
                 envs::run(&action)?;
             }
             _ => {
-                println!("WinBoat Bridge - Remote Command Executor for Windows Containers");
+                println!("CrossPilot - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
                 // Ambiente attivo ben visibile: e' il target di TUTTI i comandi.
                 println!("Ambiente attivo: {} -> host {} (winrm:{}, client:{})",
                     envs::active_name().unwrap_or_else(|| "default".to_string()),
                     env_host, env_winrm, env_client);
                 println!("Usage:");
-                println!("  winboat-bridge -- <COMMAND>   # Execute command remotely (Linux side)");
-                println!("  winboat-bridge --server       # Run in Server Mode (Windows side)");
-                println!("  winboat-bridge put <local> <remote>   # Upload file (rsync delta)");
-                println!("  winboat-bridge get <remote> <local>   # Download file (rsync delta)");
-                println!("  winboat-bridge status <local> <remote>  # Diff directory (read-only)");
-                println!("  winboat-bridge sync   <local> <remote>  # Mirror directory (upload)");
+                println!("  crosspilot -- <COMMAND>   # Execute command remotely (Linux side)");
+                println!("  crosspilot --server       # Run in Server Mode (Windows side)");
+                println!("  crosspilot put <local> <remote>   # Upload file (rsync delta)");
+                println!("  crosspilot get <remote> <local>   # Download file (rsync delta)");
+                println!("  crosspilot status <local> <remote>  # Diff directory (read-only)");
+                println!("  crosspilot sync   <local> <remote>  # Mirror directory (upload)");
                 println!();
                 println!("Environments (.env multi-host):");
-                println!("  winboat-bridge env list                  # ambienti definiti (* = attivo)");
-                println!("  winboat-bridge env show <nome>           # config effettiva + fallback");
-                println!("  winboat-bridge env add <nome> --host IP  # nuovo ambiente");
-                println!("  winboat-bridge env set <nome> --user ..  # modifica campi");
-                println!("  winboat-bridge env use <nome>            # seleziona l'attivo");
-                println!("  winboat-bridge env remove <nome>         # elimina ambiente");
-                println!("  (dettagli: winboat-bridge env -h; override ad-hoc: WINBOAT_ENV=<nome>)");
+                println!("  crosspilot env list                  # ambienti definiti (* = attivo)");
+                println!("  crosspilot env show <nome>           # config effettiva + fallback");
+                println!("  crosspilot env add <nome> --host IP  # nuovo ambiente");
+                println!("  crosspilot env set <nome> --user ..  # modifica campi");
+                println!("  crosspilot env use <nome>            # seleziona l'attivo");
+                println!("  crosspilot env remove <nome>         # elimina ambiente");
+                println!("  (dettagli: crosspilot env -h; override ad-hoc: CROSSPILOT_ENV=<nome>)");
                 println!();
                 println!("The -- form passes everything after it literally to cmd.exe on the");
                 println!("remote Windows host, with no shell escaping. Use single quotes around");
@@ -292,37 +319,37 @@ async fn main() -> Result<()> {
                 println!();
                 println!("Examples:");
                 println!("  1. Check remote IP:");
-                println!("     winboat-bridge -- ipconfig");
+                println!("     crosspilot -- ipconfig");
                 println!();
                 println!("  2. List remote directory (note: single quotes around the path):");
-                println!("     winboat-bridge -- dir 'c:\\'");
+                println!("     crosspilot -- dir 'c:\\'");
                 println!();
                 println!("  3. Run PowerShell script:");
-                println!("     winboat-bridge -- powershell -File C:\\Scripts\\test.ps1");
+                println!("     crosspilot -- powershell -File C:\\Scripts\\test.ps1");
                 println!();
                 println!("  4. Close remote server:");
-                println!("     winboat-bridge -- quit");
+                println!("     crosspilot -- quit");
                 println!();
                 println!("  5. Upload a file:");
-                println!("     winboat-bridge put ./app.exe C:\\ci\\app.exe");
+                println!("     crosspilot put ./app.exe C:\\ci\\app.exe");
                 println!();
                 println!("  6. Download a file:");
-                println!("     winboat-bridge get  C:\\ci\\log.txt ./log.txt");
+                println!("     crosspilot get  C:\\ci\\log.txt ./log.txt");
                 println!();
                 println!("  7. Diff directory (status):");
-                println!("     winboat-bridge status ./artifacts C:\\ci\\artifacts");
+                println!("     crosspilot status ./artifacts C:\\ci\\artifacts");
                 println!();
                 println!("  8. Mirror directory (sync):");
-                println!("     winboat-bridge sync   ./artifacts C:\\ci\\artifacts --delete");
+                println!("     crosspilot sync   ./artifacts C:\\ci\\artifacts --delete");
                 println!();
                 println!("  9. Seleziona un altro host configurato:");
-                println!("     winboat-bridge env use h102   &&   winboat-bridge -- hostname");
+                println!("     crosspilot env use h102   &&   crosspilot -- hostname");
                 println!();
                 println!(" 10. Aggiungi un nuovo host:");
-                println!("     winboat-bridge env add srv2 --host 10.0.0.9 --user admin --pass secret");
+                println!("     crosspilot env add srv2 --host 10.0.0.9 --user admin --pass secret");
                 println!("-------------------------------------");
                 println!("For detailed help on all parameters, run:");
-                println!("  winboat-bridge -h");
+                println!("  crosspilot -h");
             }
         }
     }
@@ -563,7 +590,7 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
     // (es. `dir c:\` diventa `cmd /C "dir c:\"`) e cmd.exe interpreta il
     // backslash finale come escape della quote → "filename syntax incorrect".
     // raw_arg passa la stringa così com'è a cmd.exe, consentendo di scrivere
-    // `winboat-bridge -c "dir c:\"` esattamente come su una console Windows.
+    // `crosspilot -c "dir c:\"` esattamente come su una console Windows.
     #[cfg(target_os = "windows")]
     let mut child = Command::new(shell)
         .arg(flag)
@@ -705,7 +732,7 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
             eprintln!("[DEBUG] handle_file_mode: GET_REQ src={}", req.path);
             transfer::get_server(&mut socket, req).await?;
         }
-        // Directory sync v2 (sync-spec §5): nuovi messaggi server.
+        // Directory sync (sync-spec §5): messaggi LIST/MKDIR_BATCH/DELETE_BATCH.
         proto::MSG_LIST_REQ => {
             let req = proto::decode_list_req(&payload)?;
             eprintln!("[DEBUG] handle_file_mode: LIST_REQ path={} recursive={} with_hash={}", req.path, req.recursive, req.with_hash);
@@ -753,7 +780,7 @@ fn final_connect_error(addr: &str) -> anyhow::Error {
 /// Stabilisce la connessione TCP al server e verifica l'handshake READY.
 /// Riutilizzata sia dai comandi shell (-c) che dal transfer file (put/get).
 async fn connect_and_handshake() -> Result<TcpStream> {
-    // Risoluzione via envs: WINBOAT_<ENV>_<CAMPO> -> fallback WINBOAT_<CAMPO>.
+    // Risoluzione via envs: CROSSPILOT_<ENV>_<CAMPO> -> fallback CROSSPILOT_<CAMPO>.
     let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
@@ -911,8 +938,8 @@ async fn client_sync(
 }
 
 async fn client_mode(cmd: &str) -> Result<()> {
-    // Same host as bootstrap (WinRM): WINBOAT_HOST. Only the port differs.
-    // Risoluzione via envs: WINBOAT_<ENV>_<CAMPO> -> fallback WINBOAT_<CAMPO>.
+    // Same host as bootstrap (WinRM): CROSSPILOT_HOST. Only the port differs.
+    // Risoluzione via envs: CROSSPILOT_<ENV>_<CAMPO> -> fallback CROSSPILOT_<CAMPO>.
     let host = envs::var("HOST")
         .unwrap_or_else(|| "127.0.0.1".to_string());
     // Port mapped on host: 47330 -> Container: 5330

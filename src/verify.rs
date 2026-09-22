@@ -90,7 +90,7 @@ mod tests {
     fn sha256_file_matches_bytes() {
         // Scrive un file temporaneo e verifica che l'hash su file == hash in memoria.
         let dir = std::env::temp_dir();
-        let path = dir.join("winboat_verify_test.bin");
+        let path = dir.join("crosspilot_verify_test.bin");
         let content = b"contenuto di prova per sha256 streaming su file";
         {
             let mut f = std::fs::File::create(&path).unwrap();
@@ -109,7 +109,7 @@ mod tests {
     fn sha256_large_file_streaming() {
         // File da ~1 MB per verificare che lo streaming legge più chunk.
         let dir = std::env::temp_dir();
-        let path = dir.join("winboat_verify_large.bin");
+        let path = dir.join("crosspilot_verify_large.bin");
         let mut content = Vec::with_capacity(1024 * 1024);
         // Pattern ripetuto: riempie 1 MB con byte ciclici.
         for i in 0..(1024 * 1024) {

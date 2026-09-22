@@ -9,7 +9,7 @@ RUSTFLAGS="-L native=${PTHREAD_LIB_PATH} -C target-feature=+crt-static" cargo bu
 
 if [ $? -eq 0 ]; then
     echo "Compilazione riuscita!"
-    echo "L'eseguibile si trova in: target/x86_64-pc-windows-gnu/release/winboat-bridge.exe"
+    echo "L'eseguibile si trova in: target/x86_64-pc-windows-gnu/release/crosspilot.exe"
 else
     echo "Errore durante la compilazione."
     exit 1

@@ -3,22 +3,22 @@
 // Il .env può contenere N ambienti identificati da un nome prefisso:
 //
 //   # ambiente default (chiavi non prefissate, retrocompatibile)
-//   WINBOAT_HOST=127.0.0.1
-//   WINBOAT_USER=gianca
+//   CROSSPILOT_HOST=127.0.0.1
+//   CROSSPILOT_USER=gianca
 //
 //   # ambiente "prod"
-//   WINBOAT_PROD_HOST=10.0.0.5
-//   WINBOAT_PROD_USER=administrator
+//   CROSSPILOT_PROD_HOST=10.0.0.5
+//   CROSSPILOT_PROD_USER=administrator
 //
 //   # selettore ambiente attivo
-//   WINBOAT_ENV=PROD
+//   CROSSPILOT_ENV=PROD
 //
 // Risoluzione di un campo (es. HOST) a runtime:
-//   1. WINBOAT_<ENV>_<CAMPO>   (se WINBOAT_ENV è impostato)
-//   2. WINBOAT_<CAMPO>         (fallback: chiavi non prefissate)
+//   1. CROSSPILOT_<ENV>_<CAMPO>   (se CROSSPILOT_ENV è impostato)
+//   2. CROSSPILOT_<CAMPO>         (fallback: chiavi non prefissate)
 //   3. default hardcoded       (a carico del chiamante)
 //
-// I comandi CRUD (`winboat-bridge env ...`) operano sul file .env risolto
+// I comandi CRUD (`crosspilot env ...`) operano sul file .env risolto
 // con la stessa ricerca usata dal loader (cwd -> exe dir -> project root),
 // preservando commenti e righe non correlate (edit line-based).
 
@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 ///
 /// ORDINE IMPORTANTE: longest-first. Il parsing delle chiavi usa il match per
 /// suffisso, quindi i campi composti devono essere provati prima di quelli
-/// brevi: `WINBOAT_EU_CLIENT_PORT` -> env `EU` + campo `CLIENT_PORT`
+/// brevi: `CROSSPILOT_EU_CLIENT_PORT` -> env `EU` + campo `CLIENT_PORT`
 /// (non env `EU_CLIENT` + campo `PORT`).
 const FIELDS: &[&str] = &[
     "SEGMENT_SIZE",
@@ -68,15 +68,15 @@ const FIELD_ORDER: &[&str] = &[
 
 /// Nomi riservati: un ambiente con questi nomi colliderebbe con chiavi non
 /// prefissate o con il selettore:
-/// - ENV:     WINBOAT_ENV è il selettore dell'ambiente attivo;
-/// - SERVER:  WINBOAT_SERVER_PORT (campo PORT dell'env SERVER) colliderebbe
-///   con la chiave non prefissata WINBOAT_SERVER_PORT;
-/// - CLIENT:  idem per WINBOAT_CLIENT_PORT;
+/// - ENV:     CROSSPILOT_ENV è il selettore dell'ambiente attivo;
+/// - SERVER:  CROSSPILOT_SERVER_PORT (campo PORT dell'env SERVER) colliderebbe
+///   con la chiave non prefissata CROSSPILOT_SERVER_PORT;
+/// - CLIENT:  idem per CROSSPILOT_CLIENT_PORT;
 /// - DEFAULT: nome logico dell'ambiente non prefissato.
 const RESERVED: &[&str] = &["ENV", "SERVER", "CLIENT", "DEFAULT"];
 
 /// Chiave del selettore dell'ambiente attivo.
-const SELECTOR_KEY: &str = "WINBOAT_ENV";
+const SELECTOR_KEY: &str = "CROSSPILOT_ENV";
 
 // ---------------------------------------------------------------------------
 // Path del file .env (stessa ricerca del loader in main)
@@ -116,7 +116,7 @@ pub fn env_file_path() -> PathBuf {
 
 /// Carica il primo .env trovato nei path candidati (dotenvy).
 /// Le variabili già presenti nel processo NON vengono sovrascritte:
-/// `WINBOAT_ENV=staging winboat-bridge ...` funziona come override ad-hoc.
+/// `CROSSPILOT_ENV=staging crosspilot ...` funziona come override ad-hoc.
 pub fn load_dotenv() -> bool {
     let tried: Vec<PathBuf> = candidate_paths();
     for path in &tried {
@@ -146,7 +146,7 @@ pub fn load_dotenv() -> bool {
 // Risoluzione runtime (usata da main/bootstrap/deploy)
 // ---------------------------------------------------------------------------
 
-/// Nome dell'ambiente attivo (WINBOAT_ENV), normalizzato uppercase.
+/// Nome dell'ambiente attivo (CROSSPILOT_ENV), normalizzato uppercase.
 /// None -> ambiente "default" (chiavi non prefissate).
 pub fn active_name() -> Option<String> {
     let raw = env::var(SELECTOR_KEY).ok()?;
@@ -162,16 +162,16 @@ pub fn active_name() -> Option<String> {
 /// name=None -> chiave non prefissata (ambiente default).
 fn key_for(name: Option<&str>, field: &str) -> String {
     match name {
-        Some(n) => format!("WINBOAT_{}_{}", n, field),
-        None => format!("WINBOAT_{}", field),
+        Some(n) => format!("CROSSPILOT_{}_{}", n, field),
+        None => format!("CROSSPILOT_{}", field),
     }
 }
 
 /// Risolve un campo di configurazione host leggendo il process environment
 /// (dove load_dotenv ha già caricato il .env).
 ///
-/// Cerca prima WINBOAT_<ENV>_<CAMPO> (ambiente attivo), poi la chiave non
-/// prefissata WINBOAT_<CAMPO>. I valori vuoti sono ignorati.
+/// Cerca prima CROSSPILOT_<ENV>_<CAMPO> (ambiente attivo), poi la chiave non
+/// prefissata CROSSPILOT_<CAMPO>. I valori vuoti sono ignorati.
 pub fn var(field: &str) -> Option<String> {
     let active = active_name();
     var_for(active.as_deref(), field)
@@ -200,20 +200,20 @@ pub fn var_for(name: Option<&str>, field: &str) -> Option<String> {
 // Parsing delle righe .env
 // ---------------------------------------------------------------------------
 
-/// Esito del parsing di una chiave WINBOAT_*.
+/// Esito del parsing di una chiave CROSSPILOT_*.
 #[derive(Debug, PartialEq)]
 enum ParsedKey {
-    /// WINBOAT_ENV (selettore ambiente attivo).
+    /// CROSSPILOT_ENV (selettore ambiente attivo).
     Selector,
     /// Campo di un ambiente: nome (None = default non prefissato) + campo.
     Field(Option<String>, &'static str),
-    /// Chiave non riconducibile ad un ambiente (es. WINBOAT_DEBUG).
+    /// Chiave non riconducibile ad un ambiente (es. CROSSPILOT_DEBUG).
     Other,
 }
 
 /// Analizza una chiave .env e la classifica.
 fn parse_key(key: &str) -> ParsedKey {
-    let rest = match key.strip_prefix("WINBOAT_") {
+    let rest = match key.strip_prefix("CROSSPILOT_") {
         Some(r) => r,
         None => return ParsedKey::Other,
     };
@@ -339,7 +339,7 @@ fn validate_name(name: &str) -> Result<String> {
     }
     if RESERVED.contains(&upper.as_str()) {
         bail!(
-            "nome ambiente '{}' riservato (colliderebbe con chiavi WINBOAT_* esistenti)",
+            "nome ambiente '{}' riservato (colliderebbe con chiavi CROSSPILOT_* esistenti)",
             upper
         );
     }
@@ -399,7 +399,7 @@ fn env_exists(lines: &[String], name: Option<&str>) -> bool {
     })
 }
 
-/// Valore corrente del selettore WINBOAT_ENV nel file (se presente).
+/// Valore corrente del selettore CROSSPILOT_ENV nel file (se presente).
 fn selector_value(lines: &[String]) -> Option<String> {
     for line in lines {
         if let Some((key, value)) = parse_line(line) {
@@ -428,7 +428,7 @@ fn upsert_field(lines: &mut Vec<String>, name: Option<&str>, field: &str, value:
     lines.push(new_line);
 }
 
-/// Scrive (o rimuove) il selettore WINBOAT_ENV. value=None -> rimozione.
+/// Scrive (o rimuove) il selettore CROSSPILOT_ENV. value=None -> rimozione.
 fn upsert_selector(lines: &mut Vec<String>, value: Option<&str>) {
     let mut found = false;
     lines.retain_mut(|line| {
@@ -453,7 +453,7 @@ fn upsert_selector(lines: &mut Vec<String>, value: Option<&str>) {
 
 /// Rimuove tutte le righe campo dell'ambiente dato, piu' l'eventuale commento
 /// header `# env: <NOME>` generato da `env add`.
-/// Non tocca il selettore, gli altri env, commenti e righe non WINBOAT_*.
+/// Non tocca il selettore, gli altri env, commenti e righe non CROSSPILOT_*.
 fn remove_env_lines(lines: &mut Vec<String>, name: Option<&str>) -> usize {
     // Commento header generato da cmd_add (solo per env nominati).
     let header = name.map(|n| format!("# env: {}", n));
@@ -477,7 +477,7 @@ fn remove_env_lines(lines: &mut Vec<String>, name: Option<&str>) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// CLI: `winboat-bridge env ...`
+// CLI: `crosspilot env ...`
 // ---------------------------------------------------------------------------
 
 /// Campi opzionali condivisi da `env add` e `env set`.
@@ -492,7 +492,7 @@ pub struct EnvFields {
     /// Password WinRM (campo PASS).
     #[arg(long)]
     pub pass: Option<String>,
-    /// Path di winboat-bridge.exe sul target (campo EXE_PATH).
+    /// Path di crosspilot.exe sul target (campo EXE_PATH).
     #[arg(long)]
     pub exe_path: Option<String>,
     /// Porta di connessione lato client (campo CLIENT_PORT).
@@ -585,7 +585,7 @@ pub enum EnvAction {
         /// Nome ambiente (es. prod) oppure "default".
         name: String,
     },
-    /// Imposta l'ambiente attivo scrivendo WINBOAT_ENV nel .env.
+    /// Imposta l'ambiente attivo scrivendo CROSSPILOT_ENV nel .env.
     /// "default" rimuove il selettore (chiavi non prefissate).
     Use {
         /// Nome ambiente (es. prod) oppure "default".
@@ -654,7 +654,7 @@ fn cmd_list(path: &Path, lines: &[String]) -> Result<()> {
     println!("File .env: {}", path.display());
     if names.is_empty() && !has_default {
         println!("Nessun ambiente definito.");
-        println!("Crea il primo con: winboat-bridge env add <nome> --host <ip>");
+        println!("Crea il primo con: crosspilot env add <nome> --host <ip>");
         return Ok(());
     }
 
@@ -674,7 +674,7 @@ fn cmd_list(path: &Path, lines: &[String]) -> Result<()> {
     }
     if let Some(a) = &active {
         println!();
-        println!("Ambiente attivo: {} (WINBOAT_ENV)", a);
+        println!("Ambiente attivo: {} (CROSSPILOT_ENV)", a);
     }
     Ok(())
 }
@@ -741,7 +741,7 @@ fn cmd_add(lines: &mut Vec<String>, name: &str, host: &str, fields: &EnvFields) 
         upper,
         1 + fields.provided().len()
     );
-    println!("Attivalo con: winboat-bridge env use {}", name);
+    println!("Attivalo con: crosspilot env use {}", name);
     Ok(())
 }
 
@@ -789,13 +789,13 @@ fn cmd_remove(lines: &mut Vec<String>, name: &str) -> Result<()> {
     let removed = remove_env_lines(lines, name_opt.as_deref());
 
     // Se l'env rimosso era quello attivo, elimina anche il selettore:
-    // altrimenti WINBOAT_ENV punterebbe ad un ambiente inesistente e ogni
+    // altrimenti CROSSPILOT_ENV punterebbe ad un ambiente inesistente e ogni
     // campo ricadrebbe silenziosamente sulle chiavi non prefissate.
     let active = selector_value(lines).map(|v| v.to_uppercase());
     if let (Some(a), Some(n)) = (active, &name_opt) {
         if a == *n {
             upsert_selector(lines, None);
-            println!("Nota: '{}' era l'ambiente attivo: WINBOAT_ENV rimosso.", label);
+            println!("Nota: '{}' era l'ambiente attivo: CROSSPILOT_ENV rimosso.", label);
         }
     }
 
@@ -817,11 +817,11 @@ fn cmd_use(lines: &mut Vec<String>, name: &str) -> Result<()> {
                 );
             }
             upsert_selector(lines, Some(n));
-            println!("Ambiente attivo: {} (WINBOAT_ENV={})", n, n);
+            println!("Ambiente attivo: {} (CROSSPILOT_ENV={})", n, n);
         }
         None => {
             upsert_selector(lines, None);
-            println!("Ambiente attivo: default (WINBOAT_ENV rimosso, chiavi non prefissate)");
+            println!("Ambiente attivo: default (CROSSPILOT_ENV rimosso, chiavi non prefissate)");
         }
     }
     Ok(())
@@ -837,36 +837,36 @@ mod tests {
 
     #[test]
     fn parse_key_campi_non_prefissati() {
-        assert_eq!(parse_key("WINBOAT_HOST"), ParsedKey::Field(None, "HOST"));
-        assert_eq!(parse_key("WINBOAT_PORT"), ParsedKey::Field(None, "PORT"));
-        assert_eq!(parse_key("WINBOAT_EXE_PATH"), ParsedKey::Field(None, "EXE_PATH"));
-        assert_eq!(parse_key("WINBOAT_CLIENT_PORT"), ParsedKey::Field(None, "CLIENT_PORT"));
-        assert_eq!(parse_key("WINBOAT_SERVER_PORT"), ParsedKey::Field(None, "SERVER_PORT"));
+        assert_eq!(parse_key("CROSSPILOT_HOST"), ParsedKey::Field(None, "HOST"));
+        assert_eq!(parse_key("CROSSPILOT_PORT"), ParsedKey::Field(None, "PORT"));
+        assert_eq!(parse_key("CROSSPILOT_EXE_PATH"), ParsedKey::Field(None, "EXE_PATH"));
+        assert_eq!(parse_key("CROSSPILOT_CLIENT_PORT"), ParsedKey::Field(None, "CLIENT_PORT"));
+        assert_eq!(parse_key("CROSSPILOT_SERVER_PORT"), ParsedKey::Field(None, "SERVER_PORT"));
     }
 
     #[test]
     fn parse_key_campi_prefissati() {
         assert_eq!(
-            parse_key("WINBOAT_PROD_HOST"),
+            parse_key("CROSSPILOT_PROD_HOST"),
             ParsedKey::Field(Some("PROD".to_string()), "HOST")
         );
         // Suffisso longest-first: EU + CLIENT_PORT (non EU_CLIENT + PORT).
         assert_eq!(
-            parse_key("WINBOAT_EU_CLIENT_PORT"),
+            parse_key("CROSSPILOT_EU_CLIENT_PORT"),
             ParsedKey::Field(Some("EU".to_string()), "CLIENT_PORT")
         );
         assert_eq!(
-            parse_key("WINBOAT_PROD_EXE_PATH"),
+            parse_key("CROSSPILOT_PROD_EXE_PATH"),
             ParsedKey::Field(Some("PROD".to_string()), "EXE_PATH")
         );
     }
 
     #[test]
     fn parse_key_selettore_e_altro() {
-        assert_eq!(parse_key("WINBOAT_ENV"), ParsedKey::Selector);
-        assert_eq!(parse_key("WINBOAT_DEBUG"), ParsedKey::Other);
+        assert_eq!(parse_key("CROSSPILOT_ENV"), ParsedKey::Selector);
+        assert_eq!(parse_key("CROSSPILOT_DEBUG"), ParsedKey::Other);
         assert_eq!(parse_key("PATH"), ParsedKey::Other);
-        assert_eq!(parse_key("WINBOAT_"), ParsedKey::Other);
+        assert_eq!(parse_key("CROSSPILOT_"), ParsedKey::Other);
     }
 
     #[test]
@@ -886,22 +886,22 @@ mod tests {
     #[test]
     fn parse_line_gestisce_export_e_quote() {
         assert_eq!(
-            parse_line("WINBOAT_HOST=1.2.3.4"),
-            Some(("WINBOAT_HOST".to_string(), "1.2.3.4".to_string()))
+            parse_line("CROSSPILOT_HOST=1.2.3.4"),
+            Some(("CROSSPILOT_HOST".to_string(), "1.2.3.4".to_string()))
         );
         assert_eq!(
-            parse_line("export WINBOAT_PASS=\"a b\""),
-            Some(("WINBOAT_PASS".to_string(), "a b".to_string()))
+            parse_line("export CROSSPILOT_PASS=\"a b\""),
+            Some(("CROSSPILOT_PASS".to_string(), "a b".to_string()))
         );
         // Double-quoted: escape \\ -> \ come dotenvy.
         assert_eq!(
-            parse_line("WINBOAT_EXE_PATH=\"C:\\\\Users\\\\x\""),
-            Some(("WINBOAT_EXE_PATH".to_string(), "C:\\Users\\x".to_string()))
+            parse_line("CROSSPILOT_EXE_PATH=\"C:\\\\Users\\\\x\""),
+            Some(("CROSSPILOT_EXE_PATH".to_string(), "C:\\Users\\x".to_string()))
         );
         // Single-quoted: letterale.
         assert_eq!(
-            parse_line("WINBOAT_PASS='a\\b'"),
-            Some(("WINBOAT_PASS".to_string(), "a\\b".to_string()))
+            parse_line("CROSSPILOT_PASS='a\\b'"),
+            Some(("CROSSPILOT_PASS".to_string(), "a\\b".to_string()))
         );
         assert_eq!(parse_line("# commento"), None);
         assert_eq!(parse_line(""), None);
@@ -911,18 +911,18 @@ mod tests {
     fn parse_line_commento_inline_non_quotato() {
         // Come dotenvy: ` #` apre un commento nei valori non quotati.
         assert_eq!(
-            parse_line("WINBOAT_PORT=5330   # porta WinRM"),
-            Some(("WINBOAT_PORT".to_string(), "5330".to_string()))
+            parse_line("CROSSPILOT_PORT=5330   # porta WinRM"),
+            Some(("CROSSPILOT_PORT".to_string(), "5330".to_string()))
         );
         // `#` attaccato al valore resta parte del valore.
         assert_eq!(
-            parse_line("WINBOAT_PASS=abc#def"),
-            Some(("WINBOAT_PASS".to_string(), "abc#def".to_string()))
+            parse_line("CROSSPILOT_PASS=abc#def"),
+            Some(("CROSSPILOT_PASS".to_string(), "abc#def".to_string()))
         );
         // Valore quotato: `#` letterale.
         assert_eq!(
-            parse_line("WINBOAT_PASS=\"a # b\""),
-            Some(("WINBOAT_PASS".to_string(), "a # b".to_string()))
+            parse_line("CROSSPILOT_PASS=\"a # b\""),
+            Some(("CROSSPILOT_PASS".to_string(), "a # b".to_string()))
         );
     }
 
@@ -937,11 +937,11 @@ mod tests {
     fn collect_names_e_env_exists() {
         let lines: Vec<String> = vec![
             "# test".to_string(),
-            "WINBOAT_HOST=127.0.0.1".to_string(),
-            "WINBOAT_PROD_HOST=10.0.0.1".to_string(),
-            "WINBOAT_PROD_USER=u".to_string(),
-            "WINBOAT_STAGING_HOST=10.0.0.2".to_string(),
-            "WINBOAT_ENV=PROD".to_string(),
+            "CROSSPILOT_HOST=127.0.0.1".to_string(),
+            "CROSSPILOT_PROD_HOST=10.0.0.1".to_string(),
+            "CROSSPILOT_PROD_USER=u".to_string(),
+            "CROSSPILOT_STAGING_HOST=10.0.0.2".to_string(),
+            "CROSSPILOT_ENV=PROD".to_string(),
         ];
         assert_eq!(collect_names(&lines), vec!["PROD", "STAGING"]);
         assert!(env_exists(&lines, Some("PROD")));
@@ -953,43 +953,43 @@ mod tests {
     #[test]
     fn upsert_field_replace_in_place_e_append() {
         let mut lines: Vec<String> = vec![
-            "WINBOAT_HOST=127.0.0.1".to_string(),
+            "CROSSPILOT_HOST=127.0.0.1".to_string(),
             "# env: PROD".to_string(),
-            "WINBOAT_PROD_HOST=10.0.0.1".to_string(),
+            "CROSSPILOT_PROD_HOST=10.0.0.1".to_string(),
         ];
         // Update in place: la posizione (e il commento) restano.
         upsert_field(&mut lines, Some("PROD"), "HOST", "10.0.0.9");
-        assert_eq!(lines[2], "WINBOAT_PROD_HOST=10.0.0.9");
+        assert_eq!(lines[2], "CROSSPILOT_PROD_HOST=10.0.0.9");
         assert_eq!(lines.len(), 3);
         // Campo nuovo: append.
         upsert_field(&mut lines, Some("PROD"), "USER", "admin");
-        assert_eq!(lines[3], "WINBOAT_PROD_USER=admin");
+        assert_eq!(lines[3], "CROSSPILOT_PROD_USER=admin");
         // Chiave non prefissata (default).
         upsert_field(&mut lines, None, "HOST", "192.168.0.1");
-        assert_eq!(lines[0], "WINBOAT_HOST=192.168.0.1");
+        assert_eq!(lines[0], "CROSSPILOT_HOST=192.168.0.1");
     }
 
     #[test]
     fn upsert_selector_set_e_remove() {
-        let mut lines: Vec<String> = vec!["WINBOAT_HOST=1".to_string()];
+        let mut lines: Vec<String> = vec!["CROSSPILOT_HOST=1".to_string()];
         upsert_selector(&mut lines, Some("PROD"));
-        assert_eq!(lines[1], "WINBOAT_ENV=PROD");
+        assert_eq!(lines[1], "CROSSPILOT_ENV=PROD");
         upsert_selector(&mut lines, Some("DEV"));
-        assert_eq!(lines[1], "WINBOAT_ENV=DEV");
+        assert_eq!(lines[1], "CROSSPILOT_ENV=DEV");
         upsert_selector(&mut lines, None);
-        assert_eq!(lines, vec!["WINBOAT_HOST=1".to_string()]);
+        assert_eq!(lines, vec!["CROSSPILOT_HOST=1".to_string()]);
     }
 
     #[test]
     fn remove_env_lines_solo_env_target() {
         let mut lines: Vec<String> = vec![
             "# default".to_string(),
-            "WINBOAT_HOST=127.0.0.1".to_string(),
+            "CROSSPILOT_HOST=127.0.0.1".to_string(),
             "# env: PROD".to_string(),
-            "WINBOAT_PROD_HOST=10.0.0.1".to_string(),
-            "WINBOAT_PROD_PASS=secret".to_string(),
-            "WINBOAT_DEV_HOST=10.0.0.2".to_string(),
-            "WINBOAT_ENV=PROD".to_string(),
+            "CROSSPILOT_PROD_HOST=10.0.0.1".to_string(),
+            "CROSSPILOT_PROD_PASS=secret".to_string(),
+            "CROSSPILOT_DEV_HOST=10.0.0.2".to_string(),
+            "CROSSPILOT_ENV=PROD".to_string(),
         ];
         let removed = remove_env_lines(&mut lines, Some("PROD"));
         // 2 righe campo + commento header `# env: PROD`.

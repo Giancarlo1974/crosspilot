@@ -2,7 +2,9 @@
 *.log
 # L'exe Windows embeddato è un artefatto di build (prodotto da scripts/build-release.sh).
 # Non va committato: viene rigenerato ad ogni build-release.
-/assets/winboat-bridge.exe
+/assets/crosspilot.exe
 # .env contiene credenziali reali (WinRM password). Non committare mai.
 # Usa .env.example come template.
 .env
+# Anche il sidecar linux musl e' un artefatto di build (build-release.sh).
+/assets/crosspilot.linux

@@ -7,5 +7,5 @@ ar = "x86_64-w64-mingw32-ar"
 # rustc hard-coda -l:libpthread.a nel target spec x86_64-pc-windows-gnu, ma il
 # toolchain mingw di Nix usa mcfgthread (no libpthread.a). Stub vuoto come workaround.
 rustflags = [
-    "-C", "link-arg=-L/home/gianca/progetti/rust/winboat-bridge/.cargo/mingw-stubs",
+    "-C", "link-arg=-L/home/gianca/progetti/rust/crosspilot/.cargo/mingw-stubs",
 ]

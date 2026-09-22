@@ -9,6 +9,8 @@ use winrm_rs::WinrmError;
 
 use crate::deploy;
 use crate::envs;
+use crate::self_update;
+use crate::version;
 
 /// Settato quando l'endpoint WinRM risulta irraggiungibile a livello TCP
 /// (connect refused/timeout = servizio non attivo o firewall che droppa).
@@ -60,7 +62,7 @@ fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool 
             if !HINT_PRINTED.swap(true, Ordering::Relaxed) {
                 eprintln!();
                 eprintln!("[HINT] Autenticazione WinRM rifiutata da {}:{}.", host, port);
-                eprintln!("       Verificare USER/PASS dell'ambiente attivo: winboat-bridge env show <nome>");
+                eprintln!("       Verificare USER/PASS dell'ambiente attivo: crosspilot env show <nome>");
                 eprintln!();
             }
             true
@@ -92,9 +94,9 @@ fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool 
 /// (-EncodedCommand), eliminando i problemi di quoting/escaping.
 pub async fn bootstrap_server() -> Result<()> {
     // --- Path del server remoto (da .env) ---
-    // Risoluzione via envs: WINBOAT_<ENV>_EXE_PATH -> fallback WINBOAT_EXE_PATH.
+    // Risoluzione via envs: CROSSPILOT_<ENV>_EXE_PATH -> fallback CROSSPILOT_EXE_PATH.
     let exe_path = envs::var("EXE_PATH")
-        .context("WINBOAT_EXE_PATH (o WINBOAT_<ENV>_EXE_PATH) must be set in the .env file")?;
+        .context("CROSSPILOT_EXE_PATH (o CROSSPILOT_<ENV>_EXE_PATH) must be set in the .env file")?;
 
     // --- Credenziali e endpoint WinRM (da .env) ---
     let host = envs::var("HOST")
@@ -153,35 +155,100 @@ pub async fn bootstrap_server() -> Result<()> {
     let client = winrm_rs::WinrmClient::new(config, credentials)
         .context("Impossibile creare il client WinRM")?;
 
-    // --- Pre-check: verifica che il binario esista prima di avviare ---
-    // Se manca, esegue l'auto-deploy del binario cross-compilato.
-    // Distingue "file missing" (bug 3.6) da fallimento WinRM/protocollo.
-    let check_script = format!("Test-Path '{}'", exe_path);
-    let check_result = client.run_powershell(&host, &check_script).await;
+    // --- Pre-check: stato build remoto + auto-update bidirezionale ---
+    // remote_build_info sostituisce il vecchio Test-Path: oltre alla
+    // presenza dell'exe legge il .ver (BUILD_TS) per il confronto di
+    // versione. Il confronto usa il timestamp, non l'hash: SHA-256 dice
+    // solo "diverso", non "piu' nuovo/piu' vecchio".
+    //
+    //   remote assente o ts_remoto < ts_locale -> deploy (upload staged)
+    //   ts_remoto == ts_locale                 -> deploy idempotente
+    //                                             (hash check, skip)
+    //   ts_remoto > ts_locale                  -> SELF-UPDATE del client:
+    //                                             scarica il sidecar linux
+    //                                             e re-exec. MAI downgrade.
+    //
     // winrm_dead: errore deterministico (endpoint morto / auth rifiutata).
     // In quel caso deploy e schtasks fallirebbero identicamente: si salta
     // direttamente al polling (il server potrebbe comunque essere attivo).
     let mut winrm_dead = false;
-    let need_deploy = match check_result {
-        Ok(out) => {
-            let result_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            eprintln!("[DEBUG] bootstrap_server: Test-Path '{}' = {}", exe_path, result_str);
-            result_str.eq_ignore_ascii_case("false")
+    match deploy::remote_build_info(&client, &host, &exe_path).await {
+        Ok(info) => {
+            eprintln!(
+                "[DEBUG] bootstrap_server: ts remoto={:?} locale={} exe_present={} linux_present={}",
+                info.build_ts, version::BUILD_TS, info.exe_present, info.linux_present
+            );
+
+            if !info.exe_present {
+                // Exe mancante (bug 3.6): deploy completo.
+                eprintln!("[bootstrap] Exe remoto mancante. Avvio auto-deploy...");
+                if let Err(e) = deploy::deploy_exe(&client, &host, &exe_path, &info).await {
+                    eprintln!("[ERROR] bootstrap_server: auto-deploy fallito: {}", e);
+                    // Non ritorniamo errore: il server potrebbe essere già in
+                    // esecuzione da un bootstrap precedente. Il polling deciderà.
+                }
+            } else if info.is_newer_than_local() {
+                // Remote PIU' NUOVO del client: il "piu' vecchio" siamo noi.
+                // Escape hatch per lo sviluppo: CROSSPILOT_NO_SELF_UPDATE=1
+                // evita che un binario compilato a mano (cargo build dev)
+                // venga rimpiazzato dall'artefatto musl del remote.
+                let self_update_disabled = envs::var("NO_SELF_UPDATE")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if self_update_disabled {
+                    eprintln!(
+                        "[self-update] remote piu' nuovo (ts={} > {}) ma \
+                         CROSSPILOT_NO_SELF_UPDATE attivo: proseguo senza aggiornare.",
+                        info.effective_ts(),
+                        version::BUILD_TS
+                    );
+                } else {
+                    // self_update scarica il sidecar linux, verifica,
+                    // sostituisce l'exe corrente e fa re-exec: su successo
+                    // NON ritorna. Su errore: warning e si prosegue col
+                    // binario corrente, SENZA deployare (mai downgrade).
+                    let remote_dir = deploy::remote_dir_of(&exe_path);
+                    let update_result = self_update::run(
+                        &client,
+                        &host,
+                        remote_dir,
+                        info.effective_ts(),
+                        info.linux_sha256.as_deref(),
+                    )
+                    .await;
+                    match update_result {
+                        Ok(()) => {
+                            // Iraggiungibile su Unix (exec sostituisce il
+                            // processo); il log copre piattaforme senza exec.
+                            eprintln!("[self-update] re-exec completato senza sostituzione processo?");
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[WARNING] Remote piu' nuovo (ts={}) ma self-update fallito: {}",
+                                info.effective_ts(),
+                                e
+                            );
+                            eprintln!(
+                                "          Proseguo col binario locale (ts={}) senza toccare il remote. \
+                                 Aggiornare il client manualmente.",
+                                version::BUILD_TS
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Remote piu' vecchio o uguale: deploy idempotente. Se gli
+                // hash coincidono gia', deploy_exe skippa l'upload (costo:
+                // le verifiche .ver/.env, pochi ms di WinRM).
+                if let Err(e) = deploy::deploy_exe(&client, &host, &exe_path, &info).await {
+                    eprintln!("[ERROR] bootstrap_server: auto-deploy fallito: {}", e);
+                }
+            }
         }
         Err(e) => {
-            winrm_dead = report_winrm_error("Test-Path", &e, &host, winrm_port);
+            winrm_dead = report_winrm_error("remote_build_info", &e, &host, winrm_port);
             // Se non riusciamo a verificare, proviamo ad avviare comunque
             // (il server potrebbe essere già in esecuzione).
-            false
-        }
-    };
-
-    if need_deploy {
-        eprintln!("[bootstrap] Exe remoto mancante. Avvio auto-deploy...");
-        if let Err(e) = deploy::deploy_exe(&client, &host, &exe_path).await {
-            eprintln!("[ERROR] bootstrap_server: auto-deploy fallito: {}", e);
-            // Non ritorniamo errore: il server potrebbe essere già in
-            // esecuzione da un bootstrap precedente. Il polling deciderà.
         }
     }
 
@@ -216,7 +283,7 @@ pub async fn bootstrap_server() -> Result<()> {
     // Lo script stampa RUNAS=<mode> per permettere al client di loggare
     // la modalita' effettivamente selezionata.
     let ps_script = format!(
-        "$tn='winboat-server'; $tr='\"{}\" --server'; $mode='FAILED'; \
+        "$tn='crosspilot-server'; $tr='\"{}\" --server'; $mode='FAILED'; \
          schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null; \
          if ($LASTEXITCODE -eq 0) {{ $mode='SYSTEM' }} else {{ \
          schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU '{}' /NP /RL HIGHEST /F | Out-Null; \

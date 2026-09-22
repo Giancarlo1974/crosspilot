@@ -1,11 +1,11 @@
-//! Directory sync v2 (mirror one-way) e status (diff read-only).
+//! Directory sync (mirror one-way) e status (diff read-only).
 //!
 //! Implementa `docs/sync-spec.md`:
 //! - `status`: diff read-only tra directory locale e remota (new/changed/missing/identical/conflict).
 //! - `sync`: mirror one-way (source -> dest) che trasferisce solo i file nuovi/modificati
-//!   via delta rsync (riutilizza `put_client` v1) e opzionalmente cancella i file extra sul dest.
+//!   via delta rsync (riutilizza `put_client`) e opzionalmente cancella i file extra sul dest.
 //!
-//! Una connessione = una operazione (come v1). Sync orchestra connessioni sequenziali:
+//! Una connessione = una operazione (come put/get). Sync orchestra connessioni sequenziali:
 //! 1 connessione per LIST, 1 per ogni put, 1 per MKDIR_BATCH, 1 per DELETE_BATCH file,
 //! 1 per DELETE_BATCH dir. Niente connessioni parallele (best-practice).
 //!
@@ -919,7 +919,7 @@ where
             }
         };
 
-        // Nuova connessione per ogni put (riutilizza put_client v1, sync-spec §7).
+        // Nuova connessione per ogni put (riutilizza put_client, sync-spec §7).
         let connect_result = connect().await;
         let mut socket = match connect_result {
             Ok(s) => s,
@@ -1154,7 +1154,7 @@ mod tests {
     #[test]
     fn walk_local_dir_basic() {
         // Crea una dir temporanea con file, subdir, file in subdir.
-        let root = std::env::temp_dir().join("winboat_walk_basic");
+        let root = std::env::temp_dir().join("crosspilot_walk_basic");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.txt"), b"hello").unwrap();
@@ -1184,7 +1184,7 @@ mod tests {
 
     #[test]
     fn walk_local_dir_empty() {
-        let root = std::env::temp_dir().join("winboat_walk_empty");
+        let root = std::env::temp_dir().join("crosspilot_walk_empty");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let result = walk_local_dir(&root).unwrap();
@@ -1195,7 +1195,7 @@ mod tests {
     #[test]
     fn walk_local_dir_skips_windows_reserved() {
         // sync-spec §14 test 20: nome riservato Windows nel source -> skip.
-        let root = std::env::temp_dir().join("winboat_walk_reserved");
+        let root = std::env::temp_dir().join("crosspilot_walk_reserved");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("CON.txt"), b"device").unwrap();
@@ -1313,7 +1313,7 @@ mod tests {
     fn diff_checksum_detects_corruption() {
         // sync-spec §14 test 3: stessa size, contenuto diverso -> CHANGED con --checksum.
         // Crea file locali reali per calcolare l'hash.
-        let root = std::env::temp_dir().join("winboat_diff_checksum");
+        let root = std::env::temp_dir().join("crosspilot_diff_checksum");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("same_size.txt"), b"AAAA").unwrap();
