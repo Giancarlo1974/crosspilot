@@ -27,6 +27,22 @@
 //                           swap rename-first (exe -> exe.old, staged -> exe),
 //                           rilancia `exe --server` detached ed esce.
 //
+// ROBUSTEZZA (post-mortem H166: brick silenzioso del remote — vecchio
+// server ucciso, updater mai salito, nessuna traccia diagnostica):
+// - functional check pre-trigger: `<staged> --version` via shell-mode;
+//   uno staged non eseguibile abortisce l'update PRIMA di uccidere il
+//   server (il path WinRM lo faceva gia', qui mancava).
+// - marker anti retry-storm: il rollback scrive `crosspilot-<ts>.bad`;
+//   il client lo rileva prima del PUT e non ritenta lo stesso build.
+// - log su file: l'updater e' detached (stdio nullo) -> ogni passo e'
+//   appendato a `crosspilot-update.log` accanto al target.
+// - rollback automatico: se il nuovo server non binda la porta entro
+//   SERVER_UP_WAIT_SECS, `.old` viene ripristinato e rilanciato.
+// - --target esplicito negli spawn WMI/setsid: default_target assume il
+//   nome `crosspilot[.exe]`, un EXE_PATH con nome diverso swappava il
+//   file sbagliato.
+// - PUT con retry: "early eof" intermittenti su upload grossi.
+//
 // NOTE CHIAVE (motivazioni, non ripetere bug):
 // - I figli shell-mode su Windows sono in un Job Object KILL_ON_JOB_CLOSE:
 //   un updater spawnato cosi' morirebbe insieme al server. Per questo lo
@@ -47,7 +63,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::{deploy, envs, path, proto, transfer, verify, version};
+use crate::{bootstrap, deploy, envs, path, proto, transfer, verify, version};
 // self_update e' usato solo nel path unix (install_staged_file);
 // su Windows il self-update passa dall'updater (cfg-specific).
 #[cfg(not(target_os = "windows"))]
@@ -62,11 +78,55 @@ pub enum Reconcile {
     /// E' stato triggerato un update del server: chiudere il socket e
     /// riconnettersi (il server sta riavviando col binario nuovo).
     Reconnect,
+    /// Riconnessione dopo il fallback WinRM: il vecchio server e' gia'
+    /// stato fermato (`quit`) e quello nuovo e' gia' in ascolto (verificato
+    /// dal polling di bootstrap_server) — l'attesa della caduta della
+    /// porta (wait_remote_restart_begin) e' inutile qui, si riconnette
+    /// subito.
+    ReconnectNoWait,
 }
 
 /// Dedup: un update per processo. Evita retry-storm quando l'update e'
 /// fallito ma il server e' comunque raggiungibile (sync apre N connessioni).
 static UPDATE_TRIED: AtomicBool = AtomicBool::new(false);
+
+/// Dopo il trigger di update (Reconnect): attende che la porta TCP del
+/// vecchio server CADA prima di lasciar riconnettere il client.
+///
+/// PERCHE': il server esce ~100ms dopo l'ack di UPDATE_REQ (grace per
+/// l'ACK); una riconnessione immediata dentro quella finestra parla col
+/// VECCHIO binario — il comando girerebbe sulla versione pre-swap e
+/// l'handshake riporterebbe il ts vecchio (race osservata nell'e2e
+/// localhost). Aspettando la caduta della porta si e' certi che lo swap
+/// e' in corso (o gia' avvenuto: il retry loop con deadline gestisce il
+/// ritorno in ascolto del binario nuovo).
+///
+/// Best-effort: se la porta non cade entro 10s (updater lentissimo, o
+/// swap+relaunch cosi' veloce da non essere mai visto giu') si prosegue
+/// comunque — il comportamento degrada a quello pre-fix, mai peggio.
+pub async fn wait_remote_restart_begin(addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut polls = 0u32;
+    while Instant::now() < deadline {
+        match TcpStream::connect(addr).await {
+            // Porta ancora aperta: il vecchio server non e' ancora uscito.
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!(
+                    "[update] vecchio server uscito (porta caduta dopo {} poll).",
+                    polls
+                );
+                return;
+            }
+        }
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!(
+        "[update] WARNING: porta {} mai caduta entro 10s (swap molto veloce o updater lento): proseguo coi retry.",
+        addr
+    );
+}
 
 // ---------------------------------------------------------------------------
 // LATO CLIENT: confronto versione e orchestrazione.
@@ -134,9 +194,59 @@ pub async fn reconcile(remote_ts: Option<u64>) -> Reconcile {
                 Ok(()) => Reconcile::Reconnect,
                 Err(e) => {
                     eprintln!(
-                        "[update] WARNING update remoto fallito: {:#} — proseguo col server corrente",
+                        "[update] WARNING update remoto via TCP fallito: {:#}",
                         e
                     );
+                    // --- FALLBACK WINRM ---
+                    // Il transfer TCP puo' essere rotto SUL REMOTE (caso
+                    // reale H101: server di una build intermedia con
+                    // VERSION=2 del protocollo che rifiuta i messaggi framed
+                    // dei client v1 chiudendo il socket -> "early eof" su
+                    // OGNI put, anche da 1KB). Shell-mode (testo raw) e
+                    // handshake continuano pero' a funzionare, quindi il
+                    // server e' vivo ma non aggiornabile via TCP.
+                    //
+                    // Il canale WinRM e' indipendente dal framing TCP:
+                    // deploy + riavvio via schtasks. Sequenza SICURA:
+                    //   1. preflight WinRM (winrm_probe): se WinRM non
+                    //      risponde NON si tocca il server corrente
+                    //      (fermarlo senza via di ripristino = brick);
+                    //   2. `quit` in shell-mode (raw: funziona anche con
+                    //      framing rotto) -> il vecchio server esce pulito,
+                    //      niente race col comando client;
+                    //   3. bootstrap_server(): deploy staged via WinRM
+                    //      (con functional check `--version` + swap .old)
+                    //      + schtasks /Run + attesa;
+                    //   4. Reconnect: riconnesione e verifica del ts nuovo.
+                    if let Some(_info) = bootstrap::winrm_probe().await {
+                        eprintln!(
+                            "[update] fallback WinRM: fermo il vecchio server via shell-mode (`quit`)..."
+                        );
+                        let _ = send_shell_and_drain("quit").await;
+                        eprintln!("[update] fallback WinRM: vecchio server fermato, deploy + riavvio via WinRM...");
+                        match bootstrap::bootstrap_server().await {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[update] fallback WinRM completato: riconnessione al server aggiornato..."
+                                );
+                                // Il vecchio server e' gia' uscito (quit) e
+                                // bootstrap_server ha atteso il nuovo in
+                                // ascolto: niente attesa caduta porta.
+                                return Reconcile::ReconnectNoWait;
+                            }
+                            Err(e2) => {
+                                eprintln!(
+                                    "[update] WARNING fallback WinRM fallito: {:#} — proseguo col server corrente",
+                                    e2
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "[update] WinRM non raggiungibile: nessun fallback disponibile, \
+                             proseguo col server corrente (TCP non aggiornabile da questo client)."
+                        );
+                    }
                     Reconcile::Proceed
                 }
             }
@@ -179,6 +289,23 @@ async fn update_remote(remote_ts: Option<u64>) -> Result<()> {
         dir, staged_remote
     );
 
+    // --- Step 0: marker anti retry-storm ---
+    // Il rollback dell'updater lascia `crosspilot-<ts>.bad` nella dir del
+    // remote quando un build supera lo swap ma non il rilancio (server
+    // mai in ascolto). Senza questo check ogni run del client farebbe:
+    // brick -> rollback -> riconnessione -> nuovo tentativo -> brick.
+    // Presente => abortisco: serve intervento manuale o un build diverso.
+    let bad_marker = remote_join(&dir, &format!("crosspilot-{}.bad", version::BUILD_TS));
+    if remote_file_exists(&bad_marker).await {
+        bail!(
+            "build {} gia' fallito su questo remote (marker {} presente): \
+             rollback automatico gia' avvenuto — rimuovere il marker sul remote \
+             o distribuire un build con ts diverso",
+            version::BUILD_TS,
+            bad_marker
+        );
+    }
+
     // --- Step 1: PUT exe staged ---
     // put_client richiede un file su disco: l'exe embeddato va prima
     // materializzato in tempdir (nome con pid per evitare collisioni).
@@ -190,14 +317,18 @@ async fn update_remote(remote_ts: Option<u64>) -> Result<()> {
     std::fs::write(&tmp_exe, staged_payload)
         .with_context(|| format!("scrittura {}", tmp_exe.display()))?;
     let tmp_exe_s = tmp_exe.to_string_lossy().to_string();
-    let put_res = async {
-        let mut s = open_conn().await?;
-        transfer::put_client(&mut s, &tmp_exe_s, &staged_remote).await
-    }
-    .await;
+    let put_res = put_with_retry(&tmp_exe_s, &staged_remote, "exe staged").await;
     let _ = std::fs::remove_file(&tmp_exe);
     put_res.context("upload exe staged")?;
     eprintln!("[update] exe staged uploadato: {}", staged_remote);
+
+    // --- Step 1.5: functional check dello staged PRIMA del trigger ---
+    // Il path WinRM prova `'<exe>.new' --version` prima dello swap; qui
+    // mancava e uno staged non eseguibile (OS troppo vecchio, AV, upload
+    // troncato) brickava il remote: l'updater non partiva e il vecchio
+    // server era gia' stato ucciso. Fallire qui abortisce l'update con
+    // il server ancora vivo e utilizzabile.
+    check_staged_runnable(&staged_remote, remote_windows).await?;
 
     // --- Step 2: PUT degli artefatti scaricabili (cross-serve) ---
     // Il remote aggiornato serve self-update a client di QUALUNQUE OS:
@@ -230,11 +361,7 @@ async fn update_remote(remote_ts: Option<u64>) -> Result<()> {
         std::fs::write(&tmp_art, payload)
             .with_context(|| format!("scrittura {}", tmp_art.display()))?;
         let tmp_art_s = tmp_art.to_string_lossy().to_string();
-        let put_res = async {
-            let mut s = open_conn().await?;
-            transfer::put_client(&mut s, &tmp_art_s, &artifact_remote).await
-        }
-        .await;
+        let put_res = put_with_retry(&tmp_art_s, &artifact_remote, name).await;
         let _ = std::fs::remove_file(&tmp_art);
         match put_res {
             Ok(()) => eprintln!("[update] artefatto {} uploadato: {}", name, artifact_remote),
@@ -259,11 +386,7 @@ async fn update_remote(remote_ts: Option<u64>) -> Result<()> {
         .with_context(|| format!("scrittura {}", tmp_env.display()))?;
     let tmp_env_s = tmp_env.to_string_lossy().to_string();
     let env_remote = remote_join(&dir, ".env");
-    let put_res = async {
-        let mut s = open_conn().await?;
-        transfer::put_client(&mut s, &tmp_env_s, &env_remote).await
-    }
-    .await;
+    let put_res = put_with_retry(&tmp_env_s, &env_remote, ".env").await;
     let _ = std::fs::remove_file(&tmp_env);
     match put_res {
         Ok(()) => eprintln!("[update] .env remoto scritto (porta {})", port),
@@ -302,12 +425,17 @@ async fn update_remote(remote_ts: Option<u64>) -> Result<()> {
             // l'updater via shell (fuori dal job: WMI su Windows, setsid su
             // Linux) e poi si manda `quit` per far uscire il vecchio server.
             // L'updater attende la porta libera, poi swappa e rilancia.
+            // --target esplicito: default_target() assumerebbe il nome
+            // `crosspilot[.exe]` nella dir dello staged; se EXE_PATH ha
+            // un nome diverso (es. deploy rinominato) lo swap colpirebbe
+            // il file sbagliato. Meglio dire all'updater qual e' l'exe
+            // reale da sostituire.
             let spawn_cmd = if remote_windows {
-                wmi_spawn_cmd(&staged_remote, port)
+                wmi_spawn_cmd(&staged_remote, port, &exe_path)
             } else {
                 format!(
-                    "setsid \"{}\" update --port {} >/dev/null 2>&1 &",
-                    staged_remote, port
+                    "setsid \"{}\" update --target \"{}\" --port {} >/dev/null 2>&1 &",
+                    staged_remote, exe_path, port
                 )
             };
             let out = send_shell_and_drain(&spawn_cmd).await?;
@@ -524,12 +652,116 @@ async fn send_shell_and_drain(cmd: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).to_string())
 }
 
+/// True se `remote` esiste sul server (GET di prova su file temp locale).
+/// Best-effort: qualunque errore (connessione, file assente, permessi)
+/// => false. Usata solo per il probe del marker anti retry-storm.
+async fn remote_file_exists(remote: &str) -> bool {
+    let tmp = std::env::temp_dir().join(format!("crosspilot-probe-{}", std::process::id()));
+    let tmp_s = tmp.to_string_lossy().to_string();
+    let res = async {
+        let mut s = open_conn().await?;
+        transfer::get_client(&mut s, remote, &tmp_s).await
+    }
+    .await;
+    let _ = std::fs::remove_file(&tmp);
+    let exists = res.is_ok();
+    eprintln!("[update] probe remoto {} -> exists={}", remote, exists);
+    exists
+}
+
+/// PUT con retry su connessione fresca: l'upload di file grossi (~6.5 MB)
+/// ha mostrato "early eof" intermittenti (socket chiuso dal server a meta'
+/// stream). PUT e' idempotente — il dst viene riscritto da zero — quindi
+/// ritentare e' sicuro; la connessione rotta va comunque buttata e ogni
+/// tentativo ne apre una nuova.
+async fn put_with_retry(local: &str, remote: &str, what: &str) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=3u32 {
+        let res = async {
+            let mut s = open_conn().await?;
+            transfer::put_client(&mut s, local, remote).await
+        }
+        .await;
+        match res {
+            Ok(()) => {
+                if attempt > 1 {
+                    eprintln!("[update] PUT {} riuscito al tentativo {}", what, attempt);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[update] WARNING PUT {} tentativo {}/3 fallito: {}",
+                    what, attempt, e
+                );
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    Err(last_err
+        .map(|e| {
+            // Diagnostica mirata: "early eof" dopo PUT_REQ = il server ha
+            // chiuso il socket senza rispondere. Il caso reale: server di
+            // una build con VERSION protocollo incompatibile che rifiuta
+            // i messaggi framed chiudendo la connessione (H101). Senza
+            // questo hint l'errore e' criptico e sembra un problema di rete.
+            if format!("{:#}", e).contains("early eof") {
+                e.context(
+                    "il server remoto ha chiuso il socket dopo PUT_REQ: possibile \
+                     versione protocollo incompatibile (build intermedia?)",
+                )
+            } else {
+                e
+            }
+        })
+        .unwrap_or_else(|| anyhow::anyhow!("PUT {} fallito", what)))
+}
+
+/// Functional check dello staged sul remote: esegue `<staged> --version`
+/// in shell-mode e verifica che il build_ts stampato sia quello atteso.
+/// Chiamata PRIMA del trigger di swap: se fallisce, il vecchio server
+/// resta vivo e il remote non viene brickato (a differenza del bug H166,
+/// dove l'updater non e' mai partito e non c'era modo di saperlo).
+async fn check_staged_runnable(staged: &str, remote_windows: bool) -> Result<()> {
+    // Su unix il file appena uploadato ha permessi 644 (PUT non setta
+    // +x): chmod prima dell'esecuzione. Su Windows il bit non esiste.
+    let cmd = if remote_windows {
+        format!("\"{}\" --version", staged)
+    } else {
+        format!("chmod 755 \"{}\" && \"{}\" --version", staged, staged)
+    };
+    eprintln!("[update] functional check staged: {}", cmd);
+    let out = send_shell_and_drain(&cmd)
+        .await
+        .context("esecuzione staged --version sul remote")?;
+    eprintln!("[update] staged --version output: {}", out.trim());
+    // Il ts viene cercato in QUALUNQUE riga: l'output shell-mode puo'
+    // contenere rumore (banner, CLIXML di powershell, echo del tty).
+    let staged_ts = out
+        .lines()
+        .find_map(version::parse_version_ts)
+        .with_context(|| format!("output --version senza ts: {}", out.trim()))?;
+    if staged_ts != version::BUILD_TS {
+        bail!(
+            "staged --version riporta ts={} ma il locale e' {}: binario incoerente",
+            staged_ts,
+            version::BUILD_TS
+        );
+    }
+    eprintln!("[update] staged verificato eseguibile sul remote (ts={})", staged_ts);
+    Ok(())
+}
+
 /// Comando PowerShell (EncodedCommand, UTF-16LE base64: zero problemi di
 /// quoting via cmd /C) che crea il processo updater via WMI.
 /// Win32_Process.Create spawna il processo dal servizio WMI: nasce FUORI
 /// dal job object del server e sopravvive alla sua terminazione.
-fn wmi_spawn_cmd(staged: &str, port: u16) -> String {
-    let cmdline = format!("\"{}\" update --port {}", staged, port);
+fn wmi_spawn_cmd(staged: &str, port: u16, target: &str) -> String {
+    let cmdline = format!(
+        "\"{}\" update --target \"{}\" --port {}",
+        staged, target, port
+    );
     let ps = format!(
         "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{}'}}).ReturnValue",
         cmdline.replace('\'', "''")
@@ -631,6 +863,64 @@ pub async fn server_apply_update(socket: &mut TcpStream, req: &proto::UpdateReq)
 // rilancia. Esegue detached, fuori dal job object del server.
 // ---------------------------------------------------------------------------
 
+/// Finestra di attesa per il bind del server rilanciato, prima di
+/// dichiarare fallito l'update e fare rollback a `.old`. Il client
+/// polla per 90s: 60s qui lasciano margine per swap+rollback+relisten
+/// del vecchio server dentro la stessa finestra.
+const SERVER_UP_WAIT_SECS: u64 = 60;
+
+/// Nome del file di log dell'updater, accanto al target dello swap.
+/// NON matcha i pattern di sweep_staged (`crosspilot-<digits>`): resta
+/// come traccia diagnostica anche dopo il cleanup del server.
+const UPDATER_LOG_NAME: &str = "crosspilot-update.log";
+
+/// Logger append-only su file + mirror su stderr.
+///
+/// PERCHE': l'updater gira DETACHED con stdio nullo (spawn_detached) —
+/// senza un log su disco ogni fallimento (wait, swap, relaunch, bind del
+/// server rilanciato) e' invisibile: e' esattamente il brick silenzioso
+/// visto su H166. Best-effort per contratto: un log mancato non deve MAI
+/// interrompere l'update.
+struct UpdaterLog {
+    path: PathBuf,
+}
+
+impl UpdaterLog {
+    fn new(dir: &Path) -> Self {
+        Self {
+            path: dir.join(UPDATER_LOG_NAME),
+        }
+    }
+
+    /// Appende una riga `[unix_ts] msg`. Rotazione minimale: oltre
+    /// 512 KiB il file riparte da zero (e' diagnostica dell'ultimo
+    /// update, non uno storico — il file vivrebbe altrimenti per sempre
+    /// accumulando update su update).
+    fn line(&self, msg: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            if meta.len() > 512 * 1024 {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        let row = format!("[{}] {}\n", ts, msg);
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, row.as_bytes()));
+        if let Err(e) = res {
+            // Nemmeno il log file e' scrivibile: resta solo stderr
+            // (visibile se l'updater e' lanciato a mano con console).
+            eprintln!("[updater] WARNING log {} non scrivibile: {}", self.path.display(), e);
+        }
+        eprintln!("[updater] {}", msg);
+    }
+}
+
 /// Entry point del sottocomando `update` (usato dallo staged binary).
 /// `target`: exe da sostituire (default: `crosspilot[.exe]` nella dir dello
 /// staged). `wait_pid`/`port`: condizioni di attesa morte server.
@@ -638,6 +928,12 @@ pub async fn server_apply_update(socket: &mut TcpStream, req: &proto::UpdateReq)
 /// il self-update di un client Windows rilancia gli argv originali).
 /// `console`: su Windows rilancia con una console nuova (output visibile —
 /// usato per i comandi client; i server restano hidden).
+///
+/// In server-mode (relaunch_args vuoto -> `--server`) dopo il rilancio
+/// l'updater VERIFICA che la porta torni in ascolto: se non succede fa
+/// rollback a `.old` e rilancia il vecchio binario (meglio un server
+/// vecchio che un remote morto), lasciando il marker `crosspilot-<ts>.bad`
+/// che impedisce al client di ritentare lo stesso build all'infinito.
 pub async fn run_updater(
     target: Option<String>,
     wait_pid: Option<u32>,
@@ -658,51 +954,104 @@ pub async fn run_updater(
         .or_else(|| envs::var("SERVER_PORT").and_then(|p| p.parse().ok()))
         .unwrap_or(5330);
 
-    eprintln!(
-        "[update] updater: self={} target={} wait_pid={:?} port={} wait={}s",
+    let dir = target_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    // Il log file vive accanto al target: dir scrivibile perche' ci e'
+    // appena stato fatto un PUT/staged.
+    let log = UpdaterLog::new(&dir);
+    // Modalita' server = relaunch_args vuoto (default `--server`).
+    // Calcolata una volta sola: usata dal rilancio di emergenza (solo i
+    // server vanno riportati in vita) e dal check porta post-relaunch
+    // (un client Windows rilanciato con --arg non apre listener).
+    let server_mode = relaunch_args.is_empty();
+    log.line(&format!(
+        "=== updater start: self={} target={} wait_pid={:?} port={} wait={}s relaunch_args={:?} console={}",
         self_exe.display(),
         target_path.display(),
         wait_pid,
         port,
-        wait_secs
-    );
+        wait_secs,
+        relaunch_args,
+        console
+    ));
 
     // --- Step 1: attende la morte del vecchio server ---
-    wait_server_down(wait_pid, port, wait_secs).await;
+    wait_server_down(wait_pid, port, wait_secs, &log).await;
     // Grace: rilascio handle file post-mortem (e coda AV).
     tokio::time::sleep(Duration::from_millis(500)).await;
+    log.line("vecchio server considerato morto: inizio swap rename-first");
 
     // --- Step 2: swap rename-first ---
     // target -> target.old (rollback point), poi self -> target.
     // Su Windows il rename di un exe running e' consentito: lo swap
     // funziona anche se il vecchio processo e' ancora in chiusura.
-    let dir = target_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
     let mut old_os = target_path.as_os_str().to_owned();
     old_os.push(".old");
     let old_path = PathBuf::from(old_os);
     if target_path.exists() {
         let _ = std::fs::remove_file(&old_path);
-        retry_rename(&target_path, &old_path, 60)
-            .await
-            .context("rename target -> .old")?;
-        eprintln!("[update] backup: {}", old_path.display());
+        match retry_rename(&target_path, &old_path, 60).await {
+            Ok(()) => log.line(&format!("backup: {} -> {}", target_path.display(), old_path.display())),
+            Err(e) => {
+                // Senza backup non si puo' fare rollback: abortire e'
+                // piu' sicuro che proseguire allo swap senza paracadute
+                // (il vecchio server e' morto ma il suo exe e' intatto).
+                log.line(&format!("FATAL rename target -> .old: {} — abort senza swap", e));
+                // Il target e' ANCORA il vecchio binario funzionante (lo
+                // swap non e' avvenuto): invece di lasciare il remote
+                // morto, si tenta il rilancio di emergenza del vecchio
+                // exe. Se riesce l'update e' fallito ma il remote resta
+                // operativo (il client ritentera' al prossimo giro).
+                if server_mode {
+                    log.line("rilancio di emergenza del vecchio binario (intatto)...");
+                    match spawn_detached(&target_path, &["--server".to_string()], false) {
+                        Ok(()) => {
+                            if wait_port_up(port, 30, &log).await {
+                                log.line("vecchio server ripartito: update fallito ma remote operativo");
+                            } else {
+                                log.line("WARNING: vecchio server non in ascolto dopo il rilancio di emergenza");
+                            }
+                        }
+                        Err(e2) => log.line(&format!("FATAL rilancio di emergenza: {}", e2)),
+                    }
+                }
+                return Err(e.context("rename target -> .old"));
+            }
+        }
+    } else {
+        log.line("target assente: nessun backup .old necessario");
     }
     match retry_rename(&self_exe, &target_path, 60).await {
-        Ok(()) => eprintln!("[update] staged -> {} (rename)", target_path.display()),
+        Ok(()) => log.line(&format!("staged -> {} (rename)", target_path.display())),
         Err(e) => {
             // Fallback copy (es. rename cross-volume impossibile — non
             // dovrebbe accadere: staged e target sono nella stessa dir).
-            eprintln!("[update] rename fallito ({}), fallback copy...", e);
-            std::fs::copy(&self_exe, &target_path).with_context(|| {
-                format!("copy {} -> {}", self_exe.display(), target_path.display())
-            })?;
-            eprintln!(
-                "[update] staged -> {} (copy; lo staged resta su disco, lo sweep pulisce)",
-                target_path.display()
-            );
+            log.line(&format!("rename fallito ({}), fallback copy...", e));
+            match std::fs::copy(&self_exe, &target_path) {
+                Ok(_) => log.line(&format!(
+                    "staged -> {} (copy; lo staged resta su disco, lo sweep pulisce)",
+                    target_path.display()
+                )),
+                Err(e2) => {
+                    // Lo swap non e' avvenuto: se il backup .old esiste
+                    // ripristiniamolo SUBITO (target potrebbe essere
+                    // assente o corrotto a meta').
+                    log.line(&format!("FATAL copy staged -> target: {}", e2));
+                    if old_path.exists() {
+                        match retry_rename(&old_path, &target_path, 30).await {
+                            Ok(()) => log.line("ripristino immediato .old -> target OK"),
+                            Err(e3) => log.line(&format!("FATAL anche il ripristino .old: {}", e3)),
+                        }
+                    }
+                    return Err(anyhow::Error::from(e2).context(format!(
+                        "copy {} -> {}",
+                        self_exe.display(),
+                        target_path.display()
+                    )));
+                }
+            }
         }
     }
 
@@ -719,41 +1068,204 @@ pub async fn run_updater(
     }
 
     // --- Step 3: .ver + sweep staged (best-effort) ---
-    if let Err(e) = write_ver_file(&dir, &target_path) {
-        eprintln!("[update] WARNING scrittura .ver: {}", e);
+    match write_ver_file(&dir, &target_path) {
+        Ok(()) => log.line(&format!(".ver scritto (ts={})", version::BUILD_TS)),
+        Err(e) => log.line(&format!("WARNING scrittura .ver: {}", e)),
     }
     sweep_staged(&dir);
 
     // --- Step 4: rilancio dell'exe aggiornato ---
     // Default: --server (update del server). Il self-update di un client
     // Windows passa gli argv originali via --arg.
-    let relaunch = if relaunch_args.is_empty() {
+    let relaunch = if server_mode {
         vec!["--server".to_string()]
     } else {
         relaunch_args
     };
-    spawn_detached(&target_path, &relaunch, console)?;
-    eprintln!(
-        "[update] rilanciato {} {:?}. Update completato.",
-        target_path.display(),
-        relaunch
-    );
+    match spawn_detached(&target_path, &relaunch, console) {
+        Ok(()) => log.line(&format!(
+            "rilanciato {} {:?}",
+            target_path.display(),
+            relaunch
+        )),
+        Err(e) => {
+            // Spawn impossibile (es. exe corrotto nonostante il check):
+            // tentativo di ripristino immediato. Il relaunch del rollback
+            // usa gli STESSI argv del relaunch fallito (per un client
+            // Windows --arg sarebbero gli argv originali, non --server!).
+            log.line(&format!("FATAL spawn rilancio: {} — rollback", e));
+            let verify_port = if server_mode { Some(port) } else { None };
+            rollback_to_old(&dir, &target_path, &old_path, verify_port, &relaunch, console, &log).await;
+            return Err(e);
+        }
+    }
+
+    // --- Step 5: conferma che il server rilanciato binda la porta ---
+    // Solo in server-mode: il rilancio di un client Windows (--arg con
+    // gli argv originali) non apre listener, non c'e' nulla da verificare.
+    if !server_mode {
+        log.line("relaunch custom (--arg): skip check porta. Updater terminato OK.");
+        return Ok(());
+    }
+    if wait_port_up(port, SERVER_UP_WAIT_SECS, &log).await {
+        log.line(&format!(
+            "nuovo server in ascolto su porta {}: update COMPLETATO",
+            port
+        ));
+        return Ok(());
+    }
+
+    // --- Step 6: rollback automatico ---
+    // Il nuovo exe e' partito (spawn ok) ma la porta non si e' mai aperta:
+    // crash post-avvio, bind fallito, AV che lo ammazza dopo lo spawn.
+    // Si ripristina .old e si rilancia: il remote torna alla versione
+    // precedente invece di restare morto.
+    log.line(&format!(
+        "nuovo server NON in ascolto dopo {}s: ROLLBACK a {}",
+        SERVER_UP_WAIT_SECS,
+        old_path.display()
+    ));
+    rollback_to_old(&dir, &target_path, &old_path, Some(port), &["--server".to_string()], false, &log).await;
     Ok(())
+}
+
+/// Poll TCP su 127.0.0.1:port per `secs`: true appena qualcosa accetta.
+/// Il connect riuscito viene subito chiuso: il server vedra' un handshake
+/// abortito (peek timeout) — rumore innocuo nei suoi log.
+async fn wait_port_up(port: u16, secs: u64, log: &UpdaterLog) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut attempt = 0u32;
+    while Instant::now() < deadline {
+        attempt += 1;
+        match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+            Ok(_) => {
+                log.line(&format!(
+                    "porta {} in ascolto (tentativo {})",
+                    port, attempt
+                ));
+                return true;
+            }
+            Err(e) => {
+                if attempt % 10 == 1 {
+                    log.line(&format!(
+                        "attesa porta {} (tentativo {}): {}",
+                        port, attempt, e
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    log.line(&format!("porta {} MAI in ascolto entro {}s", port, secs));
+    false
+}
+
+/// Ripristino post-fallimento. Sequenza:
+/// 1. marker `crosspilot-<ts>.bad` (anti retry-storm: il client lo
+///    rileva via GET e non ritenta questo build — vedi update_remote);
+/// 2. il binario fallito viene parcheggiato come `crosspilot-<ts>.failed`
+///    (evidenza per la diagnosi; il nome NON matcha is_staged_name ->
+///    sopravvive allo sweep);
+/// 3. `.old` torna target e viene rilanciato con `relaunch` (server:
+///    `--server`; client Windows self-update: argv originali);
+/// 4. se `port` e' Some (server-mode): attesa bind e log dell'esito.
+///
+/// Tutto best-effort: se anche il rollback fallisce il remote resta
+/// morto e serve intervento manuale (RDP/WinRM) — il log file spiega
+/// esattamente dove si e' fermato.
+async fn rollback_to_old(
+    dir: &Path,
+    target: &Path,
+    old: &Path,
+    port: Option<u16>,
+    relaunch: &[String],
+    console: bool,
+    log: &UpdaterLog,
+) {
+    log.line("=== ROLLBACK in corso ===");
+
+    // 1) Marker anti retry-storm: piccolo file testo con la ragione.
+    //    `crosspilot-<digits>.bad` non matcha is_staged_name (stem non
+    //    tutto digit) -> sopravvive a sweep_staged e self_describe.
+    let marker = dir.join(format!("crosspilot-{}.bad", version::BUILD_TS));
+    let marker_txt = format!(
+        "build {} rollback su {}: il binario rilanciato con {:?} non ha aperto la porta {:?} entro {}s\n",
+        version::BUILD_TS,
+        target.display(),
+        relaunch,
+        port,
+        SERVER_UP_WAIT_SECS
+    );
+    match std::fs::write(&marker, &marker_txt) {
+        Ok(()) => log.line(&format!("marker anti-retry scritto: {}", marker.display())),
+        Err(e) => log.line(&format!(
+            "WARNING scrittura marker {}: {}",
+            marker.display(),
+            e
+        )),
+    }
+
+    // 2) Parcheggio del binario fallito (non cancellare: potrebbe essere
+    //    solo un bind fallito, non un exe corrotto).
+    let failed = dir.join(format!("crosspilot-{}.failed", version::BUILD_TS));
+    if target.exists() {
+        match retry_rename(target, &failed, 10).await {
+            Ok(()) => log.line(&format!(
+                "exe fallito parcheggiato: {} -> {}",
+                target.display(),
+                failed.display()
+            )),
+            Err(e) => log.line(&format!("WARNING parcheggio exe fallito: {}", e)),
+        }
+    }
+
+    // 3) Ripristino .old -> target.
+    if !old.exists() {
+        log.line("FATAL rollback: .old assente — niente da ripristinare, remote morto");
+        return;
+    }
+    match retry_rename(old, target, 60).await {
+        Ok(()) => log.line(&format!("ripristinato {} -> {}", old.display(), target.display())),
+        Err(e) => {
+            log.line(&format!("FATAL rollback rename .old -> target: {}", e));
+            return;
+        }
+    }
+
+    // 4) Rilancio del binario ripristinato. `console` e' quella del
+    // relaunch originario (un client Windows vuole la console visibile).
+    match spawn_detached(target, relaunch, console) {
+        Ok(()) => log.line(&format!("rollback: binario ripristinato rilanciato {:?}", relaunch)),
+        Err(e) => {
+            log.line(&format!("FATAL rollback: spawn fallito: {}", e));
+            return;
+        }
+    }
+    // 5) Conferma bind: solo in server-mode (client: niente listener).
+    let Some(port) = port else {
+        log.line("rollback COMPLETATO (client-mode: nessuna porta da verificare)");
+        return;
+    };
+    if wait_port_up(port, 30, log).await {
+        log.line("rollback COMPLETATO: vecchio server di nuovo in ascolto");
+    } else {
+        log.line("FATAL rollback: neanche il vecchio server binda — intervento manuale");
+    }
 }
 
 /// Attende che il vecchio server muoia: per PID (preciso, path nuovo) o
 /// per liberazione della porta TCP (fallback legacy / senza pid).
-async fn wait_server_down(wait_pid: Option<u32>, port: u16, wait_secs: u64) {
+async fn wait_server_down(wait_pid: Option<u32>, port: u16, wait_secs: u64, log: &UpdaterLog) {
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     if let Some(pid) = wait_pid {
         while Instant::now() < deadline {
             if !process_alive(pid) {
-                eprintln!("[update] pid {} terminato.", pid);
+                log.line(&format!("pid {} terminato.", pid));
                 return;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        eprintln!("[update] WARNING: pid {} ancora vivo dopo {}s", pid, wait_secs);
+        log.line(&format!("WARNING: pid {} ancora vivo dopo {}s", pid, wait_secs));
     }
     // Porta: attesa che il listener muoia (complementare al pid, o unico
     // segnale quando il pid non e' noto — es. spawn WMI legacy).
@@ -762,20 +1274,20 @@ async fn wait_server_down(wait_pid: Option<u32>, port: u16, wait_secs: u64) {
             .await
             .is_err()
         {
-            eprintln!("[update] porta {} libera.", port);
+            log.line(&format!("porta {} libera.", port));
             return;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    eprintln!(
-        "[update] WARNING: porta {} ancora occupata dopo {}s",
+    log.line(&format!(
+        "WARNING: porta {} ancora occupata dopo {}s",
         port, wait_secs
-    );
+    ));
     // Ultima spiaggia su Windows: kill diretto dei PID in ascolto
     // (riusa la logica AddrInUse del server).
     #[cfg(target_os = "windows")]
     {
-        eprintln!("[update] forzo kill listener su porta {}", port);
+        log.line(&format!("forzo kill listener su porta {}", port));
         let _ = crate::kill_listener_on_port_windows(port).await;
     }
 }

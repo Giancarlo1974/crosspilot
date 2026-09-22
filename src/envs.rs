@@ -109,9 +109,16 @@ fn candidate_paths() -> Vec<PathBuf> {
 
 /// Path del .env da usare per il CRUD: il primo esistente tra i candidati,
 /// altrimenti ./.env (viene creato alla prima scrittura).
+/// Il path trovato viene canonicalizzato: se un candidato e' un symlink
+/// (es. <exe dir>/.env -> progetto/.env per un binario installato in PATH),
+/// il save atomico (temp + rename) deve scrivere sul file reale e non
+/// sostituire il symlink.
 pub fn env_file_path() -> PathBuf {
     let found = candidate_paths().into_iter().find(|p| p.exists());
-    found.unwrap_or_else(|| PathBuf::from(".env"))
+    match found {
+        Some(p) => p.canonicalize().unwrap_or(p),
+        None => PathBuf::from(".env"),
+    }
 }
 
 /// Carica il primo .env trovato nei path candidati (dotenvy).

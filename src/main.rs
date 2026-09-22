@@ -759,7 +759,25 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
 async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
     // Legge il primo messaggio: il magic "DFB1" è già stato peek-ato ma non consumato,
     // quindi read_msg lo rilegge da capo insieme a version/msg_type/payload.
-    let (msg_type, payload) = proto::read_msg(&mut socket).await?;
+    //
+    // Su errore di framing (magic/versione/payload invalidi) si tenta PRIMA un
+    // ERR best-effort e poi si chiude: senza di esso il client vede solo
+    // "early eof" (socket chiuso senza spiegazione). E' il sintomo del server
+    // H101 zombificato (build intermedia con VERSION=2) che rifiutava ogni
+    // messaggio framed chiudendo in silenzio.
+    let (msg_type, payload) = match proto::read_msg(&mut socket).await {
+        Ok(v) => v,
+        Err(e) => {
+            let err = proto::ErrMsg {
+                code: proto::ERR_PROTO,
+                message: format!("framing non valido: {}", e),
+            };
+            // Best-effort: se il socket e' gia' rotto la scrittura fallisce
+            // silenziosamente e il client vedra' comunque early eof.
+            let _ = proto::send_err(&mut socket, &err).await;
+            return Err(e);
+        }
+    };
 
     match msg_type {
         proto::MSG_PUT_REQ => {
@@ -926,6 +944,22 @@ async fn connect_and_handshake() -> Result<TcpStream> {
             }
             update::Reconcile::Reconnect => {
                 eprintln!("[update] server in aggiornamento: attesa restart (max 90s)...");
+                // Prima di riconnettersi: attendere la MORTE del vecchio
+                // server (porta giu'). Senza questa attesa la riconnessione
+                // puo' cadere nei ~100ms di grace post-UPDATE_REQ e parlare
+                // col binario VECCHIO (race osservata in e2e: comando
+                // eseguito dal server pre-swap).
+                update::wait_remote_restart_begin(&addr).await;
+                update_deadline = Some(std::time::Instant::now() + Duration::from_secs(90));
+                attempt = 0;
+                continue;
+            }
+            update::Reconcile::ReconnectNoWait => {
+                // Fallback WinRM: il vecchio server e' gia' stato fermato
+                // (quit) e quello nuovo e' gia' in ascolto (atteso dal
+                // polling di bootstrap_server). Riconnessione immediata,
+                // con deadline di sicurezza per i retry.
+                eprintln!("[update] server aggiornato via fallback WinRM: riconnessione...");
                 update_deadline = Some(std::time::Instant::now() + Duration::from_secs(90));
                 attempt = 0;
                 continue;

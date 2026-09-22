@@ -87,6 +87,117 @@ fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool 
 /// Risultato: il server non partiva mai, ma il client ritentava 5 volte
 /// (ogni volta 15s di timeout evil-winrm + 30s di polling = 225s totali).
 ///
+/// Contesto WinRM condiviso: client costruito + host + porta + utente
+/// raw (per schtasks /RU). Estratto da bootstrap_server per essere
+/// riutilizzato dal preflight del fallback di update::reconcile.
+struct WinrmCtx {
+    client: winrm_rs::WinrmClient,
+    host: String,
+    port: u16,
+    /// Utente raw come configurato (UPN o DOMAIN\user): schtasks /RU lo
+    /// accetta in entrambi i formati.
+    schtasks_user: String,
+}
+
+/// Risolve le credenziali/endpoint WinRM dal .env (catena ambienti) e
+/// costruisce il client. Condiviso da bootstrap_server e winrm_probe.
+fn winrm_context() -> Result<WinrmCtx> {
+    let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let winrm_port_str = envs::var("PORT").unwrap_or_else(|| "47320".to_string());
+    let winrm_user_raw = envs::var("USER").unwrap_or_else(|| "gianca".to_string());
+    let winrm_pass = envs::var("PASS").unwrap_or_else(|| "gianca".to_string());
+
+    // Split dello username UPN (user@domain) in username + dominio NetBIOS.
+    // NTLM usa il dominio NetBIOS (es. AC-S-SRL), non il DNS (es. ac-s-srl.it):
+    // il suffisso @ va rimosso dal campo username dell'autenticazione.
+    let (winrm_user, winrm_domain) = if let Some(pos) = winrm_user_raw.rfind('@') {
+        let user_part = winrm_user_raw[..pos].to_string();
+        // Il dominio NTLM viene comunque auto-rilevato dal challenge Type 2:
+        // non serve convertire il DNS domain in NetBIOS.
+        let _domain_dns = winrm_user_raw[pos + 1..].to_string();
+        eprintln!("[DEBUG] winrm_context: split UPN user={} domain_dns={}", user_part, _domain_dns);
+        (user_part, String::new())
+    } else if let Some(pos) = winrm_user_raw.rfind('\\') {
+        // Formato DOMAIN\user.
+        let domain_part = winrm_user_raw[..pos].to_string();
+        let user_part = winrm_user_raw[pos + 1..].to_string();
+        eprintln!("[DEBUG] winrm_context: split DOMAIN\\user user={} domain={}", user_part, domain_part);
+        (user_part, domain_part)
+    } else {
+        (winrm_user_raw.clone(), String::new())
+    };
+
+    // Parsing della porta WinRM (default 5985 per HTTP).
+    let port = winrm_port_str.parse::<u16>().unwrap_or(5985);
+    eprintln!("[DEBUG] winrm_context: endpoint WinRM = {}:{} (HTTP, NTLMv2)", host, port);
+
+    // --- Costruzione client WinRM ---
+    // HTTP (use_tls = false), NTLMv2 (default). Il dominio è lasciato vuoto:
+    // winrm-rs lo auto-rileva dal challenge NTLM Type 2 del server.
+    let config = winrm_rs::WinrmConfig {
+        port,
+        use_tls: false,
+        ..Default::default()
+    };
+    let credentials = winrm_rs::WinrmCredentials::new(
+        winrm_user,
+        winrm_pass,
+        winrm_domain, // dominio: auto-rilevato dal challenge NTLM se vuoto
+    );
+    let client = winrm_rs::WinrmClient::new(config, credentials)
+        .context("Impossibile creare il client WinRM")?;
+    Ok(WinrmCtx {
+        client,
+        host,
+        port,
+        schtasks_user: winrm_user_raw,
+    })
+}
+
+/// Preflight WinRM per il fallback di update::reconcile: verifica che il
+/// canale WinRM sia VIVO prima di fermare un server funzionante.
+///
+/// PERCHE': quando l'update via TCP fallisce (es. server zombificato con
+/// versione protocollo incompatibile — il caso H101, build intermedia con
+/// VERSION=2 che chiude il socket su ogni messaggio framed), l'unica via
+/// di recovery e' il deploy via WinRM. Ma il deploy richiede di fermare
+/// il vecchio server (`quit` in shell-mode) PRIMA del riavvio: farlo con
+/// WinRM morto lascerebbe il remote senza server e senza via d'uscita
+/// (brick volontario). Questo preflight risponde alla domanda "posso
+/// permettermi di fermare il server?".
+///
+/// Ritorna Some(info) se remote_build_info risponde (deploy possibile),
+/// None se WinRM non e' utilizzabile.
+pub async fn winrm_probe() -> Option<version::RemoteBuildInfo> {
+    let ctx = match winrm_context() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[update-fallback] preflight: configurazione WinRM non valida: {}", e);
+            return None;
+        }
+    };
+    let exe_path = match envs::var("EXE_PATH") {
+        Some(p) => p,
+        None => {
+            eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
+            return None;
+        }
+    };
+    match deploy::remote_build_info(&ctx.client, &ctx.host, &exe_path).await {
+        Ok(info) => {
+            eprintln!(
+                "[update-fallback] preflight WinRM OK: ts remoto={:?} locale={} exe_present={}",
+                info.build_ts, version::BUILD_TS, info.exe_present
+            );
+            Some(info)
+        }
+        Err(e) => {
+            eprintln!("[update-fallback] preflight WinRM fallito: {}", e);
+            None
+        }
+    }
+}
+
 /// FIX: sostituito evil-winrm con winrm-rs (puro Rust, async, NTLMv2).
 /// winrm-rs esegue il comando PowerShell via protocollo WinRM nativo e
 /// ritorna immediatamente con stdout/stderr/exit_code del comando remoto.
@@ -99,61 +210,17 @@ pub async fn bootstrap_server() -> Result<()> {
         .context("CROSSPILOT_EXE_PATH (o CROSSPILOT_<ENV>_EXE_PATH) must be set in the .env file")?;
 
     // --- Credenziali e endpoint WinRM (da .env) ---
-    let host = envs::var("HOST")
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let winrm_port_str = envs::var("PORT")
-        .unwrap_or_else(|| "47320".to_string());
-    let winrm_user_raw = envs::var("USER")
-        .unwrap_or_else(|| "gianca".to_string());
-    let winrm_pass = envs::var("PASS")
-        .unwrap_or_else(|| "gianca".to_string());
+    let ctx = winrm_context()?;
 
     // Split dello username UPN (user@domain) in username + dominio NetBIOS.
     // NTLM usa il dominio NetBIOS (es. AC-S-SRL), non il DNS (es. ac-s-srl.it):
     // il suffisso @ va rimosso dal campo username dell'autenticazione.
     // Copia per schtasks /RU (tentativo S4U): il raw viene mosso dallo
     // split qui sotto. Formati accettati da /RU: user, DOMAIN\user, UPN.
-    let schtasks_user = winrm_user_raw.clone();
-
-    let (winrm_user, winrm_domain) = if let Some(pos) = winrm_user_raw.rfind('@') {
-        let user_part = winrm_user_raw[..pos].to_string();
-        // Il dominio NTLM viene comunque auto-rilevato dal challenge Type 2:
-        // non serve convertire il DNS domain in NetBIOS.
-        let _domain_dns = winrm_user_raw[pos + 1..].to_string();
-        eprintln!("[DEBUG] bootstrap_server: split UPN user={} domain_dns={}", user_part, _domain_dns);
-        (user_part, String::new())
-    } else if let Some(pos) = winrm_user_raw.rfind('\\') {
-        // Formato DOMAIN\user.
-        let domain_part = winrm_user_raw[..pos].to_string();
-        let user_part = winrm_user_raw[pos + 1..].to_string();
-        eprintln!("[DEBUG] bootstrap_server: split DOMAIN\\user user={} domain={}", user_part, domain_part);
-        (user_part, domain_part)
-    } else {
-        (winrm_user_raw, String::new())
-    };
-
-    // Parsing della porta WinRM (default 5985 per HTTP).
-    let winrm_port = winrm_port_str.parse::<u16>()
-        .unwrap_or(5985);
-    eprintln!("[DEBUG] bootstrap_server: endpoint WinRM = {}:{} (HTTP, NTLMv2)", host, winrm_port);
-
-    // --- Costruzione client WinRM ---
-    // HTTP (use_tls = false), NTLMv2 (default). Il dominio è lasciato vuoto:
-    // winrm-rs lo auto-rileva dal challenge NTLM Type 2 del server.
-    let config = winrm_rs::WinrmConfig {
-        port: winrm_port,
-        use_tls: false,
-        ..Default::default()
-    };
-
-    let credentials = winrm_rs::WinrmCredentials::new(
-        winrm_user,
-        winrm_pass,
-        winrm_domain, // dominio: auto-rilevato dal challenge NTLM se vuoto
-    );
-
-    let client = winrm_rs::WinrmClient::new(config, credentials)
-        .context("Impossibile creare il client WinRM")?;
+    let schtasks_user = ctx.schtasks_user.clone();
+    let host = ctx.host.clone();
+    let client = ctx.client;
+    let winrm_port = ctx.port;
 
     // --- Pre-check: stato build remoto + auto-update bidirezionale ---
     // remote_build_info sostituisce il vecchio Test-Path: oltre alla
@@ -304,6 +371,10 @@ pub async fn bootstrap_server() -> Result<()> {
     if winrm_dead {
         eprintln!("[bootstrap] WinRM non utilizzabile: skip avvio schtasks remoto.");
     } else {
+        // Regola firewall inbound per la porta del server: senza di essa
+        // un server vivo e' indistinguibile da uno spento visto dal client
+        // (SYN droppato). Idempotente: creata solo se manca.
+        ensure_firewall_rule(&client, &host).await;
         eprintln!("Bootstrapping server via WinRM...");
         let ps_result = client.run_powershell(&host, &ps_script).await;
 
@@ -373,14 +444,134 @@ pub async fn bootstrap_server() -> Result<()> {
     // --- Polling: verifica che il server TCP sia effettivamente partito ---
     // Il processo remoto può richiedere più tempo su dischi lenti, AV scan,
     // o primo avvio. Tenta la connessione TCP ogni 2s per un massimo di 30s.
-    poll_server_startup().await;
+    let up = poll_server_startup().await;
+    if !up && !winrm_dead {
+        // Il server non risponde: prima di dichiarare fallimento chiediamo
+        // AL REMOTO (via WinRM, canale indipendente) cosa sta succedendo.
+        // Distingue i tre casi: processo morto / porta non bindata /
+        // firewall che droppa l'inbound (il caso H102: server VIVO e in
+        // ascolto, ma SYN droppato => "connect timeout" indistinguibile
+        // dal "server spento" visto da fuori).
+        remote_startup_diag(&client, &host).await;
+    }
 
     Ok(())
 }
 
+/// Porta TCP del server remoto vista dal client (CLIENT_PORT nel .env,
+/// coerente con poll_server_startup e con la regola firewall creata).
+fn server_tcp_port() -> u16 {
+    envs::var("CLIENT_PORT")
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(5330)
+}
+
+/// Crea (una sola volta) la regola firewall inbound per la porta TCP del
+/// server. Senza di essa il server puo' essere VIVO e in ascolto ma
+/// irraggiungibile dai client: il SYN viene droppato dal Windows Firewall
+/// e l'esterno vede solo "connect timeout" — identico a un server spento
+/// (caso reale H102). Nome regola `crosspilot-server-<porta>`: distinta
+/// per porta, idempotente via check Get-NetFirewallRule.
+async fn ensure_firewall_rule(client: &winrm_rs::WinrmClient, host: &str) {
+    let port = server_tcp_port();
+    let script = format!(
+        "$p={p}; $n='crosspilot-server-' + $p; \
+         if (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue) {{ \
+         Write-Output 'FIREWALL=PRESENT' \
+         }} else {{ \
+         netsh advfirewall firewall add rule name=$n dir=in action=allow protocol=TCP localport=$p | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ Write-Output 'FIREWALL=ADDED' }} else {{ Write-Output 'FIREWALL=FAILED' }} \
+         }}",
+        p = port
+    );
+    match client.run_powershell(host, &script).await {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            match stdout.as_str() {
+                "FIREWALL=ADDED" => println!("[bootstrap] regola firewall inbound creata (TCP/{}, nome crosspilot-server-{}).", port, port),
+                "FIREWALL=PRESENT" => println!("[bootstrap] regola firewall inbound gia' presente (TCP/{}, nome crosspilot-server-{}).", port, port),
+                "FIREWALL=FAILED" => eprintln!(
+                    "[WARNING] bootstrap: creazione regola firewall TCP/{} fallita (serve admin): \
+                     se il server non risponde ma il processo vive, questo e' il motivo.",
+                    port
+                ),
+                other => eprintln!("[WARNING] bootstrap: esito firewall inatteso: {:?}", other),
+            }
+        }
+        Err(e) => eprintln!("[WARNING] bootstrap: check regola firewall fallito: {}", e),
+    }
+}
+
+/// Diagnostica post-bootstrap-fallito, eseguita via WinRM sul remote.
+/// Riporta: processo crosspilot attivo (PID), porta in ascolto LOCALE,
+/// regola firewall. Con questi tre dati il fallimento e' classificabile:
+///   PROC vuoto          -> il task non ha avviato il processo (crash?)
+///   PROC pieno, LISTEN vuoto -> processo vivo ma bind fallito
+///   PROC+LISTEN pieni   -> server OK: e' il FIREWALL/inbound a bloccare
+async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
+    let port = server_tcp_port();
+    eprintln!(
+        "[bootstrap] server non in ascolto dopo 30s: diagnostica remota via WinRM..."
+    );
+    let script = format!(
+        "$p={p}; \
+         $proc = (Get-Process -Name crosspilot -ErrorAction SilentlyContinue | Select-Object -First 1).Id; \
+         if (-not $proc) {{ Write-Output 'PROC=' }} else {{ Write-Output \"PROC=$proc\" }}; \
+         $l = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; \
+         if ($l) {{ Write-Output \"LISTEN=$($l.OwningProcess)\" }} else {{ Write-Output 'LISTEN=' }}; \
+         $fw = Get-NetFirewallRule -DisplayName (\"crosspilot-server-\" + $p) -ErrorAction SilentlyContinue; \
+         if ($fw) {{ Write-Output 'FW=1' }} else {{ Write-Output 'FW=0' }}",
+        p = port
+    );
+    match client.run_powershell(host, &script).await {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            eprintln!("[bootstrap] diagnostica remota:\n{}", stdout);
+            let has_pid = stdout
+                .lines()
+                .find(|l| l.starts_with("PROC="))
+                .map(|l| !l.trim_start_matches("PROC=").trim().is_empty())
+                .unwrap_or(false);
+            let listen_pid = stdout
+                .lines()
+                .find(|l| l.starts_with("LISTEN="))
+                .map(|l| l.trim_start_matches("LISTEN=").len() > 0)
+                .unwrap_or(false);
+            let fw = stdout.lines().any(|l| l.trim() == "FW=1");
+            if has_pid && listen_pid {
+                if fw {
+                    eprintln!(
+                        "[bootstrap] processo ATTIVO e porta {} in ascolto LOCALE con regola firewall: \
+                         il SYN in ingresso e' bloccato altrove (rete/VPN/profilo firewall) — verificare la rete.",
+                        port
+                    );
+                } else {
+                    eprintln!(
+                        "[bootstrap] processo ATTIVO e porta {} in ascolto LOCALE ma SENZA regola firewall: \
+                         e' il Windows Firewall a droppare l'inbound (ritentare: la regola viene creata al prossimo bootstrap).",
+                        port
+                    );
+                }
+            } else if has_pid && !listen_pid {
+                eprintln!(
+                    "[bootstrap] processo ATTIVO ma porta {} NON in ascolto: bind fallito \
+                     (porta occupata? configurazione .env?).",
+                    port
+                );
+            } else {
+                eprintln!(
+                    "[bootstrap] NESSUN processo crosspilot attivo: il task schedulato non ha avviato \
+                     il server (crash all'avvio? controllare LOG_PATH/ERR_PATH sul remote)."
+                );
+            }
+        }
+        Err(e) => eprintln!("[bootstrap] diagnostica remota non disponibile: {}", e),
+    }
+}
+
 /// Polling dell'endpoint TCP del server: tenta la connessione ogni 2s
 /// per un massimo di 30s. Non ritorna errore — il chiamante gestisce i retry.
-async fn poll_server_startup() {
+async fn poll_server_startup() -> bool {
     println!("Waiting for server to start...");
     let host = envs::var("HOST")
         .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -388,7 +579,6 @@ async fn poll_server_startup() {
         .unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
 
-    let mut connected = false;
     for i in 1..=15 {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let result = tokio::time::timeout(
@@ -397,12 +587,10 @@ async fn poll_server_startup() {
         ).await;
         if let Ok(Ok(_)) = result {
             println!("Server is up (after {}s).", i * 2);
-            connected = true;
-            break;
+            return true;
         }
         println!("Server not ready yet, retrying ({}s elapsed)...", i * 2);
     }
-    if !connected {
-        eprintln!("Warning: server did not come up within 30s after bootstrap.");
-    }
+    eprintln!("Warning: server did not come up within 30s after bootstrap.");
+    false
 }
