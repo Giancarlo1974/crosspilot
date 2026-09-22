@@ -24,11 +24,11 @@
 // (bootstrap) prosegue col binario vecchio: mai downgrade del remote.
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use winrm_rs::WinrmClient;
 
 use crate::deploy;
+use crate::verify;
 use crate::version;
 
 /// Esegue il self-update del binario locale dal remote.
@@ -89,26 +89,7 @@ pub async fn run(
     let new_bin = deploy::base64_decode(payload).context("decode base64 sidecar")?;
     eprintln!("[self-update] scaricati {} byte", new_bin.len());
 
-    // --- Step 2: verifica SHA-256 vs .ver remoto ---
-    let local_hash = sha256_bytes(&new_bin).to_uppercase();
-    eprintln!("[self-update] sha256 scaricato: {}", &local_hash[..16]);
-    if let Some(expected) = expected_sha256 {
-        if !local_hash.eq_ignore_ascii_case(expected) {
-            anyhow::bail!(
-                "SHA-256 MISMATCH sidecar: atteso {} scaricato {}",
-                &expected[..16.min(expected.len())],
-                &local_hash[..16]
-            );
-        }
-        eprintln!("[self-update] SHA-256 match con .ver remoto.");
-    } else {
-        eprintln!(
-            "[self-update] WARNING: .ver remoto senza LINUX_SHA256, \
-             verifica solo funzionale (--version)"
-        );
-    }
-
-    // --- Step 3: scrittura su <self>.new ---
+    // --- Step 2: scrittura su <self>.new ---
     let self_path = std::env::current_exe().context("current_exe")?;
     let new_path = staged_path(&self_path);
     eprintln!(
@@ -121,16 +102,66 @@ pub async fn run(
 
     // Risultato del self-update: da qui in poi in caso di errore
     // rimuoviamo il .new per non lasciare artefatti.
-    let result = finish_update(&self_path, &new_path, remote_ts).await;
+    let result = install_staged_file(&new_path, remote_ts, expected_sha256).await;
     if result.is_err() {
         let _ = std::fs::remove_file(&new_path);
     }
     result
 }
 
+/// Installa un binario staged (gia' su disco) come nuovo exe corrente:
+/// verifica SHA-256 (se dichiarato), chmod +x, functional check --version
+/// vs remote_ts, backup .bak, rename atomico, re-exec.
+///
+/// Riusata sia dal path WinRM (run) sia dal self-update via TCP
+/// (update.rs: download via GET invece che via WinRM).
+/// Non ritorna su successo (re-exec). Su errore il chiamante rimuove lo staged.
+pub async fn install_staged_file(
+    staged: &Path,
+    remote_ts: u64,
+    expected_sha256: Option<&str>,
+) -> Result<()> {
+    // Il self-update sostituisce il proprio exe in esecuzione: su Windows
+    // il rename fallirebbe. Il sidecar e' comunque un binario linux.
+    if cfg!(target_os = "windows") {
+        anyhow::bail!("self-update non supportato su client Windows");
+    }
+
+    let self_path = std::env::current_exe().context("current_exe")?;
+
+    // --- Verifica SHA-256 dello staged vs hash dichiarato ---
+    let mut staged_handle = std::fs::File::open(staged)
+        .with_context(|| format!("apertura staged {}", staged.display()))?;
+    let staged_digest = verify::sha256_file_handle(&mut staged_handle)
+        .context("hash staged")?;
+    let local_hash = staged_digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
+        .to_uppercase();
+    eprintln!("[self-update] sha256 staged: {}", &local_hash[..16]);
+    if let Some(expected) = expected_sha256 {
+        if !local_hash.eq_ignore_ascii_case(expected) {
+            anyhow::bail!(
+                "SHA-256 MISMATCH staged: atteso {} scaricato {}",
+                &expected[..16.min(expected.len())],
+                &local_hash[..16]
+            );
+        }
+        eprintln!("[self-update] SHA-256 match con .ver remoto.");
+    } else {
+        eprintln!(
+            "[self-update] WARNING: .ver remoto senza LINUX_SHA256, \
+             verifica solo funzionale (--version)"
+        );
+    }
+
+    finish_update(&self_path, staged, remote_ts).await
+}
+
 /// Path del file staged: `<self>.new` nella stessa directory dell'exe
 /// (stesso filesystem = rename atomico garantito).
-fn staged_path(self_path: &std::path::Path) -> PathBuf {
+pub(crate) fn staged_path(self_path: &std::path::Path) -> PathBuf {
     let mut p = self_path.as_os_str().to_owned();
     p.push(".new");
     PathBuf::from(p)
@@ -243,13 +274,4 @@ async fn finish_update(
         let _ = args;
         anyhow::bail!("re-exec non supportato su questa piattaforma");
     }
-}
-
-/// Calcola SHA-256 di byte in memoria (duplicato minimo di deploy.rs:
-/// tenere le due copie indipendenti evita accoppiamento nel replace path).
-fn sha256_bytes(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let hash = hasher.finalize();
-    hash.iter().map(|b| format!("{:02x}", b)).collect()
 }

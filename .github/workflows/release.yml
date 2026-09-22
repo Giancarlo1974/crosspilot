@@ -59,7 +59,8 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: target/release/crosspilot
-          asset_name: crosspilot-linux
+          # Nome canonico di prod: il client linux e' "crosspilot"
+          asset_name: crosspilot
           tag: ${{ steps.rel.outputs.tag }}
           release_name: ${{ steps.rel.outputs.name }}
           prerelease: ${{ steps.rel.outputs.prerelease }}
@@ -70,7 +71,8 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: assets/crosspilot.exe
-          asset_name: crosspilot-windows.exe
+          # Nome canonico di prod: il server windows e' "crosspilot.exe"
+          asset_name: crosspilot.exe
           tag: ${{ steps.rel.outputs.tag }}
           overwrite: true
 
@@ -79,6 +81,7 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: assets/crosspilot.linux
-          asset_name: crosspilot-linux-musl
+          # Nome canonico dell'artefatto sidecar: "crosspilot.linux"
+          asset_name: crosspilot.linux
           tag: ${{ steps.rel.outputs.tag }}
           overwrite: true

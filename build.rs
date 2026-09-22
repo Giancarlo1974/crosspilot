@@ -53,6 +53,23 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=CROSSPILOT_TARGET={}", target);
 
+    // --- Asset exe Windows opzionale ---
+    // assets/crosspilot.exe e' prodotto da build-release.sh (cross mingw).
+    // Se manca (build dev), stub vuoto: update.rs skippa l'upload PE.
+    let win_asset_path = PathBuf::from(&manifest_dir)
+        .join("assets")
+        .join("crosspilot.exe");
+    let win_embed_path = if win_asset_path.is_file() {
+        win_asset_path
+    } else {
+        let stub = PathBuf::from(&out_dir).join("crosspilot.exe.stub");
+        if let Err(e) = fs::write(&stub, b"") {
+            println!("cargo:warning=impossibile creare stub windows asset: {}", e);
+        }
+        stub
+    };
+    println!("cargo:rustc-env=CROSSPILOT_WINDOWS_ASSET={}", win_embed_path.display());
+
     // --- Asset linux (musl) opzionale ---
     // assets/crosspilot.linux e' prodotto da build-release.sh.
     // Se manca, embeddiamo uno stub vuoto: deploy.rs riconosce il caso

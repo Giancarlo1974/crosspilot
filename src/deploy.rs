@@ -48,20 +48,62 @@ use crate::version::{self, RemoteBuildInfo};
 /// e il sidecar musl embedderebbe il nuovo exe: dimensioni che crescono
 //  esponenzialmente ad ogni build-release (exe 67MB -> 141MB -> ...).
 /// Il server Windows non deploya mai: per lui gli asset sono vuoti.
+// Exe Windows embeddato: uploadato come staged su remote Windows
+// (update.rs) e via WinRM su cold bootstrap (deploy_exe). Embeddato solo
+// su build NON-Windows: su Windows il PE e' il binario stesso — embeddarlo
+// creerebbe un chicken-and-egg in build-release.sh (l'exe e' buildato
+// prima che assets/crosspilot.exe esista) e peso inutile. windows_exe_bytes()
+// fa il fallback a current_exe().
 #[cfg(not(target_os = "windows"))]
-const WINDOWS_EXE: &[u8] = include_bytes!("../assets/crosspilot.exe");
+pub(crate) const WINDOWS_EXE: &[u8] = include_bytes!(env!("CROSSPILOT_WINDOWS_ASSET"));
 #[cfg(target_os = "windows")]
-const WINDOWS_EXE: &[u8] = b"";
+pub(crate) const WINDOWS_EXE: &[u8] = b"";
+
+/// I byte dell'exe Windows da deployare/uploadare: l'embed (build
+/// non-Windows con assets/) oppure, su Windows, il binario corrente
+/// stesso (un client Windows E' gia' un PE). Vec perche' il self-read
+/// alloca; il caso embed fa una copia (semplice, poche MB).
+pub(crate) fn windows_exe_bytes() -> Result<Vec<u8>> {
+    if !WINDOWS_EXE.is_empty() {
+        return Ok(WINDOWS_EXE.to_vec());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let self_exe = std::env::current_exe().context("current_exe")?;
+        std::fs::read(&self_exe).with_context(|| format!("lettura {}", self_exe.display()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    Ok(Vec::new()) // nessun embed: il chiamante decide (skip/bail)
+}
 
 /// Binario Linux musl statico embeddato (sidecar per il self-update).
 /// Il path arriva da build.rs (CROSSPILOT_LINUX_ASSET): se
 /// assets/crosspilot.linux manca (build dev senza build-release.sh)
 /// e' uno stub vuoto e l'upload del sidecar viene skippato con warning.
 /// Come WINDOWS_EXE: vuoto su target Windows (nessun deploy da server).
-#[cfg(not(target_os = "windows"))]
-const LINUX_BIN: &[u8] = include_bytes!(env!("CROSSPILOT_LINUX_ASSET"));
-#[cfg(target_os = "windows")]
-const LINUX_BIN: &[u8] = b"";
+// Sidecar linux musl embeddato: self-update dei client linux e staged
+// per remote Linux (update.rs). Embeddato su TUTTE le piattaforme:
+// un client Windows deve poter aggiornare un server Linux (per questo
+// build-release.sh builda musl PRIMA dell'exe Windows).
+pub(crate) const LINUX_BIN: &[u8] = include_bytes!(env!("CROSSPILOT_LINUX_ASSET"));
+
+/// I byte del binario linux da deployare/uploadare: l'embed musl
+/// (preferito — statico, gira ovunque) oppure, su unix senza embed,
+/// il binario corrente stesso (un client linux/musl E' gia' un binario
+/// linux — meno portabile del musl, ma funziona su remote compatibili;
+/// su remote musl-only lo spawn dello staged fallirebbe senza danni).
+pub(crate) fn linux_bin_bytes() -> Result<Vec<u8>> {
+    if !LINUX_BIN.is_empty() {
+        return Ok(LINUX_BIN.to_vec());
+    }
+    #[cfg(unix)]
+    {
+        let self_exe = std::env::current_exe().context("current_exe")?;
+        std::fs::read(&self_exe).with_context(|| format!("lettura {}", self_exe.display()))
+    }
+    #[cfg(not(unix))]
+    Ok(Vec::new()) // windows senza embed: il chiamante decide
+}
 
 /// Dimensione chunk per send_input (byte di base64).
 /// WinRM Send message non ha il limite command-line, ma l'envelope SOAP ha
@@ -151,17 +193,16 @@ pub async fn deploy_exe(
     info: &RemoteBuildInfo,
 ) -> Result<()> {
     // --- Hash locali degli artefatti embeddati ---
-    let exe_data = WINDOWS_EXE;
-    // Su target Windows entrambi gli embed sono vuoti (il server non
-    // deploya): niente da uploadare, errore esplicito invece di un
-    // .ver con hash dell'exe vuoto.
+    // windows_exe_bytes: embed su non-Windows, self-read su Windows
+    // (un client Windows e' gia' un PE). Vec vuoto se nessuna fonte.
+    let exe_data = windows_exe_bytes().unwrap_or_default();
     if exe_data.is_empty() && LINUX_BIN.is_empty() {
         anyhow::bail!(
-            "nessun artefatto embeddato (build Windows o dev senza build-release.sh): \
+            "nessun artefatto embeddato (build dev senza build-release.sh): \
              deploy non supportato"
         );
     }
-    let local_exe_hash = sha256_bytes(exe_data).to_uppercase();
+    let local_exe_hash = sha256_bytes(&exe_data).to_uppercase();
     eprintln!(
         "[deploy] build locale: ts={} exe={} byte sha256={}",
         version::BUILD_TS,
@@ -203,7 +244,7 @@ pub async fn deploy_exe(
             exe_data.len()
         );
         ensure_remote_dir(client, host, remote_exe_path).await?;
-        upload_artifact(client, host, exe_data, remote_exe_path, true).await?;
+        upload_artifact(client, host, &exe_data, remote_exe_path, true).await?;
     }
 
     // --- Step 2: sidecar linux (staged + swap, niente functional check:

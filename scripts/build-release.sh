@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # build-release.sh — Compila il binario Linux con gli artefatti embeddati.
 #
-# Procedura:
-#   1. Cross-compila il binario Windows (x86_64-pc-windows-gnu) -> assets/crosspilot.exe
-#   2. Compila il binario Linux musl statico (x86_64-unknown-linux-musl)
-#      -> assets/crosspilot.linux (sidecar per il self-update)
+# Procedura (ORDINE IMPORTANTE — gli embeds sono freschi solo se l'asset
+# esiste PRIMA del build che lo include):
+#   1. Compila il binario Linux musl statico (x86_64-unknown-linux-musl)
+#      -> assets/crosspilot.linux (sidecar per il self-update).
+#      Prima: rimozione di ENTRAMBI gli asset — il musl embedderebbe
+#      altrimenti le versioni stale (l'exe Windows perche' e' un target
+#      non-Windows, il sidecar perche' e' embeddato su ogni piattaforma).
+#      Il musl risulta cosi' senza embed: e' il payload "puro" deployato
+#      come server/sidecar; per servire client omonimi usa la self-copy
+#      di self_describe (update.rs).
+#   2. Cross-compila il binario Windows (x86_64-pc-windows-gnu)
+#      -> assets/crosspilot.exe. A questo punto embedda il sidecar musl
+#      FRESCO (un client Windows puo' aggiornare un remote Linux).
+#      Non embedda se' stesso: WINDOWS_EXE e' vuoto su target Windows —
+#      windows_exe_bytes() fa fallback a current_exe().
 #   3. Compila il binario Linux host (embedda entrambi via include_bytes!)
 #
 # Uso:
@@ -50,49 +61,34 @@ if [[ "${1:-}" == "--debug" ]]; then
     PROFILE="dev"
 fi
 
-echo "=== build-release.sh: profilo=$PROFILE ==="
-
-# --- Step 1: cross-compila binario Windows ---
-echo ""
-echo "[1/4] Cross-compilazione binario Windows (x86_64-pc-windows-gnu)..."
-cargo build --target x86_64-pc-windows-gnu --bin crosspilot --profile "$PROFILE"
-
-WINDOWS_BUILD_EXE="target/x86_64-pc-windows-gnu/$PROFILE/$EXE_NAME"
-if [[ ! -f "$WINDOWS_BUILD_EXE" ]]; then
-    echo "ERRORE: binario Windows non trovato: $WINDOWS_BUILD_EXE" >&2
-    exit 1
+# Cargo scrive il profilo dev in debug/, non dev/.
+OUT_DIR_NAME="$PROFILE"
+if [[ "$PROFILE" == "dev" ]]; then
+    OUT_DIR_NAME="debug"
 fi
+echo "=== build-release.sh: profilo=$PROFILE (dir=$OUT_DIR_NAME) ==="
 
-# --- Step 2: copia exe in assets/ ---
-echo ""
-echo "[2/4] Copia exe Windows in assets/..."
 mkdir -p "$ASSETS_DIR"
-cp -f "$WINDOWS_BUILD_EXE" "$WINDOWS_EXE"
 
-EXE_SIZE=$(stat -c%s "$WINDOWS_EXE" 2>/dev/null || stat -f%z "$WINDOWS_EXE")
-EXE_SHA256=$(sha256sum "$WINDOWS_EXE" | cut -d' ' -f1)
-echo "  $WINDOWS_EXE ($EXE_SIZE byte, sha256=${EXE_SHA256:0:16})"
-
-# --- Step 3: binario Linux musl statico (sidecar self-update) ---
+# --- Step 1: binario Linux musl statico (sidecar self-update) ---
 # Un artefatto musl statico gira su qualunque distro Linux: e' il formato
 # canonico scaricato dai client piu' vecchi durante il self-update.
 # Se il target musl non e' installato si prosegue SENZA sidecar: il build
 # resta utilizzabile ma il self-update da questo remoto non sara' possibile.
 echo ""
-echo "[3/4] Compilazione binario Linux musl statico (sidecar self-update)..."
+echo "[1/4] Compilazione binario Linux musl statico (sidecar self-update)..."
 MUSL_TARGET="x86_64-unknown-linux-musl"
 if rustup target list --installed 2>/dev/null | grep -q "^$MUSL_TARGET$"; then
-    # L'asset .linux deve essere rimosso PRIMA del build musl: altrimenti
-    # il sidecar embedderebbe il sidecar della build precedente (include_bytes!
-    # attivo su tutti i target non-Windows) e la dimensione crescerebbe ad
-    # ogni release. Col file assente build.rs usa lo stub vuoto: il sidecar
-    # porta solo l'exe Windows, non un altro sidecar (documentato: un client
-    # musl self-updated deploya l'exe ma non puo' offrire il sidecar a un
-    # remote vergine — il sidecar arriva dai build fatti con questo script).
-    rm -f "$LINUX_SIDECAR"
+    # Entrambi gli asset vanno rimossi PRIMA del build musl: il musl e'
+    # un target non-Windows quindi embedderebbe asset stale (exe Windows
+    # via WINDOWS_EXE, sidecar via LINUX_BIN embeddato ovunque) e la
+    # dimensione crescerebbe ad ogni release. Con gli asset assenti
+    # build.rs usa gli stub vuoti: il musl e' il payload "puro" senza
+    # embed (per i client omonimi self_describe fa self-copy).
+    rm -f "$LINUX_SIDECAR" "$WINDOWS_EXE"
     RUSTFLAGS="-C target-feature=+crt-static" \
         cargo build --target "$MUSL_TARGET" --bin crosspilot --profile "$PROFILE"
-    MUSL_BIN="target/$MUSL_TARGET/$PROFILE/crosspilot"
+    MUSL_BIN="target/$MUSL_TARGET/$OUT_DIR_NAME/crosspilot"
     if [[ -f "$MUSL_BIN" ]]; then
         cp -f "$MUSL_BIN" "$LINUX_SIDECAR"
         SIDECAR_SIZE=$(stat -c%s "$LINUX_SIDECAR" 2>/dev/null || stat -f%z "$LINUX_SIDECAR")
@@ -116,12 +112,36 @@ else
     rm -f "$LINUX_SIDECAR"  # evita di embeddare uno stale di un build precedente
 fi
 
+# --- Step 2: cross-compila binario Windows ---
+# Ora assets/crosspilot.linux esiste (fresco): l'exe Windows lo embedda
+# (LINUX_BIN e' embeddato su tutte le piattaforme) -> un client Windows
+# puo' aggiornare un remote Linux. WINDOWS_EXE invece resta vuoto su
+# Windows: l'exe e' gia' un PE, usa se' stesso come payload.
+echo ""
+echo "[2/4] Cross-compilazione binario Windows (x86_64-pc-windows-gnu)..."
+cargo build --target x86_64-pc-windows-gnu --bin crosspilot --profile "$PROFILE"
+
+WINDOWS_BUILD_EXE="target/x86_64-pc-windows-gnu/$OUT_DIR_NAME/$EXE_NAME"
+if [[ ! -f "$WINDOWS_BUILD_EXE" ]]; then
+    echo "ERRORE: binario Windows non trovato: $WINDOWS_BUILD_EXE" >&2
+    exit 1
+fi
+
+# --- Step 3: copia exe in assets/ ---
+echo ""
+echo "[3/4] Copia exe Windows in assets/..."
+cp -f "$WINDOWS_BUILD_EXE" "$WINDOWS_EXE"
+
+EXE_SIZE=$(stat -c%s "$WINDOWS_EXE" 2>/dev/null || stat -f%z "$WINDOWS_EXE")
+EXE_SHA256=$(sha256sum "$WINDOWS_EXE" | cut -d' ' -f1)
+echo "  $WINDOWS_EXE ($EXE_SIZE byte, sha256=${EXE_SHA256:0:16})"
+
 # --- Step 4: compila binario Linux host (embedda exe + sidecar) ---
 echo ""
 echo "[4/4] Compilazione binario Linux host (con exe Windows + sidecar embeddati)..."
 cargo build --bin crosspilot --profile "$PROFILE"
 
-LINUX_BIN="target/$PROFILE/crosspilot"
+LINUX_BIN="target/$OUT_DIR_NAME/crosspilot"
 if [[ ! -f "$LINUX_BIN" ]]; then
     echo "ERRORE: binario Linux non trovato: $LINUX_BIN" >&2
     exit 1
@@ -137,5 +157,5 @@ if [[ -f "$LINUX_SIDECAR" ]]; then
 fi
 echo ""
 echo "Il binario Linux contiene l'exe Windows + il sidecar musl embeddati."
-echo "Distribuisci solo target/$PROFILE/crosspilot — auto-deploy e"
+echo "Distribuisci solo target/$OUT_DIR_NAME/crosspilot — auto-deploy e"
 echo "self-update bidirezionale funzioneranno ovunque."

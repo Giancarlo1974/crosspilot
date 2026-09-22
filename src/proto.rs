@@ -23,8 +23,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Usato dal server per distinguere la modalità file dalla modalità shell (peek 4 byte).
 pub const MAGIC: u32 = 0x3142_4644;
 
-/// Versione del protocollo (unica, copre file transfer + directory sync).
-pub const VERSION: u8 = 2;
+/// Versione del protocollo (unica, copre file transfer + directory sync +
+/// update). RESTA 1 per compatibilita' con i server legacy (winboat-bridge):
+/// il framing v1/v2 era identico (il bump era cosmetico nel rename) e un
+/// client v2 verrebbe rifiutato dai server v1 ("versione non supportata")
+/// rendendo impossibile anche il PUT dell'auto-update. I messaggi nuovi
+/// (UPDATE_REQ/RES) sono distinti per msg_type, non per versione: i server
+/// legacy li rifiutano e il client usa il fallback WMI/setsid.
+pub const VERSION: u8 = 1;
 
 // Identificatori dei tipi di messaggio (msg_type).
 pub const MSG_PUT_REQ: u8 = 1;
@@ -42,6 +48,13 @@ pub const MSG_MKDIR_BATCH_REQ: u8 = 10;
 pub const MSG_MKDIR_BATCH_RES: u8 = 11;
 pub const MSG_DELETE_BATCH_REQ: u8 = 12;
 pub const MSG_DELETE_BATCH_RES: u8 = 13;
+
+// Messaggi self-update via TCP (update-spec): il client chiede al server di
+// spawnare l'updater staged e uscire. Inviati solo a server che dichiarano
+// un BUILD_TS nell'handshake "READY <ts>" (i server legacy mandano "READY"
+// secco e non ricevono mai UPDATE_REQ: per loro c'e' il path WMI/setsid).
+pub const MSG_UPDATE_REQ: u8 = 14;
+pub const MSG_UPDATE_RES: u8 = 15;
 
 /// Cap massimo sul numero di entry restituite da LIST_RES (sync-spec §5).
 /// Oltre questo limite il server risponde ERR 5 esplicito (non payload da 1 GB).
@@ -194,6 +207,25 @@ pub struct Ack {
 pub struct ErrMsg {
     /// Codice di errore (vedi costanti ERR_*).
     pub code: u16,
+    /// Messaggio descrittivo UTF-8.
+    pub message: String,
+}
+
+/// Richiesta di self-update del server (C→S): path assoluto del binario
+/// staged (`crosspilot-<ts>.exe` nella stessa dir dell'exe in esecuzione).
+/// Il server lo spawnza detached con `update --target <self_exe>
+/// --wait-pid <self_pid> --port <porta_locale>`, risponde UPDATE_RES ed esce.
+#[derive(Debug, Clone)]
+pub struct UpdateReq {
+    /// Path assoluto del binario staged (UTF-8, senza null).
+    pub staged_path: String,
+}
+
+/// Risposta del server a UPDATE_REQ (S→C).
+#[derive(Debug, Clone)]
+pub struct UpdateRes {
+    /// Stato: 0 = updater spawnato (il server sta uscendo), altro = errore.
+    pub status: u8,
     /// Messaggio descrittivo UTF-8.
     pub message: String,
 }
@@ -1089,6 +1121,70 @@ pub async fn send_delete_batch_req<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Messaggi self-update (UPDATE_REQ / UPDATE_RES).
+// ---------------------------------------------------------------------------
+
+/// Codifica una UpdateReq in payload (path\0).
+pub fn encode_update_req(req: &UpdateReq) -> Result<Vec<u8>> {
+    if req.staged_path.contains('\0') {
+        bail!("UpdateReq: path contiene null");
+    }
+    let mut payload = Vec::with_capacity(req.staged_path.len() + 1);
+    payload.extend_from_slice(req.staged_path.as_bytes());
+    payload.push(0);
+    Ok(payload)
+}
+
+/// Decodifica una UpdateReq dal payload.
+pub fn decode_update_req(payload: &[u8]) -> Result<UpdateReq> {
+    let null_pos = payload
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| anyhow!("UpdateReq: terminatore null mancante"))?;
+    let path_bytes = &payload[..null_pos];
+    let staged_path = String::from_utf8(path_bytes.to_vec())
+        .map_err(|e| anyhow!("UpdateReq: path non UTF-8 valido: {}", e))?;
+    Ok(UpdateReq { staged_path })
+}
+
+/// Codifica una UpdateRes in payload (u8 status + messaggio UTF-8).
+pub fn encode_update_res(res: &UpdateRes) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + res.message.len());
+    payload.push(res.status);
+    payload.extend_from_slice(res.message.as_bytes());
+    payload
+}
+
+/// Decodifica una UpdateRes dal payload.
+pub fn decode_update_res(payload: &[u8]) -> Result<UpdateRes> {
+    if payload.is_empty() {
+        bail!("UpdateRes: payload vuoto (attesi almeno 1 byte)");
+    }
+    let status = payload[0];
+    let message = String::from_utf8(payload[1..].to_vec())
+        .unwrap_or_else(|_| "<messaggio non UTF-8>".to_string());
+    Ok(UpdateRes { status, message })
+}
+
+/// Invia una UpdateReq.
+pub async fn send_update_req<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    req: &UpdateReq,
+) -> Result<()> {
+    let payload = encode_update_req(req)?;
+    write_msg(writer, MSG_UPDATE_REQ, &payload).await
+}
+
+/// Invia una UpdateRes.
+pub async fn send_update_res<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    res: &UpdateRes,
+) -> Result<()> {
+    let payload = encode_update_res(res);
+    write_msg(writer, MSG_UPDATE_RES, &payload).await
+}
+
+// ---------------------------------------------------------------------------
 // Test di roundtrip encode/decode (spec §17 passo 2).
 // ---------------------------------------------------------------------------
 
@@ -1518,5 +1614,37 @@ mod tests {
         assert_eq!(msg_type, MSG_LIST_REQ);
         let decoded = decode_list_req(&payload).unwrap();
         assert_eq!(decoded.path, req.path);
+    }
+
+    // --- Test self-update ---------------------------------------------------
+
+    #[test]
+    fn roundtrip_update_req() {
+        let req = UpdateReq {
+            staged_path: r"C:\ci\crosspilot-1758530400.exe".to_string(),
+        };
+        let payload = encode_update_req(&req).unwrap();
+        let decoded = decode_update_req(&payload).unwrap();
+        assert_eq!(decoded.staged_path, req.staged_path);
+    }
+
+    #[test]
+    fn update_req_rejects_null_in_path() {
+        let req = UpdateReq {
+            staged_path: "bad\0path".to_string(),
+        };
+        assert!(encode_update_req(&req).is_err());
+    }
+
+    #[test]
+    fn roundtrip_update_res() {
+        let res = UpdateRes {
+            status: 0,
+            message: "updater avviato".to_string(),
+        };
+        let payload = encode_update_res(&res);
+        let decoded = decode_update_res(&payload).unwrap();
+        assert_eq!(decoded.status, 0);
+        assert_eq!(decoded.message, "updater avviato");
     }
 }

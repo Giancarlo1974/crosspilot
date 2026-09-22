@@ -27,6 +27,8 @@ mod envs;
 mod version;
 // Self-update del client Linux quando il remote e' piu' nuovo.
 mod self_update;
+// Auto-update bidirezionale via TCP (READY <ts> + UPDATE_REQ + updater).
+mod update;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -204,6 +206,32 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
+    /// (interno) Updater staged: attende la morte del server, fa lo swap
+    /// exe -> exe.old / staged -> exe, poi rilancia `exe --server`.
+    /// Lanciato detached dal server (MSG_UPDATE_REQ) o via WMI/setsid
+    /// (server legacy). Non e' pensato per l'uso diretto.
+    #[command(hide = true)]
+    Update {
+        /// Path dell'exe da sostituire (default: crosspilot[.exe] nella dir dello staged)
+        #[arg(long)]
+        target: Option<String>,
+        /// PID del server da attendere prima dello swap
+        #[arg(long)]
+        wait_pid: Option<u32>,
+        /// Porta TCP del server da attendere libera (fallback senza pid)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Timeout attesa morte server (secondi)
+        #[arg(long, default_value = "60")]
+        wait_secs: u64,
+        /// Argomento con cui rilanciare l'exe dopo lo swap (ripetibile;
+        /// default: --server). Il self-update client Windows rilancia argv.
+        #[arg(long = "arg")]
+        relaunch_args: Vec<String>,
+        /// Su Windows rilancia l'exe con una console nuova (output visibile)
+        #[arg(long)]
+        console: bool,
+    },
     /// Gestione degli ambienti (configurazioni host) nel file .env.
     ///
     /// Il .env può contenere N ambienti come CROSSPILOT_<NOME>_<CAMPO>
@@ -284,6 +312,10 @@ async fn main() -> Result<()> {
             // Directory sync: sync (mirror one-way upload) lato client.
             Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet }) => {
                 client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet).await?;
+            }
+            // Updater staged (auto-update via TCP): uso interno.
+            Some(Commands::Update { target, wait_pid, port, wait_secs, relaunch_args, console }) => {
+                update::run_updater(target, wait_pid, port, wait_secs, relaunch_args, console).await?;
             }
             // CRUD ambienti host nel .env (nessuna connessione richiesta).
             Some(Commands::Env { action }) => {
@@ -404,6 +436,10 @@ async fn server_mode(port: u16) -> Result<()> {
     };
     println!("Server listening on {}", addr);
 
+    // Self-describing: (ri)scrive crosspilot.ver (ts + hash exe + sidecar)
+    // e ripulisce gli artefatti staged/residui dell'auto-update via TCP.
+    update::self_describe();
+
     // Persistent Server Mode
     let shutdown_signal = Arc::new(Notify::new());
 
@@ -418,8 +454,12 @@ async fn server_mode(port: u16) -> Result<()> {
                 match accept_result {
                     Ok((mut socket, _)) => {
                         tokio::spawn(async move {
-                            // Handshake: Send READY
-                            if let Err(e) = socket.write_all(b"READY\n").await {
+                            // Handshake: "READY <BUILD_TS>" — il ts rende il
+                            // server self-describing per l'auto-update via TCP
+                            // (i client legacy leggono 6 byte "READY " e
+                            // falliscono -> bootstrap WinRM -> self-update).
+                            let hello = format!("READY {}\n", version::BUILD_TS);
+                            if let Err(e) = socket.write_all(hello.as_bytes()).await {
                                 eprintln!("Failed to send handshake: {}", e);
                                 return;
                             }
@@ -748,6 +788,12 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
             eprintln!("[DEBUG] handle_file_mode: DELETE_BATCH_REQ count={}", req.items.len());
             sync_server::delete_batch_server(&mut socket, &req).await?;
         }
+        // Self-update via TCP (update-spec): spawn updater staged + uscita.
+        proto::MSG_UPDATE_REQ => {
+            let req = proto::decode_update_req(&payload)?;
+            eprintln!("[DEBUG] handle_file_mode: UPDATE_REQ staged={}", req.staged_path);
+            update::server_apply_update(&mut socket, &req).await?;
+        }
         _ => {
             // Tipo di messaggio non riconosciuto: invia ERR protocollo.
             let err = proto::ErrMsg {
@@ -777,30 +823,88 @@ fn final_connect_error(addr: &str) -> anyhow::Error {
     anyhow::anyhow!("Failed to connect to server after bootstrap attempt")
 }
 
-/// Stabilisce la connessione TCP al server e verifica l'handshake READY.
-/// Riutilizzata sia dai comandi shell (-c) che dal transfer file (put/get).
+/// Legge la riga di handshake del server fino a '\n' (cap 256 byte).
+/// Ritorna Ok(None) per "READY" legacy (server pre auto-update, ts=0),
+/// Ok(Some(ts)) per "READY <ts>". Errore su EOF/riga sconosciuta (zombie).
+async fn read_ready_line(s: &mut TcpStream) -> Result<Option<u64>> {
+    let mut line = Vec::with_capacity(32);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = s.read(&mut byte).await?;
+        if n == 0 {
+            bail!("connessione chiusa durante l'handshake");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+        if line.len() > 256 {
+            bail!("handshake troppo lungo (>256 byte)");
+        }
+    }
+    let text = String::from_utf8_lossy(&line);
+    let text = text.trim_end();
+    if text == "READY" {
+        return Ok(None);
+    }
+    if let Some(rest) = text.strip_prefix("READY ") {
+        let ts = rest.trim().parse::<u64>().unwrap_or(0);
+        return Ok(Some(ts));
+    }
+    bail!("handshake sconosciuto: {:?}", text);
+}
+
+/// Una connessione TCP + lettura handshake "READY <ts>" (singolo tentativo,
+/// niente retry/bootstrap/update). Ritorna il socket e il BUILD_TS remoto
+/// (None = server legacy). Usata da connect_and_handshake e dall'interno
+/// dell'orchestrazione update (le connessioni di PUT/GET/shell non devono
+/// ri-triggerare il confronto di versione).
+pub(crate) async fn connect_raw(addr: &str) -> Result<(TcpStream, Option<u64>)> {
+    let mut s = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .context("connect timeout")??;
+    let remote_ts = tokio::time::timeout(Duration::from_millis(1500), read_ready_line(&mut s))
+        .await
+        .context("handshake timeout")??;
+    Ok((s, remote_ts))
+}
+
+/// Stabilisce la connessione TCP al server, verifica l'handshake
+/// "READY <ts>" e orchestra l'auto-update via TCP sul version skew
+/// (update::reconcile). Bootstrap WinRM solo se il server non risponde.
+/// Riutilizzata dai comandi shell (--), transfer file (put/get) e sync.
 async fn connect_and_handshake() -> Result<TcpStream> {
     // Risoluzione via envs: CROSSPILOT_<ENV>_<CAMPO> -> fallback CROSSPILOT_<CAMPO>.
     let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
 
-    // Loop di tentativi con bootstrap (come client_mode esistente).
     let mut attempt = 0;
     let max_attempts = 5;
-    let socket = loop {
+    // Dopo un update triggerato il server e' in restart: solo polling TCP
+    // (MAI bootstrap WinRM in questa fase — il remote_build_info vedrebbe
+    // lo stato pre-swap e scatenerebbe un deploy WinRM inutile/dannoso).
+    let mut update_deadline: Option<std::time::Instant> = None;
+    loop {
         attempt += 1;
         eprintln!("Connecting to {} (Attempt {})...", addr, attempt);
 
-        let connect_result = tokio::time::timeout(
-            Duration::from_secs(2),
-            TcpStream::connect(addr.as_str()),
-        )
-        .await;
-
-        let mut s = match connect_result {
-            Ok(Ok(s)) => s,
-            _ => {
+        let conn = connect_raw(&addr).await;
+        let (s, remote_ts) = match conn {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(dl) = update_deadline {
+                    if std::time::Instant::now() < dl {
+                        eprintln!("[DEBUG] update in corso, retry... ({})", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    // L'updater non ha rialzato il server entro la deadline:
+                    // caduta al bootstrap WinRM come ultima spiaggia.
+                    eprintln!("[update] nuovo server non salito entro la deadline; fallback bootstrap.");
+                    update_deadline = None;
+                    attempt = 0;
+                }
                 if attempt >= max_attempts {
                     return Err(final_connect_error(&addr));
                 }
@@ -810,31 +914,24 @@ async fn connect_and_handshake() -> Result<TcpStream> {
             }
         };
 
-        // Handshake: legge "READY\n".
-        let mut buf = [0u8; 6];
-        let handshake_result = tokio::time::timeout(
-            Duration::from_millis(1000),
-            s.read_exact(&mut buf),
-        )
-        .await;
-
-        match handshake_result {
-            Ok(Ok(_)) if &buf == b"READY\n" => {
+        eprintln!(
+            "[DEBUG] handshake: remote_ts={:?} locale={}",
+            remote_ts,
+            version::BUILD_TS
+        );
+        match update::reconcile(remote_ts).await {
+            update::Reconcile::Proceed => {
                 eprintln!("Connected and verified.");
-                break s;
+                return Ok(s);
             }
-            _ => {
-                if attempt >= max_attempts {
-                    return Err(anyhow::anyhow!("Handshake failed (Zombie connection?)"));
-                }
-                eprintln!("Connected but no READY signal (likely Docker zombie port). Bootstrapping...");
-                bootstrap::bootstrap_server().await?;
+            update::Reconcile::Reconnect => {
+                eprintln!("[update] server in aggiornamento: attesa restart (max 90s)...");
+                update_deadline = Some(std::time::Instant::now() + Duration::from_secs(90));
+                attempt = 0;
                 continue;
             }
         }
-    };
-
-    Ok(socket)
+    }
 }
 
 /// Lato client: PUT (upload) di un file locale verso il server.
@@ -938,63 +1035,9 @@ async fn client_sync(
 }
 
 async fn client_mode(cmd: &str) -> Result<()> {
-    // Same host as bootstrap (WinRM): CROSSPILOT_HOST. Only the port differs.
-    // Risoluzione via envs: CROSSPILOT_<ENV>_<CAMPO> -> fallback CROSSPILOT_<CAMPO>.
-    let host = envs::var("HOST")
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    // Port mapped on host: 47330 -> Container: 5330
-    let client_port = envs::var("CLIENT_PORT")
-        .unwrap_or_else(|| "47330".to_string());
-    let addr = format!("{}:{}", host, client_port);
-    
-    // Attempt connection loop (Connect -> Handshake -> if fail -> Bootstrap -> Retry)
-    // Il bootstrap usa winrm-rs (puro Rust, NTLMv2) — vedi bootstrap::bootstrap_server().
-    let mut attempt = 0;
-    let max_attempts = 5;
-    
-    let mut socket = loop {
-        attempt += 1;
-        println!("Connecting to {} (Attempt {})...", addr, attempt);
-        
-        let connect_result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            TcpStream::connect(addr.as_str())
-        ).await;
-
-        let mut s = match connect_result {
-            Ok(Ok(s)) => s,
-            _ => {
-                if attempt >= max_attempts {
-                     return Err(final_connect_error(&addr));
-                }
-                eprintln!("Connection failed or timed out. Bootstrapping...");
-                bootstrap::bootstrap_server().await?;
-                continue;
-            }
-        };
-
-        // Handshake Check
-        let mut buf = [0; 6]; // "READY\n"
-        let handshake_result = tokio::time::timeout(
-             tokio::time::Duration::from_millis(1000),
-             s.read_exact(&mut buf)
-        ).await;
-
-        match handshake_result {
-            Ok(Ok(_)) if &buf == b"READY\n" => {
-                println!("Connected and verified.");
-                break s;
-            }
-            _ => {
-                 if attempt >= max_attempts {
-                     return Err(anyhow::anyhow!("Handshake failed (Zombie connection?)"));
-                }
-                println!("Connected but no READY signal (likely Docker zombie port). Bootstrapping...");
-                bootstrap::bootstrap_server().await?;
-                continue;
-            }
-        }
-    };
+    // Connessione + handshake + auto-update (stessa logica di put/get/sync:
+    // connect_and_handshake orchestra retry, bootstrap e version skew).
+    let mut socket = connect_and_handshake().await?;
 
     // Send command
     socket.write_all(cmd.as_bytes()).await?;
