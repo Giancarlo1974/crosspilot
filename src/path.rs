@@ -346,10 +346,8 @@ fn find_longest_existing_ancestor(path: &Path) -> Option<PathBuf> {
         if current.exists() {
             return Some(current);
         }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return None, // raggiunta la root senza trovare nulla.
-        }
+        // None => raggiunta la root senza trovare nulla.
+        current = current.parent()?.to_path_buf();
     }
 }
 

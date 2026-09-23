@@ -8,11 +8,17 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use std::io::ErrorKind;
 use std::time::Duration;
+// Solo nel path Windows (retry loop AddrInUse in server_mode).
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 // Moduli del transfer file (vedi docs/transfer-spec.md).
 mod proto;
 mod path;
 mod verify;
+// transfer.rs resta invariato rispetto alla spec (§12): i warning clippy
+// di stile si silenziano qui invece di toccare il file.
+#[allow(clippy::manual_range_contains, clippy::manual_div_ceil)]
 mod transfer;
 // Modulo directory sync (vedi docs/sync-spec.md).
 mod sync;
@@ -20,6 +26,8 @@ mod sync;
 mod sync_server;
 // Modulo bootstrap WinRM (separato da main.rs per dimensione, best-practice < 1000 righe).
 mod bootstrap;
+// Bootstrap via SSH per remote Linux/Unix (speculare a bootstrap.rs WinRM).
+mod bootstrap_ssh;
 mod deploy;
 // Modulo ambienti host multipli nel .env (CRUD via sottocomando `env`).
 mod envs;
@@ -114,7 +122,7 @@ mod win_job {
       CROSSPILOT_<NAME>_<FIELD> (e.g. CROSSPILOT_PROD_HOST). CROSSPILOT_ENV selects\n\
       the active one; unprefixed keys are the fallback for missing fields.\n\
       Fields: HOST PORT USER PASS EXE_PATH CLIENT_PORT SERVER_PORT\n\
-      LOG_PATH ERR_PATH SEGMENT_SIZE.\n\
+      LOG_PATH ERR_PATH SEGMENT_SIZE OS SSH_HOST SSH_PORT SSH_USER.\n\
       Manage them with: crosspilot env list|show|add|set|remove|use\n\
       (details: crosspilot env -h / crosspilot env <action> -h)\n\n\
     Usage:\n\
@@ -208,7 +216,7 @@ enum Commands {
     },
     /// (interno) Updater staged: attende la morte del server, fa lo swap
     /// exe -> exe.old / staged -> exe, poi rilancia `exe --server`.
-    /// Lanciato detached dal server (MSG_UPDATE_REQ) o via WMI/setsid
+    /// Lanciato detached dal server (MSG_UPDATE_REQ) o via schtasks/setsid
     /// (server legacy). Non e' pensato per l'uso diretto.
     #[command(hide = true)]
     Update {
@@ -238,8 +246,10 @@ enum Commands {
     /// (es. CROSSPILOT_PROD_HOST). CROSSPILOT_ENV seleziona l'ambiente attivo;
     /// le chiavi non prefissate (ambiente "default") fanno da fallback.
     Env {
+        // Box: EnvAction (con EnvFields) e' la variante piu' grande di
+        // Commands — senza indirection clippy segnala large_enum_variant.
         #[command(subcommand)]
-        action: envs::EnvAction,
+        action: Box<envs::EnvAction>,
     },
 }
 
@@ -262,6 +272,12 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     }
+
+    // Igiene d'avvio: se questo exe ha il nome canonico (crosspilot[.exe])
+    // spazza gli artefatti staged/residui dell'auto-update nella sua dir.
+    // Uno staged crosspilot-<ts> in esecuzione non sweeps mai (ne' se'
+    // stesso ne' i fratelli del proprio update). Best-effort, mai fatale.
+    update::startup_sweep();
 
     // Carica il .env dal primo path candidato disponibile
     // (cwd -> exe dir -> project root). Vedi envs.rs.
@@ -389,11 +405,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Finestra di pazienza del bind su AddrInUse (Windows, BUG-13): la
+/// socket listening del server appena morto puo' restare bound per
+/// decine di secondi (socket zombie). 300s > vita residua massima
+/// dell'updater (~4min worst-case): se lo zombie e' un handle ereditato
+/// dall'updater, si libera solo all'uscita dell'updater — il server in
+/// retry DEVE sopravvivere fino a quel momento per bindare e restare su.
+#[cfg(target_os = "windows")]
+const ADDRINUSE_RETRY_SECS: u64 = 300;
+
 async fn server_mode(port: u16) -> Result<()> {
     // Force UTF-8 code page on Windows
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd").args(&["/C", "chcp 65001"]).output().await;
+        let _ = Command::new("cmd").args(["/C", "chcp 65001"]).output().await;
     }
 
     let actual_port = envs::var("SERVER_PORT")
@@ -408,23 +433,64 @@ async fn server_mode(port: u16) -> Result<()> {
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
             #[cfg(target_os = "windows")]
             {
-                eprintln!("Port {} already in use. Attempting to terminate existing listener and retry...", actual_port);
-                kill_listener_on_port_windows(actual_port).await?;
-                
-                // Wait a bit more for socket to be fully released
-                println!("Waiting additional 1 second for socket release...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                
-                match TcpListener::bind(&addr).await {
-                    Ok(l) => l,
-                    Err(e2) if e2.kind() == ErrorKind::AddrInUse => {
+                // BUG-13 ROOT CAUSE (H166, provata da crosspilot-server.log):
+                // il socket listening del server appena morto resta BOUND
+                // per decine di secondi — netstat lo mostra LISTENING col
+                // pid morto e i connect ci riescono pure (backlog kernel),
+                // ma nessuno risponde READY. Il server rilanciato trovava
+                // AddrInUse, il taskkill falliva ("processo non trovato")
+                // e il processo USCIVA: la "morte misteriosa ~3-7s dopo il
+                // bind" era il nostro exit, non un killer esterno.
+                //
+                // Fix: MAI uscire al primo AddrInUse. Loop paziente:
+                // 1. probe READY — un crosspilot VIVO non si tocca mai
+                //    (fix precedente: il taskkill cieco ammazzava
+                //    l'incumbent sano);
+                // 2. taskkill best-effort del pid occupante (sul pid morto
+                //    fallisce in modo innocuo);
+                // 3. retry del bind fino ad ADDRINUSE_RETRY_SECS — la
+                //    socket zombie si libera e il bind va a buon fine.
+                //    La finestra deve superare la vita residua
+                //    dell'updater: se lo zombie e' un handle ereditato
+                //    dall'updater, muore solo quando l'updater esce —
+                //    e a quel punto il server DEVE essere ancora in retry.
+                let deadline = Instant::now() + Duration::from_secs(ADDRINUSE_RETRY_SECS);
+                let mut attempt = 0u32;
+                loop {
+                    if listener_is_live_crosspilot(actual_port).await {
                         return Err(anyhow::anyhow!(
-                            "Port {} is still in use after kill attempt. Please close the existing process and retry. Underlying error: {}",
-                            actual_port,
-                            e2
+                            "Port {} is already served by a RUNNING crosspilot server. \
+                             Refusing to kill it — stop the existing instance first.",
+                            actual_port
                         ));
                     }
-                    Err(e2) => return Err(e2.into()),
+                    attempt += 1;
+                    eprintln!(
+                        "Port {} occupied by a dead/foreign listener (tentativo {}): reclaim + retry bind...",
+                        actual_port, attempt
+                    );
+                    // Best-effort: sul socket zombie il pid e' gia' morto e
+                    // il taskkill fallisce ("processo non trovato") —
+                    // l'errore non deve interrompere il retry del bind.
+                    if let Err(ke) = kill_listener_on_port_windows(actual_port).await {
+                        eprintln!("[kill_listener] WARNING: {}", ke);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    match TcpListener::bind(&addr).await {
+                        Ok(l) => break l,
+                        Err(e2) if e2.kind() == ErrorKind::AddrInUse => {
+                            if Instant::now() >= deadline {
+                                return Err(anyhow::anyhow!(
+                                    "Port {} is still in use after {}s of retries (socket zombie persistente). \
+                                     Please close the existing process and retry. Underlying error: {}",
+                                    actual_port,
+                                    ADDRINUSE_RETRY_SECS,
+                                    e2
+                                ));
+                            }
+                        }
+                        Err(e2) => return Err(e2.into()),
+                    }
                 }
             }
             #[cfg(not(target_os = "windows"))]
@@ -458,6 +524,16 @@ async fn server_mode(port: u16) -> Result<()> {
                             // server self-describing per l'auto-update via TCP
                             // (i client legacy leggono 6 byte "READY " e
                             // falliscono -> bootstrap WinRM -> self-update).
+                            // TODO: in futuro inviare anche il tag OS del
+                            // server come terzo token — "READY <ts> L" su
+                            // unix, "READY <ts> W" su Windows. Il client
+                            // parsa gia' il token opzionale
+                            // (version::ServerHello.os) e lo usa per la
+                            // scelta del payload di update al posto
+                            // dell'euristica EXE_PATH. NON inviarlo finche'
+                            // circolano client attuali: "READY <ts> L"
+                            // verrebbe letto come ts non parsabile -> 0 ->
+                            // update forzato del server.
                             let hello = format!("READY {}\n", version::BUILD_TS);
                             if let Err(e) = socket.write_all(hello.as_bytes()).await {
                                 eprintln!("Failed to send handshake: {}", e);
@@ -480,6 +556,32 @@ async fn server_mode(port: u16) -> Result<()> {
 
     println!("Server shutting down.");
     Ok(())
+}
+
+/// True se sulla porta risponde un server crosspilot VIVO (handshake
+/// READY entro 2s). Chiamata PRIMA di kill_listener su AddrInUse:
+/// un incumbent sano non si tocca — il taskkill resta riservato a
+/// listener zombie/estranei (socket tenuto da processo che non parla
+/// il nostro protocollo). Riutilizza read_ready_line del handshake
+/// client. Best-effort: qualunque errore -> false (-> reclaim).
+#[cfg(target_os = "windows")]
+async fn listener_is_live_crosspilot(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", port);
+    let conn = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await;
+    let mut stream = match conn {
+        Ok(Ok(s)) => s,
+        // Nessuna connessione accettata: listener zombie (bind senza
+        // accept loop) o porta gia' liberata -> si puo' reclamare.
+        _ => return false,
+    };
+    let hello = tokio::time::timeout(Duration::from_secs(2), read_ready_line(&mut stream)).await;
+    let alive = matches!(hello, Ok(Ok(_)));
+    eprintln!(
+        "[kill_listener] probe READY su {}: {}",
+        addr,
+        if alive { "server crosspilot VIVO (niente kill)" } else { "nessuna risposta valida (reclaim)" }
+    );
+    alive
 }
 
 #[cfg(target_os = "windows")]
@@ -829,6 +931,19 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
 /// l'endpoint WinRM irraggiungibile, allega il remediation (abilitare WinRM
 /// sull'host remoto) invece del messaggio generico.
 fn final_connect_error(addr: &str) -> anyhow::Error {
+    // Remote Unix/Linux: il canale di bootstrap e' SSH (mai WinRM) —
+    // suggerire Enable-PSRemoting sarebbe fuorviante (bug B2).
+    if bootstrap::remote_is_unix() {
+        return anyhow::anyhow!(
+            "Failed to connect to {} after bootstrap attempt.\n\
+             Remote Linux/Unix (EXE_PATH unix-style o OS=linux): bootstrap SSH fallito.\n\
+             Verificare a mano: ssh -p <SSH_PORT> <SSH_USER>@<HOST>\n\
+             (BatchMode attivo: accettare l'host key con una connessione manuale\n\
+             e configurare l'auth a chiavi/agent; campi SSH_HOST/SSH_PORT/SSH_USER\n\
+             dell'ambiente, vedi 'crosspilot env show').",
+            addr
+        );
+    }
     if bootstrap::winrm_unreachable() {
         return anyhow::anyhow!(
             "Failed to connect to {} after bootstrap attempts.\n\
@@ -838,13 +953,23 @@ fn final_connect_error(addr: &str) -> anyhow::Error {
             addr
         );
     }
+    if update::update_attempted() {
+        // Se e' partito un update e il server non e' mai tornato, il
+        // diagnoser #1 e' il log persistente dell'updater sul remote.
+        return anyhow::anyhow!(
+            "Failed to connect to {} after bootstrap attempt.\n\
+             NOTA: un update del server era in corso. Sul remote leggi \
+             'crosspilot-update.log' accanto all'exe (l'updater logga ogni \
+             passo: attesa morte server, swap, rilancio, rollback).",
+            addr
+        );
+    }
     anyhow::anyhow!("Failed to connect to server after bootstrap attempt")
 }
 
-/// Legge la riga di handshake del server fino a '\n' (cap 256 byte).
-/// Ritorna Ok(None) per "READY" legacy (server pre auto-update, ts=0),
-/// Ok(Some(ts)) per "READY <ts>". Errore su EOF/riga sconosciuta (zombie).
-async fn read_ready_line(s: &mut TcpStream) -> Result<Option<u64>> {
+/// Legge la riga di handshake del server fino a '\n' (cap 256 byte) e la
+/// parsa (parse_ready_line). Errore su EOF/riga sconosciuta (zombie).
+async fn read_ready_line(s: &mut TcpStream) -> Result<version::ServerHello> {
     let mut line = Vec::with_capacity(32);
     let mut byte = [0u8; 1];
     loop {
@@ -861,30 +986,58 @@ async fn read_ready_line(s: &mut TcpStream) -> Result<Option<u64>> {
         }
     }
     let text = String::from_utf8_lossy(&line);
-    let text = text.trim_end();
+    parse_ready_line(text.trim_end())
+}
+
+/// Parsa la riga di handshake del server:
+///   "READY"          -> ServerHello { ts: None, os: None } (server legacy)
+///   "READY <ts>"     -> ServerHello { ts: Some(ts), os: None }
+///   "READY <ts> L"   -> os = Some(Linux)   (server futuri)
+///   "READY <ts> W"   -> os = Some(Windows) (server futuri)
+///
+/// Il terzo token (tag OS) e' OPZIONALE e forward-compatible: i server
+/// attuali non lo inviano, quelli futuri dichiareranno il proprio OS e
+/// il client lo usera' al posto dell'euristica EXE_PATH per scegliere
+/// il payload dell'update (binario linux vs PE). Token sconosciuti sono
+/// tollerati come "non dichiarato" — mai rifiutare l'handshake per un
+/// tag che non capiamo.
+/// Funzione pura (separata dalla lettura socket per essere unit-testabile).
+fn parse_ready_line(text: &str) -> Result<version::ServerHello> {
     if text == "READY" {
-        return Ok(None);
+        return Ok(version::ServerHello::default());
     }
     if let Some(rest) = text.strip_prefix("READY ") {
-        let ts = rest.trim().parse::<u64>().unwrap_or(0);
-        return Ok(Some(ts));
+        let mut tokens = rest.split_whitespace();
+        // Primo token: BUILD_TS. Non numerico -> 0 (server "ignoto",
+        // trattato come piu' vecchio di qualsiasi build versionato).
+        let ts = tokens
+            .next()
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(0);
+        // Secondo token (opzionale): tag OS "L"|"W".
+        let os = tokens.next().and_then(version::RemoteOs::from_tag);
+        return Ok(version::ServerHello {
+            ts: Some(ts),
+            os,
+        });
     }
     bail!("handshake sconosciuto: {:?}", text);
 }
 
-/// Una connessione TCP + lettura handshake "READY <ts>" (singolo tentativo,
-/// niente retry/bootstrap/update). Ritorna il socket e il BUILD_TS remoto
-/// (None = server legacy). Usata da connect_and_handshake e dall'interno
+/// Una connessione TCP + lettura handshake "READY <ts> [<os>]" (singolo
+/// tentativo, niente retry/bootstrap/update). Ritorna il socket e il
+/// ServerHello remoto (ts None = server legacy; os None = OS non
+/// dichiarato). Usata da connect_and_handshake e dall'interno
 /// dell'orchestrazione update (le connessioni di PUT/GET/shell non devono
 /// ri-triggerare il confronto di versione).
-pub(crate) async fn connect_raw(addr: &str) -> Result<(TcpStream, Option<u64>)> {
+pub(crate) async fn connect_raw(addr: &str) -> Result<(TcpStream, version::ServerHello)> {
     let mut s = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
         .await
         .context("connect timeout")??;
-    let remote_ts = tokio::time::timeout(Duration::from_millis(1500), read_ready_line(&mut s))
+    let hello = tokio::time::timeout(Duration::from_millis(1500), read_ready_line(&mut s))
         .await
         .context("handshake timeout")??;
-    Ok((s, remote_ts))
+    Ok((s, hello))
 }
 
 /// Stabilisce la connessione TCP al server, verifica l'handshake
@@ -908,7 +1061,7 @@ async fn connect_and_handshake() -> Result<TcpStream> {
         eprintln!("Connecting to {} (Attempt {})...", addr, attempt);
 
         let conn = connect_raw(&addr).await;
-        let (s, remote_ts) = match conn {
+        let (s, hello) = match conn {
             Ok(v) => v,
             Err(e) => {
                 if let Some(dl) = update_deadline {
@@ -927,17 +1080,33 @@ async fn connect_and_handshake() -> Result<TcpStream> {
                     return Err(final_connect_error(&addr));
                 }
                 eprintln!("Connection failed or timed out. Bootstrapping...");
-                bootstrap::bootstrap_server().await?;
+                match bootstrap::bootstrap_server().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Fail-fast (bug B1): canale di bootstrap
+                        // deterministicamente morto (WinRM/SSH down o auth
+                        // rifiutata). Ogni attempt ulteriore ripeterebbe
+                        // gli stessi timeout identici (~40s cad. su WinRM):
+                        // uscita immediata col remediation gia' stampato.
+                        if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some()
+                            || bootstrap::winrm_unreachable()
+                        {
+                            return Err(final_connect_error(&addr));
+                        }
+                        return Err(e);
+                    }
+                }
                 continue;
             }
         };
 
         eprintln!(
-            "[DEBUG] handshake: remote_ts={:?} locale={}",
-            remote_ts,
+            "[DEBUG] handshake: remote_ts={:?} remote_os={:?} locale={}",
+            hello.ts,
+            hello.os,
             version::BUILD_TS
         );
-        match update::reconcile(remote_ts).await {
+        match update::reconcile(hello).await {
             update::Reconcile::Proceed => {
                 eprintln!("Connected and verified.");
                 return Ok(s);
@@ -955,11 +1124,11 @@ async fn connect_and_handshake() -> Result<TcpStream> {
                 continue;
             }
             update::Reconcile::ReconnectNoWait => {
-                // Fallback WinRM: il vecchio server e' gia' stato fermato
-                // (quit) e quello nuovo e' gia' in ascolto (atteso dal
-                // polling di bootstrap_server). Riconnessione immediata,
-                // con deadline di sicurezza per i retry.
-                eprintln!("[update] server aggiornato via fallback WinRM: riconnessione...");
+                // Fallback sul canale di bootstrap (WinRM/SSH): il vecchio
+                // server e' gia' stato fermato (quit) e quello nuovo e'
+                // gia' in ascolto (atteso dal polling di bootstrap_server).
+                // Riconnessione immediata, con deadline di sicurezza.
+                eprintln!("[update] server aggiornato via fallback bootstrap: riconnessione...");
                 update_deadline = Some(std::time::Instant::now() + Duration::from_secs(90));
                 attempt = 0;
                 continue;
@@ -1089,4 +1258,57 @@ async fn client_mode(cmd: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ready_line_legacy() {
+        // "READY" secco: server pre auto-update -> ts/os assenti.
+        let hello = parse_ready_line("READY").unwrap();
+        assert_eq!(hello.ts, None);
+        assert_eq!(hello.os, None);
+    }
+
+    #[test]
+    fn parse_ready_line_ts_senza_os() {
+        // Formato attuale: "READY <ts>" senza tag OS.
+        let hello = parse_ready_line("READY 1758530400").unwrap();
+        assert_eq!(hello.ts, Some(1758530400));
+        assert_eq!(hello.os, None);
+    }
+
+    #[test]
+    fn parse_ready_line_ts_con_os() {
+        // Formato futuro: "READY <ts> L|W" — il client deve capire il
+        // tag OS gia' oggi (i server lo invieranno piu' avanti).
+        let hello = parse_ready_line("READY 1758530400 L").unwrap();
+        assert_eq!(hello.ts, Some(1758530400));
+        assert_eq!(hello.os, Some(version::RemoteOs::Linux));
+
+        let hello = parse_ready_line("READY 1758530400 W").unwrap();
+        assert_eq!(hello.ts, Some(1758530400));
+        assert_eq!(hello.os, Some(version::RemoteOs::Windows));
+    }
+
+    #[test]
+    fn parse_ready_line_tag_sconosciuto_tollerato() {
+        // Tag OS non riconosciuto: tollerato come "non dichiarato",
+        // l'handshake NON deve fallire (forward-compat).
+        let hello = parse_ready_line("READY 7 X").unwrap();
+        assert_eq!(hello.ts, Some(7));
+        assert_eq!(hello.os, None);
+    }
+
+    #[test]
+    fn parse_ready_line_ts_malformato_e_sconosciuto() {
+        // ts non numerico -> 0 (server "piu' vecchio di tutti").
+        let hello = parse_ready_line("READY abc").unwrap();
+        assert_eq!(hello.ts, Some(0));
+        // Righe non-READY: zombie/protocollo diverso -> errore.
+        assert!(parse_ready_line("HELLO").is_err());
+        assert!(parse_ready_line("").is_err());
+    }
 }

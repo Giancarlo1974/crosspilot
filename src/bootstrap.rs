@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use winrm_rs::WinrmError;
 
+use crate::bootstrap_ssh;
 use crate::deploy;
 use crate::envs;
 use crate::self_update;
@@ -16,6 +17,39 @@ use crate::version;
 /// (connect refused/timeout = servizio non attivo o firewall che droppa).
 /// Letto dal chiamante per arricchire l'errore finale con il remediation.
 static WINRM_UNREACHABLE: AtomicBool = AtomicBool::new(false);
+
+/// Errore dedicato: il canale di bootstrap (WinRM o SSH) e'
+/// deterministicamente irraggiungibile/morto (endpoint down, auth
+/// rifiutata, host key non verificata). Ogni chiamata successiva
+/// fallirebbe identica: connect_and_handshake lo usa per interrompere
+/// SUBITO il retry loop invece di ripetere timeout identici per ogni
+/// attempt (bug B1). Il campo e' il nome del canale, per i log.
+#[derive(Debug)]
+pub struct ChannelUnreachable(pub &'static str);
+
+impl std::fmt::Display for ChannelUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "canale bootstrap {} irraggiungibile", self.0)
+    }
+}
+
+impl std::error::Error for ChannelUnreachable {}
+
+/// True se l'ambiente attivo punta a un remote Unix/Linux: EXE_PATH
+/// unix-style (inizia con '/') oppure campo OS=linux/unix esplicito.
+/// Seleziona il canale di bootstrap SSH invece di WinRM (bug B3) e
+/// adatta hint/errore finale (bug B2).
+pub fn remote_is_unix() -> bool {
+    let os_linux = envs::var("OS")
+        .map(|v| v.eq_ignore_ascii_case("linux") || v.eq_ignore_ascii_case("unix"))
+        .unwrap_or(false);
+    if os_linux {
+        return true;
+    }
+    envs::var("EXE_PATH")
+        .map(|p| p.starts_with('/'))
+        .unwrap_or(false)
+}
 
 /// Dedup del messaggio di remediation: bootstrap_server viene chiamata nel
 /// retry loop (fino a 4 volte) e ogni chiamata puo' fallire 2 volte
@@ -28,17 +62,26 @@ pub fn winrm_unreachable() -> bool {
 }
 
 /// Stampa una volta il remediation per WinRM non abilitato sull'host remoto.
+/// Se l'ambiente punta a un remote Unix (EXE_PATH unix-style o OS=linux)
+/// il messaggio WinRM sarebbe fuorviante: su quell'host WinRM non esistera'
+/// MAI — il canale di bootstrap corretto e' SSH (bug B2).
 fn print_psremoting_hint(host: &str, port: u16) {
     if HINT_PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!();
     eprintln!("[HINT] Endpoint WinRM {}:{} non raggiungibile (servizio non attivo o firewall).", host, port);
-    eprintln!("       Sulla macchina Windows remota, da PowerShell come amministratore:");
-    eprintln!();
-    eprintln!("         Enable-PSRemoting -Force");
-    eprintln!();
-    eprintln!("       (crea il listener 5985 e le regole firewall; alternativa: winrm quickconfig)");
+    if remote_is_unix() {
+        eprintln!("       L'ambiente attivo punta a un remote Linux/Unix: WinRM non e'");
+        eprintln!("       applicabile — il bootstrap usa SSH (campi SSH_HOST/SSH_USER/SSH_PORT,");
+        eprintln!("       auth a chiavi/agent; vedi 'crosspilot env show').");
+    } else {
+        eprintln!("       Sulla macchina Windows remota, da PowerShell come amministratore:");
+        eprintln!();
+        eprintln!("         Enable-PSRemoting -Force");
+        eprintln!();
+        eprintln!("       (crea il listener 5985 e le regole firewall; alternativa: winrm quickconfig)");
+    }
     eprintln!();
 }
 
@@ -89,7 +132,8 @@ fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool 
 ///
 /// Contesto WinRM condiviso: client costruito + host + porta + utente
 /// raw (per schtasks /RU). Estratto da bootstrap_server per essere
-/// riutilizzato dal preflight del fallback di update::reconcile.
+/// riutilizzato dal preflight del fallback di update::reconcile
+/// (channel_probe).
 struct WinrmCtx {
     client: winrm_rs::WinrmClient,
     host: String,
@@ -100,7 +144,7 @@ struct WinrmCtx {
 }
 
 /// Risolve le credenziali/endpoint WinRM dal .env (catena ambienti) e
-/// costruisce il client. Condiviso da bootstrap_server e winrm_probe.
+/// costruisce il client. Condiviso da bootstrap_server e channel_probe.
 fn winrm_context() -> Result<WinrmCtx> {
     let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let winrm_port_str = envs::var("PORT").unwrap_or_else(|| "47320".to_string());
@@ -154,21 +198,36 @@ fn winrm_context() -> Result<WinrmCtx> {
     })
 }
 
-/// Preflight WinRM per il fallback di update::reconcile: verifica che il
-/// canale WinRM sia VIVO prima di fermare un server funzionante.
+/// Preflight del canale di bootstrap per il fallback di
+/// update::reconcile: verifica che il canale dedicato (WinRM su remote
+/// Windows, SSH su remote Linux/Unix) sia VIVO prima di fermare un
+/// server funzionante.
 ///
 /// PERCHE': quando l'update via TCP fallisce (es. server zombificato con
 /// versione protocollo incompatibile — il caso H101, build intermedia con
 /// VERSION=2 che chiude il socket su ogni messaggio framed), l'unica via
-/// di recovery e' il deploy via WinRM. Ma il deploy richiede di fermare
-/// il vecchio server (`quit` in shell-mode) PRIMA del riavvio: farlo con
-/// WinRM morto lascerebbe il remote senza server e senza via d'uscita
-/// (brick volontario). Questo preflight risponde alla domanda "posso
-/// permettermi di fermare il server?".
+/// di recovery e' il deploy sul canale di bootstrap. Ma il deploy
+/// richiede di fermare il vecchio server (`quit` in shell-mode) PRIMA
+/// del riavvio: farlo col canale morto lascerebbe il remote senza server
+/// e senza via d'uscita (brick volontario). Questo preflight risponde
+/// alla domanda "posso permettermi di fermare il server?".
 ///
 /// Ritorna Some(info) se remote_build_info risponde (deploy possibile),
-/// None se WinRM non e' utilizzabile.
-pub async fn winrm_probe() -> Option<version::RemoteBuildInfo> {
+/// None se il canale non e' utilizzabile.
+pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
+    // Remote Unix: il preflight del canale e' SSH, non WinRM (bug B3) —
+    // stessa domanda ("posso permettermi di fermare il server?") su un
+    // trasporto diverso.
+    if remote_is_unix() {
+        let exe_path = match envs::var("EXE_PATH") {
+            Some(p) => p,
+            None => {
+                eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
+                return None;
+            }
+        };
+        return bootstrap_ssh::probe(&exe_path).await;
+    }
     let ctx = match winrm_context() {
         Ok(c) => c,
         Err(e) => {
@@ -208,6 +267,13 @@ pub async fn bootstrap_server() -> Result<()> {
     // Risoluzione via envs: CROSSPILOT_<ENV>_EXE_PATH -> fallback CROSSPILOT_EXE_PATH.
     let exe_path = envs::var("EXE_PATH")
         .context("CROSSPILOT_EXE_PATH (o CROSSPILOT_<ENV>_EXE_PATH) must be set in the .env file")?;
+
+    // Remote Unix/Linux: WinRM non esiste — il bootstrap passa da SSH
+    // (deploy staged + avvio detached via setsid). Selezione: EXE_PATH
+    // unix-style o campo OS=linux (bug B3).
+    if remote_is_unix() {
+        return bootstrap_ssh::bootstrap_server(&exe_path).await;
+    }
 
     // --- Credenziali e endpoint WinRM (da .env) ---
     let ctx = winrm_context()?;
@@ -441,11 +507,24 @@ pub async fn bootstrap_server() -> Result<()> {
     }
     }
 
+    // --- Fail-fast su canale morto (bug B1) ---
+    // Se il canale WinRM e' deterministicamente irraggiungibile NESSUN
+    // avvio remoto e' stato eseguito: il polling TCP di 30s non ha alcuna
+    // possibilita' di successo (il caso "server gia' in ascolto" e' gia'
+    // stato escluso dal connect_raw iniziale del retry loop) e
+    // remote_startup_diag — anch'essa via WinRM — aggiungerebbe solo un
+    // altro timeout identico (~10-60s). L'errore dedicato
+    // ChannelUnreachable fa interrompere subito il retry loop di
+    // connect_and_handshake: prima questo caso bruciava ~40s x 5 attempt.
+    if winrm_dead || WINRM_UNREACHABLE.load(Ordering::Relaxed) {
+        return Err(ChannelUnreachable("WinRM").into());
+    }
+
     // --- Polling: verifica che il server TCP sia effettivamente partito ---
     // Il processo remoto può richiedere più tempo su dischi lenti, AV scan,
     // o primo avvio. Tenta la connessione TCP ogni 2s per un massimo di 30s.
     let up = poll_server_startup().await;
-    if !up && !winrm_dead {
+    if !up {
         // Il server non risponde: prima di dichiarare fallimento chiediamo
         // AL REMOTO (via WinRM, canale indipendente) cosa sta succedendo.
         // Distingue i tre casi: processo morto / porta non bindata /
@@ -460,7 +539,8 @@ pub async fn bootstrap_server() -> Result<()> {
 
 /// Porta TCP del server remoto vista dal client (CLIENT_PORT nel .env,
 /// coerente con poll_server_startup e con la regola firewall creata).
-fn server_tcp_port() -> u16 {
+/// pub(crate): riusata dalla diagnostica di bootstrap_ssh.
+pub(crate) fn server_tcp_port() -> u16 {
     envs::var("CLIENT_PORT")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(5330)
@@ -535,7 +615,7 @@ async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
             let listen_pid = stdout
                 .lines()
                 .find(|l| l.starts_with("LISTEN="))
-                .map(|l| l.trim_start_matches("LISTEN=").len() > 0)
+                .map(|l| !l.trim_start_matches("LISTEN=").is_empty())
                 .unwrap_or(false);
             let fw = stdout.lines().any(|l| l.trim() == "FW=1");
             if has_pid && listen_pid {
@@ -571,7 +651,8 @@ async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
 
 /// Polling dell'endpoint TCP del server: tenta la connessione ogni 2s
 /// per un massimo di 30s. Non ritorna errore — il chiamante gestisce i retry.
-async fn poll_server_startup() -> bool {
+/// pub(crate): riusata da bootstrap_ssh (stessa attesa post-avvio).
+pub(crate) async fn poll_server_startup() -> bool {
     println!("Waiting for server to start...");
     let host = envs::var("HOST")
         .unwrap_or_else(|| "127.0.0.1".to_string());

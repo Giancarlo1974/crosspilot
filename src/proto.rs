@@ -51,7 +51,8 @@ pub const MSG_DELETE_BATCH_RES: u8 = 13;
 
 // Messaggi self-update via TCP (update-spec): il client chiede al server di
 // spawnare l'updater staged e uscire. Inviati solo a server che dichiarano
-// un BUILD_TS nell'handshake "READY <ts>" (i server legacy mandano "READY"
+// un BUILD_TS nell'handshake "READY <ts> [<os>]" (il tag OS L|W e'
+// opzionale e non ancora inviato; i server legacy mandano "READY"
 // secco e non ricevono mai UPDATE_REQ: per loro c'e' il path WMI/setsid).
 pub const MSG_UPDATE_REQ: u8 = 14;
 pub const MSG_UPDATE_RES: u8 = 15;

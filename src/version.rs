@@ -63,6 +63,43 @@ pub const VERSION_STR: &str = concat!(
     ")"
 );
 
+/// OS del server remoto come dichiarato nell'handshake
+/// "READY <ts> <L|W>" (terzo token opzionale).
+/// I server attuali non lo inviano ancora: in quel caso il client
+/// ricade sull'euristica EXE_PATH per decidere il payload di update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOs {
+    /// Server su host Linux/Unix (payload update: binario linux staged).
+    Linux,
+    /// Server su host Windows (payload update: PE staged).
+    Windows,
+}
+
+impl RemoteOs {
+    /// Parsa il tag OS del terzo token dell'handshake:
+    /// "L" -> Linux, "W" -> Windows. Token assenti o sconosciuti -> None
+    /// (server che non dichiara il proprio OS).
+    pub fn from_tag(tag: &str) -> Option<RemoteOs> {
+        match tag {
+            "L" => Some(RemoteOs::Linux),
+            "W" => Some(RemoteOs::Windows),
+            _ => None,
+        }
+    }
+}
+
+/// Saluto del server nell'handshake TCP: "READY [<ts> [<os>]]".
+/// - ts=None: server legacy pre auto-update ("READY" secco);
+/// - os=None: server che non dichiara ancora il proprio OS — il client
+///   usa l'euristica EXE_PATH per la scelta del payload di update.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerHello {
+    /// BUILD_TS dichiarato dal server (None = server legacy).
+    pub ts: Option<u64>,
+    /// OS del server (None = non dichiarato, handshake "READY <ts>").
+    pub os: Option<RemoteOs>,
+}
+
 /// Stato della build deployata sul remote, ricostruito da remote_build_info()
 /// in deploy.rs (una sola chiamata WinRM).
 ///
@@ -241,6 +278,16 @@ mod tests {
         assert_eq!(parse_version_ts(""), None);
         assert_eq!(parse_version_ts("abc+xyz"), None);
         assert_eq!(parse_version_ts("0.1.0+"), None);
+    }
+
+    #[test]
+    fn remote_os_from_tag() {
+        assert_eq!(RemoteOs::from_tag("L"), Some(RemoteOs::Linux));
+        assert_eq!(RemoteOs::from_tag("W"), Some(RemoteOs::Windows));
+        // Token sconosciuti o malformati: tollerati come "non dichiarato".
+        assert_eq!(RemoteOs::from_tag("X"), None);
+        assert_eq!(RemoteOs::from_tag("linux"), None);
+        assert_eq!(RemoteOs::from_tag(""), None);
     }
 
     #[test]

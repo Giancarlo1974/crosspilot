@@ -43,6 +43,12 @@ const FIELDS: &[&str] = &[
     "SEGMENT_SIZE",
     "CLIENT_PORT",
     "SERVER_PORT",
+    // I campi SSH_* devono precedere HOST/PORT/USER: il match per suffisso
+    // farebbe altrimenti leggere CROSSPILOT_SSH_PORT come env "SSH" campo
+    // "PORT" invece del campo SSH_PORT non prefissato.
+    "SSH_PORT",
+    "SSH_USER",
+    "SSH_HOST",
     "EXE_PATH",
     "LOG_PATH",
     "ERR_PATH",
@@ -50,6 +56,7 @@ const FIELDS: &[&str] = &[
     "PORT",
     "USER",
     "PASS",
+    "OS",
 ];
 
 /// Ordine di presentazione/scrittura dei campi (show + add).
@@ -64,6 +71,10 @@ const FIELD_ORDER: &[&str] = &[
     "LOG_PATH",
     "ERR_PATH",
     "SEGMENT_SIZE",
+    "OS",
+    "SSH_HOST",
+    "SSH_PORT",
+    "SSH_USER",
 ];
 
 /// Nomi riservati: un ambiente con questi nomi colliderebbe con chiavi non
@@ -72,8 +83,10 @@ const FIELD_ORDER: &[&str] = &[
 /// - SERVER:  CROSSPILOT_SERVER_PORT (campo PORT dell'env SERVER) colliderebbe
 ///   con la chiave non prefissata CROSSPILOT_SERVER_PORT;
 /// - CLIENT:  idem per CROSSPILOT_CLIENT_PORT;
-/// - DEFAULT: nome logico dell'ambiente non prefissato.
-const RESERVED: &[&str] = &["ENV", "SERVER", "CLIENT", "DEFAULT"];
+/// - DEFAULT: nome logico dell'ambiente non prefissato;
+/// - SSH:     CROSSPILOT_SSH_HOST/SSH_PORT/SSH_USER sono campi non prefissati:
+///   un env "SSH" vedrebbe le sue chiavi HOST/PORT/USER shadow-ate da essi.
+const RESERVED: &[&str] = &["ENV", "SERVER", "CLIENT", "DEFAULT", "SSH"];
 
 /// Chiave del selettore dell'ambiente attivo.
 const SELECTOR_KEY: &str = "CROSSPILOT_ENV";
@@ -421,7 +434,9 @@ fn selector_value(lines: &[String]) -> Option<String> {
 /// Scrive (o aggiorna in place) una riga KEY=VALUE per il campo di un env.
 /// Se la chiave esiste già la riga viene sostituita mantenendo la posizione,
 /// altrimenti viene aggiunta in coda al file.
-fn upsert_field(lines: &mut Vec<String>, name: Option<&str>, field: &str, value: &str) {
+/// pub(crate): riusata da update.rs per il merge del .env remoto (BUG:
+/// l'overwrite cieco cancellava i campi preesistenti del remote).
+pub(crate) fn upsert_field(lines: &mut Vec<String>, name: Option<&str>, field: &str, value: &str) {
     let key = key_for(name, field);
     let new_line = format!("{}={}", key, quote_value(value));
     for line in lines.iter_mut() {
@@ -517,6 +532,18 @@ pub struct EnvFields {
     /// Dimensione segmento transfer delta in byte (campo SEGMENT_SIZE, 1MB-256MB).
     #[arg(long)]
     pub segment_size: Option<u64>,
+    /// OS del remote: "linux"/"unix" forza il bootstrap SSH (campo OS).
+    #[arg(long)]
+    pub os: Option<String>,
+    /// Host SSH se diverso da HOST (campo SSH_HOST).
+    #[arg(long)]
+    pub ssh_host: Option<String>,
+    /// Porta SSH (campo SSH_PORT, default 22).
+    #[arg(long)]
+    pub ssh_port: Option<u16>,
+    /// Utente SSH (campo SSH_USER; default: utente locale di ssh).
+    #[arg(long)]
+    pub ssh_user: Option<String>,
 }
 
 impl EnvFields {
@@ -549,6 +576,18 @@ impl EnvFields {
         }
         if let Some(v) = self.segment_size {
             out.push(("SEGMENT_SIZE", v.to_string()));
+        }
+        if let Some(v) = &self.os {
+            out.push(("OS", v.clone()));
+        }
+        if let Some(v) = &self.ssh_host {
+            out.push(("SSH_HOST", v.clone()));
+        }
+        if let Some(v) = self.ssh_port {
+            out.push(("SSH_PORT", v.to_string()));
+        }
+        if let Some(v) = &self.ssh_user {
+            out.push(("SSH_USER", v.clone()));
         }
         out
     }
@@ -866,6 +905,41 @@ mod tests {
             parse_key("CROSSPILOT_PROD_EXE_PATH"),
             ParsedKey::Field(Some("PROD".to_string()), "EXE_PATH")
         );
+    }
+
+    #[test]
+    fn parse_key_campi_ssh_e_os() {
+        // Campi SSH/OS non prefissati: SSH_PORT deve vincere sul suffisso
+        // _PORT (ordine longest-first in FIELDS).
+        assert_eq!(
+            parse_key("CROSSPILOT_SSH_PORT"),
+            ParsedKey::Field(None, "SSH_PORT")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_SSH_USER"),
+            ParsedKey::Field(None, "SSH_USER")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_SSH_HOST"),
+            ParsedKey::Field(None, "SSH_HOST")
+        );
+        assert_eq!(parse_key("CROSSPILOT_OS"), ParsedKey::Field(None, "OS"));
+        // Prefissati: MYR + campo SSH_*/OS.
+        assert_eq!(
+            parse_key("CROSSPILOT_MYR_SSH_PORT"),
+            ParsedKey::Field(Some("MYR".to_string()), "SSH_PORT")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_MYR_OS"),
+            ParsedKey::Field(Some("MYR".to_string()), "OS")
+        );
+    }
+
+    #[test]
+    fn validate_name_ssh_riservato() {
+        // "SSH" riservato: CROSSPILOT_SSH_* sono campi non prefissati,
+        // un env "SSH" non potrebbe mai definire HOST/PORT/USER propri.
+        assert!(validate_name("ssh").is_err());
     }
 
     #[test]

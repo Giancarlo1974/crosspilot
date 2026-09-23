@@ -591,8 +591,9 @@ async fn upload_artifact(
     Ok(())
 }
 
-/// Calcola SHA-256 di byte in memoria.
-fn sha256_bytes(data: &[u8]) -> String {
+/// Calcola SHA-256 (lowercase hex) di byte in memoria.
+/// pub(crate): riusata da bootstrap_ssh per i check hash via SSH.
+pub(crate) fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let hash = hasher.finalize();
