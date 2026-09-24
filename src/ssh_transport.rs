@@ -401,14 +401,30 @@ impl SshSession {
 
     /// Esegue `cmd` sulla shell di default del remote (testo raw — il
     /// dialetto giusto e' scelto dal chiamante). Niente PTY: exec batch
-    /// non interattivo.
+    /// non interattivo. Lo stdin del canale viene chiuso subito (EOF):
+    /// un comando remoto che leggesse stdin non resta appeso.
     pub async fn exec(&self, cmd: &str) -> Result<ExecOut> {
+        self.exec_stdin(cmd, &[]).await
+    }
+
+    /// Come exec(), ma scrive `stdin` sul canale prima dell'EOF.
+    /// Usata per `sudo -S` (bootstrap_ssh): la password viaggia su
+    /// stdin e non finisce MAI in argv remoto (visibile in `ps`)
+    /// ne' nei log della sessione.
+    pub async fn exec_stdin(&self, cmd: &str, stdin: &[u8]) -> Result<ExecOut> {
         let mut channel = self
             .handle
             .channel_open_session()
             .await
             .context("ssh channel_open_session")?;
         channel.exec(true, cmd).await.context("ssh exec request")?;
+        if !stdin.is_empty() {
+            channel
+                .data_bytes(stdin.to_vec())
+                .await
+                .context("ssh stdin data")?;
+        }
+        channel.eof().await.context("ssh stdin eof")?;
 
         let mut out = ExecOut::default();
         let read_loop = async {

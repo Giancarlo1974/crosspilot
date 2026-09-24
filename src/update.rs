@@ -821,22 +821,31 @@ pub(crate) fn windows_inbound_allow_cmd(port: u16) -> String {
 ///   non esiste (tabelle custom): il FW=fail:nft resta come evidenza;
 /// - nessun frontend: FW=none (host senza firewall locale: OK).
 ///
+/// ESCALATION: i frontend richiedono root. Se il processo non e' gia'
+/// root si tenta `sudo -n` (NOPASSWD) come prefisso $S di ogni comando.
+/// Il sudo CON password e' possibile solo sul canale SSH, dove la
+/// password e' nota al client: bootstrap_ssh wrappa lo script in
+/// `sudo -S` con la password su stdin (sudo_wrap_posix) — nel path TCP
+/// shell-mode e nel self-ensure locale la password non e' disponibile
+/// e resta il best-effort `sudo -n`.
+///
 /// NOTA: il comando shell-mode e' letto dal server in UN buffer da
 /// 1024 byte (handle_connection): lo script deve restare compatto.
 /// pub(crate): riusato da bootstrap_ssh (stesso blocco, trasporto ssh).
 pub(crate) fn linux_inbound_allow_script(port: u16) -> String {
     format!(
         "p={p}; \
+         S=; [ \"$(id -u)\" -ne 0 ] && sudo -n true 2>/dev/null && S=\"sudo -n\"; \
          if command -v ufw >/dev/null 2>&1; then \
-           ufw allow $p/tcp >/dev/null 2>&1 && echo FW=ufw || echo FW=fail:ufw; \
-         elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then \
-           firewall-cmd --add-port=$p/tcp >/dev/null 2>&1; \
-           firewall-cmd --permanent --add-port=$p/tcp >/dev/null 2>&1 && echo FW=firewalld || echo FW=fail:firewalld; \
+           $S ufw allow $p/tcp >/dev/null 2>&1 && echo FW=ufw || echo FW=fail:ufw; \
+         elif command -v firewall-cmd >/dev/null 2>&1 && $S firewall-cmd --state >/dev/null 2>&1; then \
+           $S firewall-cmd --add-port=$p/tcp >/dev/null 2>&1; \
+           $S firewall-cmd --permanent --add-port=$p/tcp >/dev/null 2>&1 && echo FW=firewalld || echo FW=fail:firewalld; \
          elif command -v iptables >/dev/null 2>&1; then \
-           iptables -C INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null; \
+           $S iptables -C INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null || $S iptables -I INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null; \
            [ $? -eq 0 ] && echo FW=iptables || echo FW=fail:iptables; \
          elif command -v nft >/dev/null 2>&1; then \
-           nft add rule inet filter input tcp dport $p accept 2>/dev/null && echo FW=nft || echo FW=fail:nft; \
+           $S nft add rule inet filter input tcp dport $p accept 2>/dev/null && echo FW=nft || echo FW=fail:nft; \
          else echo FW=none; fi",
         p = port
     )
@@ -2571,6 +2580,10 @@ mod tests {
         assert!(lin.contains("ufw allow $p/tcp"));
         assert!(lin.contains("--dport $p"));
         assert!(lin.contains("p=5330"));
+        // Escalation: non-root tenta `sudo -n` (NOPASSWD) come prefisso
+        // dei comandi firewall. Il sudo con password e' solo nel path
+        // SSH (sudo_wrap_posix + exec_stdin), non in questo script.
+        assert!(lin.contains("sudo -n"));
     }
 
     #[test]

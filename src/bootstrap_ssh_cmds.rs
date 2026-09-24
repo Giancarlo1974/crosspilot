@@ -241,6 +241,21 @@ pub(crate) fn firewall_cmd(d: Dialect, port: u16) -> String {
     }
 }
 
+/// Wrapper Posix per eseguire `script` con escalation sudo -S: la
+/// password va su stdin del canale (exec_stdin), MAI in argv — in
+/// argv sarebbe visibile nel process list del remote (`ps`).
+/// Se il processo remoto e' gia' root, o sudo non e' installato, lo
+/// script gira cosi' com'e' (con l'eventuale `sudo -n` interno).
+/// Solo per il dialetto Posix; il chiamante decide se invocarlo
+/// (password disponibile) e gestisce il fallback sul run nudo.
+pub(crate) fn sudo_wrap_posix(script: &str) -> String {
+    format!(
+        "if [ \"$(id -u)\" -ne 0 ] && command -v sudo >/dev/null 2>&1; then \
+         exec sudo -S -p '' sh -c {s}; else exec sh -c {s}; fi",
+        s = sh_sq(script)
+    )
+}
+
 /// Avvio detached del server (spec §1.4):
 /// - Posix: setsid in nuova sessione con redirect su log/err — il
 ///   processo sopravvive alla chiusura del canale SSH.
@@ -275,8 +290,18 @@ pub(crate) fn start_server_cmd(d: Dialect, exe_path: &str, user: &str) -> String
 }
 
 /// Comando di diagnostica post-bootstrap-fallito, per dialetto:
-/// - Posix: processo vivo + porta in ascolto + frontend firewall
-///   (righe PROC:/LISTEN:/FWTOOL:);
+/// - Posix: processo vivo + porta in ascolto + **probe READY su
+///   loopback** + frontend firewall (righe PROC:/LISTEN:/READY_PROBE:/
+///   FWTOOL:). Il probe READY discrimina i due casi che PROC+LISTEN
+///   da soli confondevano (bug osservato su H41): il server fa bind
+///   subito ma risponde READY solo dopo self_describe — che ricalcola
+///   gli SHA-256 degli artefatti ad ogni avvio (decine di secondi se
+///   sono stati appena uploadati). Loopback non passa per le regole
+///   firewall inbound: READY locale ok = filtro esterno vero; READY
+///   locale assente = server ancora in init o bloccato.
+///   Implementazione: bash /dev/tcp + `read -t` builtin — niente
+///   `timeout`/`nc`/`ss` extra; senza bash la riga manca e il
+///   chiamante ricade sull'euristica storica.
 /// - PowerShell: lo script condiviso col path WinRM
 ///   (bootstrap::windows_diag_script — righe PROC=/LISTEN=/FW=).
 pub(crate) fn diag_cmd(d: Dialect, port: u16) -> String {
@@ -287,6 +312,10 @@ pub(crate) fn diag_cmd(d: Dialect, port: u16) -> String {
              ss -tln 2>/dev/null | grep ':{p} ' | sed 's/^/LISTEN: /'; \
              elif command -v netstat >/dev/null 2>&1; then \
              netstat -tln 2>/dev/null | grep ':{p} ' | sed 's/^/LISTEN: /'; fi; \
+             if command -v bash >/dev/null 2>&1; then \
+             R=$(bash -c 'exec 3<>/dev/tcp/127.0.0.1/{p}; IFS= read -t 3 -r l <&3; printf %s \"$l\"' 2>/dev/null); \
+             case \"$R\" in READY*) echo \"READY_PROBE: ok $R\";; *) echo \"READY_PROBE: fail\";; esac; \
+             fi; \
              for f in ufw firewall-cmd iptables nft; do \
              command -v $f >/dev/null 2>&1 && echo \"FWTOOL: $f\"; done",
             p = port
@@ -365,6 +394,38 @@ mod tests {
         let cmd = firewall_cmd(Dialect::Posix, 5330);
         assert!(cmd.contains("ufw"));
         assert!(cmd.contains("5330"));
+    }
+
+    #[test]
+    fn diag_posix_ready_probe_loopback() {
+        // Il probe READY via bash /dev/tcp su 127.0.0.1 discrimina
+        // "SYN esterni filtrati" (loopback risponde) da "server ancora
+        // in init" (self_describe ricalcola gli hash degli artefatti).
+        let cmd = diag_cmd(Dialect::Posix, 5330);
+        assert!(cmd.contains("PROC:"));
+        assert!(cmd.contains("LISTEN:"));
+        assert!(cmd.contains("/dev/tcp/127.0.0.1/5330"));
+        assert!(cmd.contains("read -t 3"));
+        assert!(cmd.contains("READY_PROBE: ok"));
+        assert!(cmd.contains("READY_PROBE: fail"));
+        assert!(cmd.contains("command -v bash"));
+        assert!(cmd.contains("FWTOOL:"));
+    }
+
+    #[test]
+    fn sudo_wrap_posix_escalation_via_stdin() {
+        // Lo script va sotto `sudo -S` (password su stdin, mai in argv)
+        // solo quando serve: non-root + sudo installato. Altrimenti
+        // gira cosi' com'e'. Lo script interno e' single-quoted.
+        let inner = update::linux_inbound_allow_script(5330);
+        let wrapped = sudo_wrap_posix(&inner);
+        assert!(wrapped.contains("id -u"));
+        assert!(wrapped.contains("command -v sudo"));
+        assert!(wrapped.contains("exec sudo -S -p '' sh -c '"));
+        assert!(wrapped.contains("else exec sh -c '"));
+        // Script con single-quote embedded: sh_sq escapa correttamente.
+        let wrapped = sudo_wrap_posix("echo 'x'");
+        assert!(wrapped.contains("sh -c 'echo '\\''x'\\'''"));
     }
 
     #[test]

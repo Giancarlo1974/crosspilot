@@ -37,7 +37,9 @@ use crate::bootstrap_ssh_cmds::{
     staged_name, swap_cmd,
 };
 pub use crate::bootstrap_ssh_cmds::Dialect;
-use crate::bootstrap_ssh_cmds::{diag_cmd, firewall_cmd, functional_check_cmd, start_server_cmd};
+use crate::bootstrap_ssh_cmds::{
+    diag_cmd, firewall_cmd, functional_check_cmd, start_server_cmd, sudo_wrap_posix,
+};
 use crate::deploy;
 use crate::envs;
 use crate::self_update;
@@ -72,10 +74,7 @@ fn ssh_context() -> SshCtx {
     let key_path = envs::var("SSH_KEY");
     // SSH_PASS dedicato; fallback PASS = credenziali WinRM (caso tipico
     // di SSH->Windows, dove USER/PASS sono gia' configurati).
-    let password = match envs::var("SSH_PASS") {
-        Some(p) => Some(p),
-        None => envs::var("PASS"),
-    };
+    let password = ssh_password();
     // Mai loggare la password (spec §3: stessa disciplina di ssh_context
     // storico — solo target/porta/utente).
     eprintln!(
@@ -93,6 +92,12 @@ fn ssh_context() -> SshCtx {
         key_path,
         password,
     }
+}
+
+/// Password SSH configurata: SSH_PASS, fallback PASS. Condivisa da
+/// ssh_context (auth) e dal macro-blocco firewall (sudo -S via stdin).
+fn ssh_password() -> Option<String> {
+    envs::var("SSH_PASS").or_else(|| envs::var("PASS"))
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +612,34 @@ async fn start_server(sess: &SshSession, d: Dialect, exe_path: &str, user: &str)
 async fn ensure_inbound_allow(sess: &SshSession, d: Dialect) {
     let port = bootstrap::server_tcp_port();
     let cmd = firewall_cmd(d, port);
+    // Remote Posix + password nota: i frontend firewall (ufw, iptables,
+    // nft) richiedono root — un utente sudoer fallirebbe comunque
+    // (FW=fail:*). Primo tentativo via `sudo -S` con la password su
+    // stdin del canale (exec_stdin): mai in argv ne' nei log remoti.
+    // Se l'output non contiene il marker FW= (sudo assente, password
+    // errata o diversa da SSH_PASS) si cade sul run non privilegiato,
+    // che produce l'evidenza diagnostica come prima.
+    if d == Dialect::Posix {
+        if let Some(pw) = ssh_password() {
+            let wrapped = sudo_wrap_posix(&cmd);
+            match sess
+                .exec_stdin(&wrapped, format!("{}\n", pw).as_bytes())
+                .await
+            {
+                Ok(out) if String::from_utf8_lossy(&out.stdout).contains("FW=") => {
+                    eprintln!(
+                        "[bootstrap-ssh] firewall: {}",
+                        String::from_utf8_lossy(&out.stdout).trim()
+                    );
+                    return;
+                }
+                Ok(_) => eprintln!(
+                    "[bootstrap-ssh] firewall: escalation sudo senza esito, retry non privilegiato"
+                ),
+                Err(e) => eprintln!("[bootstrap-ssh] WARNING firewall sudo: {}", e),
+            }
+        }
+    }
     match ssh_run(sess, &cmd, "regola firewall").await {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -637,13 +670,58 @@ async fn remote_startup_diag(sess: &SshSession, d: Dialect) {
                 Dialect::Posix => {
                     let has_proc = stdout.contains("PROC:");
                     let has_listen = stdout.contains("LISTEN:");
+                    // READY_PROBE (diag_cmd Posix): banner letto via
+                    // bash /dev/tcp su 127.0.0.1. Il server binda SUBITO
+                    // ma risponde READY solo dopo ensure_inbound_allow_local
+                    // + self_describe — che ricalcola gli SHA-256 degli
+                    // artefatti ad ogni avvio e puo' durare decine di
+                    // secondi (caso H41: 659MB appena uploadati -> ~50s
+                    // di "not ready" pur essendo in LISTEN; la vecchia
+                    // euristica PROC+LISTEN concludeva "e' il firewall",
+                    // verdetto errato). Loopback non attraversa le regole
+                    // inbound: READY ok = filtro esterno reale; READY
+                    // fail = server ancora in init o bloccato.
+                    let ready_probe_done = stdout.contains("READY_PROBE:");
+                    let ready_probe_ok = stdout.contains("READY_PROBE: ok");
+                    // Debug log di supporto: l'esito del probe e' la prova
+                    // diretta della tesi (init lenta vs filtro esterno).
+                    eprintln!(
+                        "[DEBUG] diag: proc={} listen={} ready_probe={}",
+                        has_proc,
+                        has_listen,
+                        if !ready_probe_done {
+                            "n/a"
+                        } else if ready_probe_ok {
+                            "ok"
+                        } else {
+                            "fail"
+                        }
+                    );
                     if has_proc && has_listen {
-                        eprintln!(
-                            "[bootstrap-ssh] processo ATTIVO e porta {} in ascolto LOCALE: \
-                             il server e' vivo — e' la rete/firewall tra client e server a bloccare \
-                             (vedi righe FWTOOL per il frontend eventualmente da configurare).",
-                            port
-                        );
+                        if ready_probe_ok {
+                            eprintln!(
+                                "[bootstrap-ssh] READY su loopback OK ma porta {} irraggiungibile \
+                                 dal client: e' la rete/firewall tra client e server a bloccare \
+                                 (vedi righe FWTOOL per il frontend eventualmente da configurare).",
+                                port
+                            );
+                        } else if ready_probe_done {
+                            eprintln!(
+                                "[bootstrap-ssh] processo ATTIVO e porta {} in ascolto ma NESSUN \
+                                 READY su loopback: server ancora in inizializzazione (self_describe \
+                                 ricalcola gli hash degli artefatti ad ogni avvio) o bloccato — \
+                                 NON e' detto che sia il firewall. Controlla server.err sul remote.",
+                                port
+                            );
+                        } else {
+                            eprintln!(
+                                "[bootstrap-ssh] processo ATTIVO e porta {} in ascolto LOCALE: \
+                                 il server e' vivo (probe READY non disponibile: bash assente) — \
+                                 possibile filtro rete/firewall (vedi FWTOOL) oppure init lenta \
+                                 (self_describe su artefatti grandi).",
+                                port
+                            );
+                        }
                     } else if has_proc {
                         eprintln!(
                             "[bootstrap-ssh] processo ATTIVO ma porta {} NON in ascolto: \
