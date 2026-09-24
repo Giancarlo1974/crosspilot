@@ -843,11 +843,28 @@ pub(crate) async fn poll_server_startup() -> bool {
 
     for i in 1..=15 {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let result = tokio::time::timeout(
+        // READY handshake, NON bare connect: il backlog TCP accetta i SYN
+        // gia' mentre il server appena spawnato e' ancora prima dell'accept
+        // loop (netsh self-ensure + self_describe possono durare secondi su
+        // Windows). Un "up" dichiarato sul solo connect fa fallire il
+        // connect_raw successivo (handshake timeout 1.5s) e innesca un
+        // re-bootstrap inutile che spawnerebbe un SECONDO server — con il
+        // reclaim AddrInUse che rischia di taskkillare il primo a meta'
+        // avvio. Stesso motivo dei listener zombie (BUG-13): connect OK ma
+        // nessuno risponde READY. La connessione extra e' innocua: il
+        // server manda READY e ripulisce al primo peek (EOF).
+        let conn = tokio::time::timeout(
             Duration::from_secs(2),
             TcpStream::connect(addr.as_str())
         ).await;
-        if let Ok(Ok(_)) = result {
+        let up = match conn {
+            Ok(Ok(mut s)) => matches!(
+                tokio::time::timeout(Duration::from_secs(2), crate::read_ready_line(&mut s)).await,
+                Ok(Ok(_))
+            ),
+            _ => false,
+        };
+        if up {
             println!("Server is up (after {}s).", i * 2);
             return true;
         }

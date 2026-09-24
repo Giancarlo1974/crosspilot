@@ -238,7 +238,11 @@ pub(crate) async fn smb_connect(ctx: &SmbCtx) -> Result<SmbClient> {
     tokio::time::timeout(SMB_OP_TIMEOUT, login)
         .await
         .map_err(|_| {
+            // TCP 445 aperta ma NEGOTIATE/SESSION_SETUP mai completati:
+            // canale morto di fatto — stesso hint del connect timeout,
+            // senza di esso il fallimento era completamente silenzioso.
             SMB_UNREACHABLE.store(true, Ordering::Relaxed);
+            print_smb_hint(ctx, "TCP 445 accetta ma il login NTLMv2 non risponde (timeout)");
             anyhow::Error::from(bootstrap::ChannelUnreachable("SMB/SCM"))
         })?
         .map_err(|e| smb_err(ctx, e, "login NTLMv2"))?;

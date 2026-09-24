@@ -1118,7 +1118,18 @@ async fn connect_and_handshake() -> Result<TcpStream> {
                         if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some()
                             || bootstrap::winrm_unreachable()
                         {
-                            return Err(final_connect_error(&addr));
+                            let err = final_connect_error(&addr);
+                            if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some() {
+                                return Err(err);
+                            }
+                            // WinRM morto ma il canale di fallback (SMB/SCM)
+                            // ha fallito con un errore DIVERSO da
+                            // ChannelUnreachable: quello e' l'errore reale —
+                            // non va ingoiato dal messaggio evidence-based
+                            // (caso H166: un fallimento SMB spariva dietro
+                            // "canali non utilizzabili" e la diagnosi era
+                            // impossibile).
+                            return Err(err.context(format!("{:#}", e)));
                         }
                         return Err(e);
                     }
