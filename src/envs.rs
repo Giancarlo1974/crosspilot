@@ -52,6 +52,10 @@ const FIELDS: &[&str] = &[
     "EXE_PATH",
     "LOG_PATH",
     "ERR_PATH",
+    // Canale di bootstrap su remote Windows (spec smb-scm §1.3):
+    // "smb" = SMB/SCM primario; assente = WinRM primario + fallback SMB.
+    // Non collide con nessun suffisso dei campi sopra.
+    "BOOTSTRAP",
     "HOST",
     "PORT",
     "USER",
@@ -75,6 +79,7 @@ const FIELD_ORDER: &[&str] = &[
     "SSH_HOST",
     "SSH_PORT",
     "SSH_USER",
+    "BOOTSTRAP",
 ];
 
 /// Nomi riservati: un ambiente con questi nomi colliderebbe con chiavi non
@@ -544,6 +549,10 @@ pub struct EnvFields {
     /// Utente SSH (campo SSH_USER; default: utente locale di ssh).
     #[arg(long)]
     pub ssh_user: Option<String>,
+    /// Canale bootstrap su remote Windows: "smb" forza SMB/SCM
+    /// (campo BOOTSTRAP; assente = WinRM primario + fallback SMB).
+    #[arg(long)]
+    pub bootstrap: Option<String>,
 }
 
 impl EnvFields {
@@ -588,6 +597,9 @@ impl EnvFields {
         }
         if let Some(v) = &self.ssh_user {
             out.push(("SSH_USER", v.clone()));
+        }
+        if let Some(v) = &self.bootstrap {
+            out.push(("BOOTSTRAP", v.clone()));
         }
         out
     }

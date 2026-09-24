@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use winrm_rs::WinrmError;
 
+use crate::bootstrap_smb;
 use crate::bootstrap_ssh;
 use crate::deploy;
 use crate::envs;
@@ -61,27 +62,178 @@ pub fn winrm_unreachable() -> bool {
     WINRM_UNREACHABLE.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostica evidence-based del bootstrap Windows (spec smb-scm §3).
+// "Enable-PSRemoting -Force" come unica risposta a un connect error era
+// fuorviante su H166 (host vivo, SMB operativo, WinRM fermo): la probe TCP
+// distingue host giu' / porta filtrata / servizio fermo / canale alternativo.
+// ---------------------------------------------------------------------------
+
+/// Stato di una porta TCP remota dopo una probe di connect.
+/// La distinzione refused/timeout e' diagnostica: refused (RST) = host
+/// vivo senza listener; timeout/drop = firewall o host giu'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortState {
+    /// Connect riuscita: listener attivo.
+    Open,
+    /// RST immediato: host vivo, nessun listener sulla porta.
+    Refused,
+    /// Timeout o errore di rete: SYN filtrato oppure host irraggiungibile.
+    Filtered,
+}
+
+impl PortState {
+    fn label(self) -> &'static str {
+        match self {
+            PortState::Open => "aperta",
+            PortState::Refused => "chiusa (refused: host vivo, nessun listener)",
+            PortState::Filtered => "filtrata/irraggiungibile (timeout)",
+        }
+    }
+}
+
+/// Probe TCP singola con timeout 3s. Connect riuscita = Open, RST =
+/// Refused, qualunque altro esito (timeout incluso) = Filtered.
+async fn tcp_probe(host: &str, port: u16) -> PortState {
+    let target = format!("{}:{}", host, port);
+    let connect = TcpStream::connect(target);
+    let timed = tokio::time::timeout(Duration::from_secs(3), connect).await;
+    match timed {
+        Ok(Ok(_stream)) => PortState::Open,
+        Ok(Err(e)) => {
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                PortState::Refused
+            } else {
+                PortState::Filtered
+            }
+        }
+        Err(_) => PortState::Filtered,
+    }
+}
+
+/// Evidenza della probe TCP sui canali di management, formattata per i
+/// messaggi utente. Conservata qui perche' final_connect_error (main.rs)
+/// la riporta nel messaggio finale — l'evidenza raccolta, non il
+/// remediation generico (spec §3.3).
+static MGMT_EVIDENCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Il blocco "TCP porta: stato" raccolto dall'ultima probe, se eseguita.
+pub fn mgmt_evidence() -> Option<String> {
+    let guard = match MGMT_EVIDENCE.lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    guard.clone()
+}
+
+/// Esito della probe TCP dei canali di management del remote: porta del
+/// server (CLIENT_PORT), SMB/SCM (445), WinRM (PORT).
+struct MgmtProbe {
+    server_port: u16,
+    server: PortState,
+    smb: PortState,
+    winrm_port: u16,
+    winrm: PortState,
+}
+
+impl MgmtProbe {
+    /// Blocco "TCP porta: stato" per i messaggi utente (spec §3.3).
+    fn render(&self) -> String {
+        let mut ev = String::new();
+        use std::fmt::Write;
+        let _ = writeln!(
+            ev,
+            "       TCP {} (server):  {}",
+            self.server_port,
+            self.server.label()
+        );
+        let _ = writeln!(ev, "       TCP 445 (SMB/SCM): {}", self.smb.label());
+        let _ = write!(
+            ev,
+            "       TCP {} (WinRM):    {}",
+            self.winrm_port,
+            self.winrm.label()
+        );
+        ev
+    }
+
+    /// Diagnosi sintetica dagli stati delle tre porte (matrice spec §3.2):
+    /// evidence-based, mai "Enable-PSRemoting" come unica risposta.
+    fn diagnosis(&self) -> &'static str {
+        if self.smb == PortState::Open {
+            // Host vivo, canale alternativo disponibile: il bootstrap lo
+            // usa come fallback automatico (o forzato con BOOTSTRAP=smb).
+            return "host VIVO e SMB/SCM raggiungibile: il bootstrap provera' \
+                    il canale SMB/SCM automaticamente (campo BOOTSTRAP=smb \
+                    per forzarlo). WinRM resta spento/filtrato.";
+        }
+        if self.winrm == PortState::Refused {
+            return "servizio WinRM fermo (RST: host vivo, nessun listener): \
+                    'Start-Service WinRM' + 'Set-Service WinRM -StartupType \
+                    Automatic' (le regole firewall esistono gia').";
+        }
+        if self.server == PortState::Open
+            || self.smb == PortState::Refused
+            || self.winrm == PortState::Refused
+        {
+            // Qualcosa risponde con RST: host vivo ma management filtrato.
+            return "host parzialmente raggiungibile ma i canali di management \
+                    (SMB 445 / WinRM) sono filtrati — verificare firewall/GPO.";
+        }
+        "host non raggiungibile (nessuna porta management risponde): verificare \
+         che sia acceso/connesso — 'Enable-PSRemoting' non basta."
+    }
+}
+
+/// Probe TCP dei canali di management del remote. Sequenziali — niente
+/// probe parallele (best-practice: ridurre il traffico verso il server);
+/// ogni probe ha timeout 3s, costo peggiore ~9s su host morto. Eseguita
+/// una sola volta per processo (dedup HINT_PRINTED nel chiamante).
+async fn probe_management_channels(host: &str, winrm_port: u16) -> MgmtProbe {
+    let server_port = server_tcp_port();
+
+    let server = tcp_probe(host, server_port).await;
+    let smb = tcp_probe(host, 445).await;
+    let winrm = tcp_probe(host, winrm_port).await;
+
+    MgmtProbe {
+        server_port,
+        server,
+        smb,
+        winrm_port,
+        winrm,
+    }
+}
+
 /// Stampa una volta il remediation per WinRM non abilitato sull'host remoto.
 /// Se l'ambiente punta a un remote Unix (EXE_PATH unix-style o OS=linux)
 /// il messaggio WinRM sarebbe fuorviante: su quell'host WinRM non esistera'
 /// MAI — il canale di bootstrap corretto e' SSH (bug B2).
-fn print_psremoting_hint(host: &str, port: u16) {
+/// Su remote Windows la diagnosi e' evidence-based (probe TCP, spec §3).
+async fn print_psremoting_hint(host: &str, port: u16) {
     if HINT_PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!();
-    eprintln!("[HINT] Endpoint WinRM {}:{} non raggiungibile (servizio non attivo o firewall).", host, port);
     if remote_is_unix() {
+        eprintln!("[HINT] Endpoint WinRM {}:{} non raggiungibile (servizio non attivo o firewall).", host, port);
         eprintln!("       L'ambiente attivo punta a un remote Linux/Unix: WinRM non e'");
         eprintln!("       applicabile — il bootstrap usa SSH (campi SSH_HOST/SSH_USER/SSH_PORT,");
         eprintln!("       auth a chiavi/agent; vedi 'crosspilot env show').");
-    } else {
-        eprintln!("       Sulla macchina Windows remota, da PowerShell come amministratore:");
         eprintln!();
-        eprintln!("         Enable-PSRemoting -Force");
-        eprintln!();
-        eprintln!("       (crea il listener 5985 e le regole firewall; alternativa: winrm quickconfig)");
+        return;
     }
+
+    // Probe evidence-based sui tre canali prima del remediation.
+    let probe = probe_management_channels(host, port).await;
+    let evidence = probe.render();
+    let diagnosis = probe.diagnosis();
+    if let Ok(mut guard) = MGMT_EVIDENCE.lock() {
+        *guard = Some(format!("{}\n       Diagnosi: {}", evidence, diagnosis));
+    }
+    eprintln!("[HINT] Bootstrap Windows fallito su {}.", host);
+    eprintln!("{}", evidence);
+    eprintln!("       Diagnosi: {}", diagnosis);
     eprintln!();
 }
 
@@ -91,13 +243,13 @@ fn print_psremoting_hint(host: &str, port: u16) {
 /// il chiamante puo' saltare i tentativi successivi e passare al polling.
 /// Il transport ritenta gia' internamente gli errori HTTP transitori
 /// (send_soap_with_retry): un Http surfato qui e' quindi un fallimento reale.
-fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool {
+async fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) -> bool {
     eprintln!("[ERROR] bootstrap_server: {} fallito: {}", ctx, e);
     match e {
         WinrmError::Http(err) => {
             if err.is_connect() || err.is_timeout() {
                 WINRM_UNREACHABLE.store(true, Ordering::Relaxed);
-                print_psremoting_hint(host, port);
+                print_psremoting_hint(host, port).await;
             }
             true
         }
@@ -143,6 +295,27 @@ struct WinrmCtx {
     schtasks_user: String,
 }
 
+/// Split delle credenziali raw in (username, dominio NetBIOS): gestisce
+/// sia "DOMAIN\user" sia "user@domain" (UPN — il dominio NTLM viene
+/// comunque auto-rilevato dal challenge Type 2, il suffisso DNS va solo
+/// rimosso dal campo username). pub(crate): condiviso da winrm_context e
+/// dal canale SMB/SCM (bootstrap_smb, stessa auth NTLMv2).
+pub(crate) fn split_domain_user(raw: &str) -> (String, String) {
+    if let Some(pos) = raw.rfind('@') {
+        let user_part = raw[..pos].to_string();
+        let domain_dns = raw[pos + 1..].to_string();
+        eprintln!("[DEBUG] split credenziali: UPN user={} domain_dns={}", user_part, domain_dns);
+        (user_part, String::new())
+    } else if let Some(pos) = raw.rfind('\\') {
+        let domain_part = raw[..pos].to_string();
+        let user_part = raw[pos + 1..].to_string();
+        eprintln!("[DEBUG] split credenziali: DOMAIN\\user user={} domain={}", user_part, domain_part);
+        (user_part, domain_part)
+    } else {
+        (raw.to_string(), String::new())
+    }
+}
+
 /// Risolve le credenziali/endpoint WinRM dal .env (catena ambienti) e
 /// costruisce il client. Condiviso da bootstrap_server e channel_probe.
 fn winrm_context() -> Result<WinrmCtx> {
@@ -154,22 +327,7 @@ fn winrm_context() -> Result<WinrmCtx> {
     // Split dello username UPN (user@domain) in username + dominio NetBIOS.
     // NTLM usa il dominio NetBIOS (es. AC-S-SRL), non il DNS (es. ac-s-srl.it):
     // il suffisso @ va rimosso dal campo username dell'autenticazione.
-    let (winrm_user, winrm_domain) = if let Some(pos) = winrm_user_raw.rfind('@') {
-        let user_part = winrm_user_raw[..pos].to_string();
-        // Il dominio NTLM viene comunque auto-rilevato dal challenge Type 2:
-        // non serve convertire il DNS domain in NetBIOS.
-        let _domain_dns = winrm_user_raw[pos + 1..].to_string();
-        eprintln!("[DEBUG] winrm_context: split UPN user={} domain_dns={}", user_part, _domain_dns);
-        (user_part, String::new())
-    } else if let Some(pos) = winrm_user_raw.rfind('\\') {
-        // Formato DOMAIN\user.
-        let domain_part = winrm_user_raw[..pos].to_string();
-        let user_part = winrm_user_raw[pos + 1..].to_string();
-        eprintln!("[DEBUG] winrm_context: split DOMAIN\\user user={} domain={}", user_part, domain_part);
-        (user_part, domain_part)
-    } else {
-        (winrm_user_raw.clone(), String::new())
-    };
+    let (winrm_user, winrm_domain) = split_domain_user(&winrm_user_raw);
 
     // Parsing della porta WinRM (default 5985 per HTTP).
     let port = winrm_port_str.parse::<u16>().unwrap_or(5985);
@@ -228,18 +386,25 @@ pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
         };
         return bootstrap_ssh::probe(&exe_path).await;
     }
-    let ctx = match winrm_context() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[update-fallback] preflight: configurazione WinRM non valida: {}", e);
-            return None;
-        }
-    };
     let exe_path = match envs::var("EXE_PATH") {
         Some(p) => p,
         None => {
             eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
             return None;
+        }
+    };
+    // Remote Windows: BOOTSTRAP=smb forza il preflight SMB/SCM (WinRM
+    // intenzionalmente off — spec smb-scm §1.3). Altrimenti WinRM
+    // primario, con fallback automatico sul canale SMB quando WinRM non
+    // risponde.
+    if bootstrap_smb::channel_forced() {
+        return bootstrap_smb::probe(&exe_path).await;
+    }
+    let ctx = match winrm_context() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[update-fallback] preflight: configurazione WinRM non valida: {}", e);
+            return bootstrap_smb::probe(&exe_path).await;
         }
     };
     match deploy::remote_build_info(&ctx.client, &ctx.host, &exe_path).await {
@@ -252,7 +417,8 @@ pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
         }
         Err(e) => {
             eprintln!("[update-fallback] preflight WinRM fallito: {}", e);
-            None
+            eprintln!("[update-fallback] tento preflight sul canale SMB/SCM...");
+            bootstrap_smb::probe(&exe_path).await
         }
     }
 }
@@ -273,6 +439,15 @@ pub async fn bootstrap_server() -> Result<()> {
     // unix-style o campo OS=linux (bug B3).
     if remote_is_unix() {
         return bootstrap_ssh::bootstrap_server(&exe_path).await;
+    }
+
+    // Selezione canale su remote Windows (spec smb-scm §1.3):
+    // BOOTSTRAP=smb forza SMB/SCM come primario — per host dove WinRM
+    // e' volutamente spento (es. H166) evita il timeout 5985 del path
+    // WinRM e il suo fallback.
+    if bootstrap_smb::channel_forced() {
+        eprintln!("[bootstrap] BOOTSTRAP=smb: canale SMB/SCM forzato (WinRM saltato).");
+        return bootstrap_smb::bootstrap_server(&exe_path).await;
     }
 
     // --- Credenziali e endpoint WinRM (da .env) ---
@@ -379,7 +554,7 @@ pub async fn bootstrap_server() -> Result<()> {
             }
         }
         Err(e) => {
-            winrm_dead = report_winrm_error("remote_build_info", &e, &host, winrm_port);
+            winrm_dead = report_winrm_error("remote_build_info", &e, &host, winrm_port).await;
             // Se non riusciamo a verificare, proviamo ad avviare comunque
             // (il server potrebbe essere già in esecuzione).
         }
@@ -502,7 +677,7 @@ pub async fn bootstrap_server() -> Result<()> {
             // Connessione WinRM fallita (rete, credenziali, servizio non attivo).
             // Non ritorniamo errore: il server potrebbe essere già in esecuzione.
             // Il chiamante ritenterà la connessione TCP fino a max_attempts.
-            report_winrm_error("comando WinRM", &e, &host, winrm_port);
+            report_winrm_error("comando WinRM", &e, &host, winrm_port).await;
         }
     }
     }
@@ -517,7 +692,13 @@ pub async fn bootstrap_server() -> Result<()> {
     // ChannelUnreachable fa interrompere subito il retry loop di
     // connect_and_handshake: prima questo caso bruciava ~40s x 5 attempt.
     if winrm_dead || WINRM_UNREACHABLE.load(Ordering::Relaxed) {
-        return Err(ChannelUnreachable("WinRM").into());
+        // Fallback automatico sul canale SMB/SCM (spec smb-scm §1.3): se
+        // TCP 445 e' raggiungibile il bootstrap prosegue senza WinRM —
+        // upload su C$ + esecuzione via Service Control Manager.
+        // Se anche SMB e' morto bootstrap_smb ritorna ChannelUnreachable
+        // e il fail-fast del retry loop si conserva identico.
+        eprintln!("[bootstrap] WinRM irraggiungibile: fallback sul canale SMB/SCM...");
+        return bootstrap_smb::bootstrap_server(&exe_path).await;
     }
 
     // --- Polling: verifica che il server TCP sia effettivamente partito ---
@@ -674,4 +855,50 @@ pub(crate) async fn poll_server_startup() -> bool {
     }
     eprintln!("Warning: server did not come up within 30s after bootstrap.");
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(server: PortState, smb: PortState, winrm: PortState) -> MgmtProbe {
+        MgmtProbe {
+            server_port: 5330,
+            server,
+            smb,
+            winrm_port: 5985,
+            winrm,
+        }
+    }
+
+    #[test]
+    fn mgmt_diagnosis_matrix() {
+        // SMB aperta -> canale alternativo (mai "Enable-PSRemoting" secco).
+        let d = probe(PortState::Filtered, PortState::Open, PortState::Filtered);
+        assert!(d.diagnosis().contains("SMB/SCM raggiungibile"));
+        assert!(d.diagnosis().contains("BOOTSTRAP=smb"));
+
+        // WinRM refused + SMB morta -> servizio WinRM fermo.
+        let d = probe(PortState::Filtered, PortState::Filtered, PortState::Refused);
+        assert!(d.diagnosis().contains("WinRM fermo"));
+
+        // Qualcosa refused ma niente management utile -> host parziale.
+        let d = probe(PortState::Open, PortState::Refused, PortState::Filtered);
+        assert!(d.diagnosis().contains("filtrati"));
+
+        // Tutto filtrato -> host irraggiungibile.
+        let d = probe(PortState::Filtered, PortState::Filtered, PortState::Filtered);
+        assert!(d.diagnosis().contains("non raggiungibile"));
+    }
+
+    #[test]
+    fn mgmt_render_shape() {
+        let ev = probe(PortState::Filtered, PortState::Open, PortState::Refused).render();
+        assert!(ev.contains("TCP 5330 (server):"));
+        assert!(ev.contains("TCP 445 (SMB/SCM):"));
+        assert!(ev.contains("TCP 5985 (WinRM):"));
+        assert!(ev.contains("aperta"));
+        assert!(ev.contains("chiusa (refused"));
+        assert!(ev.contains("filtrata"));
+    }
 }

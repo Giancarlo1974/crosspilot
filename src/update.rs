@@ -797,7 +797,9 @@ fn inbound_allow_cmd(remote_os: version::RemoteOs, port: u16) -> String {
 /// `crosspilot-server-<porta>` via netsh delete-then-add. La delete rende
 /// l'add privo di duplicati e le keyword netsh sono in inglese su ogni
 /// locale -> indipendente dalla lingua del remote.
-fn windows_inbound_allow_cmd(port: u16) -> String {
+/// pub(crate): riusato dal canale SMB/SCM (bootstrap_smb, stessa regola
+/// via servizio transitorio) e da ensure_inbound_allow_local.
+pub(crate) fn windows_inbound_allow_cmd(port: u16) -> String {
     let name = format!("crosspilot-server-{}", port);
     format!(
         "netsh advfirewall firewall delete rule name=\"{n}\" >nul 2>&1 & \
@@ -838,6 +840,61 @@ pub(crate) fn linux_inbound_allow_script(port: u16) -> String {
          else echo FW=none; fi",
         p = port
     )
+}
+
+/// Self-ensure della regola firewall inbound all'avvio del SERVER
+/// (spec smb-scm §2). Le regole create dal client durante update o
+/// bootstrap possono sparire DOPO (GPO refresh, cleanup admin,
+/// reinstallazione firewall): un server che binda ma e' filtrato e'
+/// indistinguibile da uno spento visto dal client. Il server gira
+/// tipicamente elevato (SYSTEM via schtasks/SCM, root via setsid) e
+/// puo' riassicurare la regola da se'.
+///
+/// Usa la STESSA coppia di comandi del macro-blocco remoto: netsh
+/// delete-then-add su Windows, cascata ufw->firewalld->iptables->nft
+/// su unix. Eseguita localmente (cmd /C | sh -c), best-effort: mai
+/// fatale, una riga di log registra l'esito.
+pub async fn ensure_inbound_allow_local(port: u16) {
+    #[cfg(target_os = "windows")]
+    {
+        let cmd = windows_inbound_allow_cmd(port);
+        let out = tokio::process::Command::new("cmd")
+            .args(["/C", &cmd])
+            .output()
+            .await;
+        match out {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let trimmed = stdout.trim();
+                if trimmed.is_empty() {
+                    eprintln!("[server] firewall self-ensure: regola applicata (netsh, nessun output)");
+                } else {
+                    eprintln!("[server] firewall self-ensure: {}", trimmed);
+                }
+            }
+            Err(e) => {
+                eprintln!("[server] WARNING firewall self-ensure fallito: {}", e);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let script = linux_inbound_allow_script(port);
+        let out = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .await;
+        match out {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                eprintln!("[server] firewall self-ensure: {}", stdout.trim());
+            }
+            Err(e) => {
+                eprintln!("[server] WARNING firewall self-ensure fallito: {}", e);
+            }
+        }
+    }
 }
 
 /// BLOCCO 5 (server legacy): comando shell che spawna l'updater FUORI

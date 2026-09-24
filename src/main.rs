@@ -28,6 +28,10 @@ mod sync_server;
 mod bootstrap;
 // Bootstrap via SSH per remote Linux/Unix (speculare a bootstrap.rs WinRM).
 mod bootstrap_ssh;
+// Bootstrap via SMB/SCM per remote Windows senza WinRM
+// (docs/smb-scm-bootstrap-spec.md; deploy separato per dimensione).
+mod bootstrap_smb;
+mod bootstrap_smb_deploy;
 mod deploy;
 // Modulo ambienti host multipli nel .env (CRUD via sottocomando `env`).
 mod envs;
@@ -122,7 +126,8 @@ mod win_job {
       CROSSPILOT_<NAME>_<FIELD> (e.g. CROSSPILOT_PROD_HOST). CROSSPILOT_ENV selects\n\
       the active one; unprefixed keys are the fallback for missing fields.\n\
       Fields: HOST PORT USER PASS EXE_PATH CLIENT_PORT SERVER_PORT\n\
-      LOG_PATH ERR_PATH SEGMENT_SIZE OS SSH_HOST SSH_PORT SSH_USER.\n\
+      LOG_PATH ERR_PATH SEGMENT_SIZE OS SSH_HOST SSH_PORT SSH_USER\n\
+      BOOTSTRAP (=smb: SMB/SCM channel for Windows remotes without WinRM).\n\
       Manage them with: crosspilot env list|show|add|set|remove|use\n\
       (details: crosspilot env -h / crosspilot env <action> -h)\n\n\
     Usage:\n\
@@ -501,6 +506,14 @@ async fn server_mode(port: u16) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     println!("Server listening on {}", addr);
+
+    // Self-ensure firewall inbound (spec smb-scm §2): le regole create
+    // dal client durante bootstrap/update possono sparire dopo (GPO
+    // refresh, cleanup admin). Un server che binda ma e' filtrato e'
+    // indistinguibile da uno spento: il server — che gira elevato —
+    // riassicura la regola da se' ad OGNI avvio (anche quelli via
+    // updater). Best-effort, mai fatale.
+    update::ensure_inbound_allow_local(actual_port).await;
 
     // Self-describing: (ri)scrive crosspilot.ver (ts + hash exe + sidecar)
     // e ripulisce gli artefatti staged/residui dell'auto-update via TCP.
@@ -944,14 +957,28 @@ fn final_connect_error(addr: &str) -> anyhow::Error {
             addr
         );
     }
-    if bootstrap::winrm_unreachable() {
-        return anyhow::anyhow!(
+    if bootstrap::winrm_unreachable() || bootstrap_smb::smb_unreachable() {
+        // Remote Windows: il bootstrap ha provato i canali di management
+        // (WinRM, poi SMB/SCM in fallback o forzato). Il messaggio finale
+        // riporta l'EVIDENZA delle probe TCP raccolta dal hint (spec
+        // smb-scm §3.3) — non il remediation generico "Enable-PSRemoting"
+        // che su H166 era fuorviante (host vivo, SMB operativo).
+        let mut msg = format!(
             "Failed to connect to {} after bootstrap attempts.\n\
-             WinRM non raggiungibile sull'host remoto. Per abilitarlo, sulla macchina\n\
-             Windows eseguire da PowerShell come amministratore:\n  Enable-PSRemoting -Force\n\
-             (oppure: winrm quickconfig)",
+             Canali di bootstrap non utilizzabili sull'host remoto (WinRM e/o SMB/SCM).",
             addr
         );
+        if let Some(evidence) = bootstrap::mgmt_evidence() {
+            msg.push_str("\nEvidenza probe TCP:\n");
+            msg.push_str(&evidence);
+        }
+        msg.push_str(
+            "\nRemediation: se SMB (445) risponde il canale SMB/SCM e' attivo \
+             (campo BOOTSTRAP=smb per forzarlo); altrimenti abilitare WinRM \
+             sulla macchina remota (Enable-PSRemoting -Force / winrm quickconfig) \
+             o verificare che l'host sia acceso e raggiungibile.",
+        );
+        return anyhow::anyhow!(msg);
     }
     if update::update_attempted() {
         // Se e' partito un update e il server non e' mai tornato, il
