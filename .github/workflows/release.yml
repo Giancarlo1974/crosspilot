@@ -20,6 +20,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Storia completa + tag: build.rs deriva la versione semver da
+          # `git describe --match 'v[0-9]*'` (auto-incremento dopo il tag).
+          fetch-depth: 0
 
       - name: Install Rust toolchain + cross targets
         uses: dtolnay/rust-toolchain@stable
@@ -49,9 +53,12 @@ jobs:
             # Rolling prerelease: tag fisso 'latest', asset sovrascritti
             # ad ogni push su main. I client che puntano a 'latest'
             # ricevono sempre il build piu' recente.
+            # Il nome include la versione da git describe (es. 1.0.0-6-gabc1234):
+            # e' lo stesso valore che --version mostrera' nel binario.
+            VER=$(git describe --tags --match 'v[0-9]*' --always 2>/dev/null | sed 's/^v//')
             echo "tag=latest" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "name=latest (rolling build ${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+            echo "name=latest (rolling ${VER:-build ${GITHUB_SHA::7}})" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload linux client (gnu, embeds completi)

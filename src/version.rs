@@ -51,11 +51,14 @@ pub const LINUX_SIDECAR_NAME: &str = "crosspilot.linux";
 pub const VER_FILE_NAME: &str = "crosspilot.ver";
 
 /// Stringa versione stampata da --version (clap) e usata nel functional
-/// check post-deploy: formato "0.1.0+<ts> (<target>)".
+/// check post-deploy: formato "<semver>+<ts> (<target>)", dove semver
+/// e' derivata da `git describe --match 'v[0-9]*'` in build.rs (es.
+/// "1.0.0" sul tag, "1.0.0-6-gabc123" sei commit dopo) con fallback a
+/// CARGO_PKG_VERSION fuori da un clone git.
 /// &'static str perche' Command::version() richiede IntoResettable<Str>
-/// (String non implementato). Esempio: "0.1.0+1758530400 (x86_64-pc-windows-gnu)".
+/// (String non implementato). Esempio: "1.0.0+1758530400 (x86_64-pc-windows-gnu)".
 pub const VERSION_STR: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
+    env!("CROSSPILOT_VERSION"),
     "+",
     env!("CROSSPILOT_BUILD_TS"),
     " (",

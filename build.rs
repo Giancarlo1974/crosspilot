@@ -53,6 +53,29 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=CROSSPILOT_TARGET={}", target);
 
+    // --- Versione semver ---
+    // Priorita': CROSSPILOT_VERSION (override manuale/CI), poi
+    // `git describe --tags --match 'v[0-9]*' --always --dirty`:
+    //   tag esatto          "v1.0.0"         -> "1.0.0"
+    //   N commit dopo il tag "v1.0.0-6-gabc" -> "1.0.0-6-gabc"
+    //   working dir dirty                    -> suffisso "-dirty"
+    // Fallback: CARGO_PKG_VERSION (build fuori da un clone git, es.
+    // source tarball della release). Il tag rolling 'latest' e' escluso
+    // dal --match: altrimenti shadowerebbe i tag v*.
+    let version = env::var("CROSSPILOT_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| git_describe_version(&manifest_dir))
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()));
+    println!("cargo:rustc-env=CROSSPILOT_VERSION={}", version);
+    println!("cargo:rerun-if-env-changed=CROSSPILOT_VERSION");
+    // Re-describe ad ogni commit/checkout (HEAD cambia): senza questo
+    // watcher cargo cacherebbe la versione del build precedente.
+    let head = PathBuf::from(&manifest_dir).join(".git").join("HEAD");
+    if head.is_file() {
+        println!("cargo:rerun-if-changed={}", head.display());
+    }
+
     // --- Asset exe Windows opzionale ---
     // assets/crosspilot.exe e' prodotto da build-release.sh (cross mingw).
     // Se manca (build dev), stub vuoto: update.rs skippa l'upload PE.
@@ -99,4 +122,34 @@ fn main() {
     // diretto su assets/crosspilot.exe, che fa da trigger implicito).
     println!("cargo:rerun-if-changed=assets/crosspilot.linux");
     println!("cargo:rerun-if-changed=assets/crosspilot.exe");
+}
+
+/// `git describe --tags --match 'v[0-9]*' --always --dirty` normalizzato
+/// in semver (strip del 'v' iniziale). None se git manca, la dir non e'
+/// un clone, o l'output e' solo uno short sha (--always senza alcun tag
+/// v*: non e' una versione, si preferisce il fallback CARGO_PKG_VERSION).
+fn git_describe_version(manifest_dir: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            manifest_dir,
+            "describe",
+            "--tags",
+            "--match",
+            "v[0-9]*",
+            "--always",
+            "--dirty",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let v = raw.strip_prefix('v').unwrap_or(&raw);
+    if v.chars().next()?.is_ascii_digit() {
+        Some(v.to_string())
+    } else {
+        None
+    }
 }
