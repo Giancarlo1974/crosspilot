@@ -436,9 +436,12 @@ async fn deploy_exe(
         }
         Dialect::PowerShell => {
             let win_path = update::remote_join(&dir, "crosspilot.exe");
-            if exe_path == win_path {
+            if update::same_remote_path(exe_path, &win_path) {
                 // EXE_PATH e' gia' crosspilot.exe: l'exe deployato E'
-                // l'artefatto scaricabile, niente copia.
+                // l'artefatto scaricabile, niente copia. Il confronto e'
+                // normalizzato: con EXE_PATH="C:\crosspilot.exe" remote_join
+                // produce "C:/crosspilot.exe" e l'uguaglianza letterale
+                // falliva -> Copy-Item del file su se stesso (bug H166).
                 eprintln!("[deploy-ssh] exe e' gia' l'artefatto crosspilot.exe. Skip copia.");
             } else {
                 let out =

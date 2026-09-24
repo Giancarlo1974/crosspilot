@@ -2506,6 +2506,17 @@ pub(crate) fn remote_join(dir: &str, name: &str) -> String {
     format!("{}{}{}", dir.trim_end_matches(['\\', '/']), sep, name)
 }
 
+/// Stesso file remoto? Confronto per path WINDOWS: separatori
+/// normalizzati ('\\' -> '/') + case-insensitive (FAT/NTFS lo sono).
+/// Necessario perche' remote_join emette '/' quando il parent e' una
+/// root nuda ("C:") mentre EXE_PATH arriva con '\': "C:\crosspilot.exe"
+/// e "C:/crosspilot.exe" sono lo stesso file. NON usare su path unix
+/// (case-sensitive).
+pub(crate) fn same_remote_path(a: &str, b: &str) -> bool {
+    a.replace('\\', "/")
+        .eq_ignore_ascii_case(&b.replace('\\', "/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2540,6 +2551,15 @@ mod tests {
         assert_eq!(remote_join(r"C:\ci", "crosspilot-1.exe"), r"C:\ci\crosspilot-1.exe");
         assert_eq!(remote_join("/tmp/remote", "crosspilot-1"), "/tmp/remote/crosspilot-1");
         assert_eq!(remote_join(r"C:\ci\", "x"), r"C:\ci\x");
+    }
+
+    #[test]
+    fn same_remote_path_normalizza_separatori_e_case() {
+        // Bug H166: EXE_PATH="C:\crosspilot.exe" vs remote_join -> "C:/crosspilot.exe".
+        assert!(same_remote_path(r"C:\crosspilot.exe", "C:/crosspilot.exe"));
+        assert!(same_remote_path(r"C:\CI\CrossPilot.EXE", r"c:\ci\crosspilot.exe"));
+        assert!(!same_remote_path(r"C:\crosspilot.exe", r"C:\other.exe"));
+        assert!(!same_remote_path("/opt/crosspilot", "/opt/other"));
     }
 
     #[test]
