@@ -1688,8 +1688,9 @@ async fn relaunch_server(
 /// osservato in vivo su H166: il delete immediato uccideva il server
 /// rilanciato ~1s dopo il bind). Il task resta registrato come launcher
 /// — trigger ONCE/00:00 nel passato, non riparte da solo.
-/// Cascata identica a bootstrap::start_server: `/RU SYSTEM /RL HIGHEST`,
-/// poi `/RU <USERNAME> /NP /RL HIGHEST` (S4U, niente logon interattivo),
+/// Cascata identica a bootstrap::schtasks_start_script (condivisa anche
+/// col canale SSH-win): `/RU SYSTEM /RL HIGHEST`, poi
+/// `/RU <USERNAME> /NP /RL HIGHEST` (S4U, niente logon interattivo),
 /// poi task semplice dell'utente corrente. Ogni tentativo e' loggato.
 #[cfg(target_os = "windows")]
 async fn schtasks_spawn_local(

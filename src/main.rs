@@ -24,10 +24,18 @@ mod transfer;
 mod sync;
 // Handler server per sync (separato da sync.rs per dimensione, best-practice < 1000 righe).
 mod sync_server;
-// Modulo bootstrap WinRM (separato da main.rs per dimensione, best-practice < 1000 righe).
+// Modulo bootstrap: selezione canale (prescan+candidati) + path WinRM
+// (separato da main.rs per dimensione, best-practice < 1000 righe).
 mod bootstrap;
-// Bootstrap via SSH per remote Linux/Unix (speculare a bootstrap.rs WinRM).
+// Prescan TCP delle porte management + lista candidati ordinata
+// (docs/ssh-unified-prescan-bootstrap-spec.md §2).
+mod bootstrap_prescan;
+// Trasporto SSH unificato su russh+russh-sftp (spec §1.3).
+mod ssh_transport;
+// Bootstrap via SSH unificato (remote unix E Windows — dialetti in
+// bootstrap_ssh_cmds, spec §1.4).
 mod bootstrap_ssh;
+mod bootstrap_ssh_cmds;
 // Bootstrap via SMB/SCM per remote Windows senza WinRM
 // (docs/smb-scm-bootstrap-spec.md; deploy separato per dimensione).
 mod bootstrap_smb;
@@ -944,39 +952,53 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
 /// l'endpoint WinRM irraggiungibile, allega il remediation (abilitare WinRM
 /// sull'host remoto) invece del messaggio generico.
 fn final_connect_error(addr: &str) -> anyhow::Error {
-    // Remote Unix/Linux: il canale di bootstrap e' SSH (mai WinRM) —
-    // suggerire Enable-PSRemoting sarebbe fuorviante (bug B2).
+    // Remote Unix/Linux: il canale di bootstrap e' SSH unificato (russh —
+    // mai WinRM). L'evidenza del prescan (incl. porta SSH) e l'ultimo
+    // errore reale vanno sempre allegati (spec ssh-unified §2.4).
     if bootstrap::remote_is_unix() {
-        return anyhow::anyhow!(
+        let mut msg = format!(
             "Failed to connect to {} after bootstrap attempt.\n\
              Remote Linux/Unix (EXE_PATH unix-style o OS=linux): bootstrap SSH fallito.\n\
-             Verificare a mano: ssh -p <SSH_PORT> <SSH_USER>@<HOST>\n\
-             (BatchMode attivo: accettare l'host key con una connessione manuale\n\
-             e configurare l'auth a chiavi/agent; campi SSH_HOST/SSH_PORT/SSH_USER\n\
-             dell'ambiente, vedi 'crosspilot env show').",
-            addr
-        );
-    }
-    if bootstrap::winrm_unreachable() || bootstrap_smb::smb_unreachable() {
-        // Remote Windows: il bootstrap ha provato i canali di management
-        // (WinRM, poi SMB/SCM in fallback o forzato). Il messaggio finale
-        // riporta l'EVIDENZA delle probe TCP raccolta dal hint (spec
-        // smb-scm §3.3) — non il remediation generico "Enable-PSRemoting"
-        // che su H166 era fuorviante (host vivo, SMB operativo).
-        let mut msg = format!(
-            "Failed to connect to {} after bootstrap attempts.\n\
-             Canali di bootstrap non utilizzabili sull'host remoto (WinRM e/o SMB/SCM).",
+             Campi SSH_HOST/SSH_PORT/SSH_USER/SSH_KEY/SSH_PASS dell'ambiente \
+             (vedi 'crosspilot env show'); auth a catena agent->key->password,\n\
+             host key verificata TOFU in crosspilot_known_hosts accanto al .env.",
             addr
         );
         if let Some(evidence) = bootstrap::mgmt_evidence() {
             msg.push_str("\nEvidenza probe TCP:\n");
             msg.push_str(&evidence);
         }
+        if let Some(e) = bootstrap::last_bootstrap_error() {
+            msg.push_str("\nUltimo errore: ");
+            msg.push_str(&e);
+        }
+        return anyhow::anyhow!(msg);
+    }
+    if bootstrap::winrm_unreachable() || bootstrap_smb::smb_unreachable() {
+        // Remote Windows: il bootstrap ha provato i canali di management
+        // (WinRM / SSH / SMB-SCM nell'ordine dettato dal prescan). Il
+        // messaggio finale riporta l'EVIDENZA delle probe TCP raccolta
+        // dal prescan (spec ssh-unified §2.4 + smb-scm §3.3) — non il
+        // remediation generico "Enable-PSRemoting" che su H166 era
+        // fuorviante (host vivo, SMB operativo).
+        let mut msg = format!(
+            "Failed to connect to {} after bootstrap attempts.\n\
+             Canali di bootstrap non utilizzabili sull'host remoto (WinRM, SSH, SMB/SCM).",
+            addr
+        );
+        if let Some(evidence) = bootstrap::mgmt_evidence() {
+            msg.push_str("\nEvidenza probe TCP:\n");
+            msg.push_str(&evidence);
+        }
+        if let Some(e) = bootstrap::last_bootstrap_error() {
+            msg.push_str("\nUltimo errore: ");
+            msg.push_str(&e);
+        }
         msg.push_str(
-            "\nRemediation: se SMB (445) risponde il canale SMB/SCM e' attivo \
-             (campo BOOTSTRAP=smb per forzarlo); altrimenti abilitare WinRM \
-             sulla macchina remota (Enable-PSRemoting -Force / winrm quickconfig) \
-             o verificare che l'host sia acceso e raggiungibile.",
+            "\nRemediation: il canale che risponde nell'evidenza e' utilizzabile \
+             (BOOTSTRAP=smb|ssh|winrm per forzarlo); altrimenti abilitare WinRM \
+             (Enable-PSRemoting -Force / winrm quickconfig) o OpenSSH sulla \
+             macchina remota, o verificare che l'host sia acceso e raggiungibile.",
         );
         return anyhow::anyhow!(msg);
     }

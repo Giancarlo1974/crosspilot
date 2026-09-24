@@ -43,12 +43,16 @@ const FIELDS: &[&str] = &[
     "SEGMENT_SIZE",
     "CLIENT_PORT",
     "SERVER_PORT",
-    // I campi SSH_* devono precedere HOST/PORT/USER: il match per suffisso
-    // farebbe altrimenti leggere CROSSPILOT_SSH_PORT come env "SSH" campo
-    // "PORT" invece del campo SSH_PORT non prefissato.
+    // I campi SSH_* devono precedere HOST/PORT/USER/PASS/KEY: il match per
+    // suffisso farebbe altrimenti leggere CROSSPILOT_SSH_PORT come env "SSH"
+    // campo "PORT" (idem SSH_PASS->PASS, SSH_HOST->HOST, SSH_KEY->KEY? no:
+    // KEY non e' un campo, ma per coerenza restano tutti qui sopra).
+    "SSH_INSECURE_NO_HOSTKEY",
     "SSH_PORT",
     "SSH_USER",
     "SSH_HOST",
+    "SSH_KEY",
+    "SSH_PASS",
     "EXE_PATH",
     "LOG_PATH",
     "ERR_PATH",
@@ -79,6 +83,9 @@ const FIELD_ORDER: &[&str] = &[
     "SSH_HOST",
     "SSH_PORT",
     "SSH_USER",
+    "SSH_KEY",
+    "SSH_PASS",
+    "SSH_INSECURE_NO_HOSTKEY",
     "BOOTSTRAP",
 ];
 
@@ -89,8 +96,9 @@ const FIELD_ORDER: &[&str] = &[
 ///   con la chiave non prefissata CROSSPILOT_SERVER_PORT;
 /// - CLIENT:  idem per CROSSPILOT_CLIENT_PORT;
 /// - DEFAULT: nome logico dell'ambiente non prefissato;
-/// - SSH:     CROSSPILOT_SSH_HOST/SSH_PORT/SSH_USER sono campi non prefissati:
-///   un env "SSH" vedrebbe le sue chiavi HOST/PORT/USER shadow-ate da essi.
+/// - SSH:     CROSSPILOT_SSH_HOST/SSH_PORT/SSH_USER/SSH_KEY/SSH_PASS/
+///   SSH_INSECURE_NO_HOSTKEY sono campi non prefissati: un env "SSH"
+///   vedrebbe le sue chiavi HOST/PORT/USER/KEY/PASS shadow-ate da essi.
 const RESERVED: &[&str] = &["ENV", "SERVER", "CLIENT", "DEFAULT", "SSH"];
 
 /// Chiave del selettore dell'ambiente attivo.
@@ -546,11 +554,23 @@ pub struct EnvFields {
     /// Porta SSH (campo SSH_PORT, default 22).
     #[arg(long)]
     pub ssh_port: Option<u16>,
-    /// Utente SSH (campo SSH_USER; default: utente locale di ssh).
+    /// Utente SSH (campo SSH_USER; default: utente di processo).
     #[arg(long)]
     pub ssh_user: Option<String>,
-    /// Canale bootstrap su remote Windows: "smb" forza SMB/SCM
-    /// (campo BOOTSTRAP; assente = WinRM primario + fallback SMB).
+    /// Path della chiave privata SSH (campo SSH_KEY; default:
+    /// agent + ~/.ssh/id_ed25519|id_rsa|id_ecdsa).
+    #[arg(long)]
+    pub ssh_key: Option<String>,
+    /// Password SSH (campo SSH_PASS; fallback PASS — mascherata in
+    /// `env show`, mai loggata).
+    #[arg(long)]
+    pub ssh_pass: Option<String>,
+    /// Disabilita la verifica TOFU della host key SSH, SOLO dev
+    /// (campo SSH_INSECURE_NO_HOSTKEY=1; warning esplicito ad ogni connect).
+    #[arg(long)]
+    pub ssh_insecure_no_hostkey: Option<String>,
+    /// Canale bootstrap su remote Windows: "smb"|"ssh"|"winrm" forza il
+    /// canale singolo (campo BOOTSTRAP; assente = lista ordinata dal prescan).
     #[arg(long)]
     pub bootstrap: Option<String>,
 }
@@ -597,6 +617,15 @@ impl EnvFields {
         }
         if let Some(v) = &self.ssh_user {
             out.push(("SSH_USER", v.clone()));
+        }
+        if let Some(v) = &self.ssh_key {
+            out.push(("SSH_KEY", v.clone()));
+        }
+        if let Some(v) = &self.ssh_pass {
+            out.push(("SSH_PASS", v.clone()));
+        }
+        if let Some(v) = &self.ssh_insecure_no_hostkey {
+            out.push(("SSH_INSECURE_NO_HOSTKEY", v.clone()));
         }
         if let Some(v) = &self.bootstrap {
             out.push(("BOOTSTRAP", v.clone()));
@@ -761,7 +790,9 @@ fn cmd_show(lines: &[String], name: &str, reveal: bool) -> Result<()> {
             ),
             (None, None) => ("-".to_string(), "(non impostato)".to_string()),
         };
-        let shown = if *field == "PASS" && !reveal && value != "-" {
+        // Le password (PASS e SSH_PASS) sono mascherate a meno di --reveal.
+        let is_secret = *field == "PASS" || *field == "SSH_PASS";
+        let shown = if is_secret && !reveal && value != "-" {
             "********".to_string()
         } else {
             value
@@ -934,6 +965,24 @@ mod tests {
         assert_eq!(
             parse_key("CROSSPILOT_SSH_HOST"),
             ParsedKey::Field(None, "SSH_HOST")
+        );
+        // Nuovi campi SSH della v1 unificata: SSH_PASS deve vincere sul
+        // suffisso _PASS, SSH_KEY e SSH_INSECURE_NO_HOSTKEY sono campi.
+        assert_eq!(
+            parse_key("CROSSPILOT_SSH_PASS"),
+            ParsedKey::Field(None, "SSH_PASS")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_SSH_KEY"),
+            ParsedKey::Field(None, "SSH_KEY")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_SSH_INSECURE_NO_HOSTKEY"),
+            ParsedKey::Field(None, "SSH_INSECURE_NO_HOSTKEY")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_PROD_SSH_PASS"),
+            ParsedKey::Field(Some("PROD".to_string()), "SSH_PASS")
         );
         assert_eq!(parse_key("CROSSPILOT_OS"), ParsedKey::Field(None, "OS"));
         // Prefissati: MYR + campo SSH_*/OS.

@@ -29,6 +29,16 @@ winrm-rs = "1.2.2"
 smb2-client = "0.2.5"
 ms-scmr = "0.1"
 
+# Canale SSH unificato (docs/ssh-unified-prescan-bootstrap-spec.md §1):
+# russh = client SSH2 puro Rust async (niente binario `ssh` di sistema,
+# niente FFI -> musl + windows-gnu ok); russh-sftp = sottosistema SFTP
+# per le file ops indipendenti dalla shell remota (decisivo su Windows).
+# default-features=false: i default attivano aws-lc-rs (cmake/C++, rischio
+# cross-compile) e flate2; "ring" e' il backend crypto gia' compilato per
+# musl via rustls, "rsa" serve per autenticare chiavi id_rsa esistenti.
+russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "3.0.0"
+
 [patch.crates-io]
 # PATCH LOCALE: winrm-rs 1.2.2 ha un bug in create_shell_request (soap/envelope.rs):
 # emette <wsman:OptionSet> FUORI da </s:Header>, producendo un envelope SOAP 1.2

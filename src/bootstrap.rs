@@ -1,5 +1,10 @@
-// Modulo bootstrap: avvia il server remoto su Windows via WinRM.
+// Modulo bootstrap: selezione del canale + bootstrap del server remoto.
 // Separato da main.rs per rispettare la best-practice < 1000 righe.
+//
+// Selezione del canale (spec ssh-unified §2): PRESCAN TCP delle porte
+// di management PRIMA di scegliere (bootstrap_prescan.rs), poi loop
+// sequenziale sui candidati ordinati — mai piu' un canale scoperto morto
+// pagando il timeout del protocollo.
 
 use anyhow::{Context, Result};
 use tokio::net::TcpStream;
@@ -7,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use winrm_rs::WinrmError;
 
-use crate::bootstrap_smb;
-use crate::bootstrap_ssh;
+use crate::bootstrap_prescan::{self, BootstrapChannel};
 use crate::deploy;
 use crate::envs;
 use crate::self_update;
+use crate::ssh_transport;
 use crate::version;
 
 /// Settato quando l'endpoint WinRM risulta irraggiungibile a livello TCP
@@ -63,175 +68,45 @@ pub fn winrm_unreachable() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostica evidence-based del bootstrap Windows (spec smb-scm §3).
-// "Enable-PSRemoting -Force" come unica risposta a un connect error era
-// fuorviante su H166 (host vivo, SMB operativo, WinRM fermo): la probe TCP
-// distingue host giu' / porta filtrata / servizio fermo / canale alternativo.
+// Diagnostica evidence-based del bootstrap (spec smb-scm §3 +
+// ssh-unified §2): "Enable-PSRemoting -Force" come unica risposta a un
+// connect error era fuorviante su H166 (host vivo, SMB operativo, WinRM
+// fermo). La probe TCP — ora eseguita UNA VOLTA dal prescan prima della
+// scelta del canale — distingue host giu' / porta filtrata / servizio
+// fermo / canale alternativo, su tutti i canali (WinRM, SMB, SSH).
 // ---------------------------------------------------------------------------
 
-/// Stato di una porta TCP remota dopo una probe di connect.
-/// La distinzione refused/timeout e' diagnostica: refused (RST) = host
-/// vivo senza listener; timeout/drop = firewall o host giu'.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PortState {
-    /// Connect riuscita: listener attivo.
-    Open,
-    /// RST immediato: host vivo, nessun listener sulla porta.
-    Refused,
-    /// Timeout o errore di rete: SYN filtrato oppure host irraggiungibile.
-    Filtered,
-}
-
-impl PortState {
-    fn label(self) -> &'static str {
-        match self {
-            PortState::Open => "aperta",
-            PortState::Refused => "chiusa (refused: host vivo, nessun listener)",
-            PortState::Filtered => "filtrata/irraggiungibile (timeout)",
-        }
-    }
-}
-
-/// Probe TCP singola con timeout 3s. Connect riuscita = Open, RST =
-/// Refused, qualunque altro esito (timeout incluso) = Filtered.
-async fn tcp_probe(host: &str, port: u16) -> PortState {
-    let target = format!("{}:{}", host, port);
-    let connect = TcpStream::connect(target);
-    let timed = tokio::time::timeout(Duration::from_secs(3), connect).await;
-    match timed {
-        Ok(Ok(_stream)) => PortState::Open,
-        Ok(Err(e)) => {
-            if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                PortState::Refused
-            } else {
-                PortState::Filtered
-            }
-        }
-        Err(_) => PortState::Filtered,
-    }
-}
-
-/// Evidenza della probe TCP sui canali di management, formattata per i
-/// messaggi utente. Conservata qui perche' final_connect_error (main.rs)
-/// la riporta nel messaggio finale — l'evidenza raccolta, non il
-/// remediation generico (spec §3.3).
-static MGMT_EVIDENCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// Il blocco "TCP porta: stato" raccolto dall'ultima probe, se eseguita.
+/// Il blocco "TCP porta: stato" + diagnosi raccolti dal prescan.
+/// Delega a bootstrap_prescan (l'evidenza e' riempita dal prescan
+/// stesso: niente ri-probe tardive).
 pub fn mgmt_evidence() -> Option<String> {
-    let guard = match MGMT_EVIDENCE.lock() {
-        Ok(g) => g,
-        Err(_) => return None,
-    };
-    guard.clone()
+    bootstrap_prescan::mgmt_evidence()
 }
 
-/// Esito della probe TCP dei canali di management del remote: porta del
-/// server (CLIENT_PORT), SMB/SCM (445), WinRM (PORT).
-struct MgmtProbe {
-    server_port: u16,
-    server: PortState,
-    smb: PortState,
-    winrm_port: u16,
-    winrm: PortState,
+/// L'ultimo errore reale del loop candidati (spec §2.4): concatenato da
+/// final_connect_error all'evidenza — mai ingoiare l'errore
+/// non-trasporto.
+pub fn last_bootstrap_error() -> Option<String> {
+    bootstrap_prescan::last_bootstrap_error()
 }
 
-impl MgmtProbe {
-    /// Blocco "TCP porta: stato" per i messaggi utente (spec §3.3).
-    fn render(&self) -> String {
-        let mut ev = String::new();
-        use std::fmt::Write;
-        let _ = writeln!(
-            ev,
-            "       TCP {} (server):  {}",
-            self.server_port,
-            self.server.label()
-        );
-        let _ = writeln!(ev, "       TCP 445 (SMB/SCM): {}", self.smb.label());
-        let _ = write!(
-            ev,
-            "       TCP {} (WinRM):    {}",
-            self.winrm_port,
-            self.winrm.label()
-        );
-        ev
-    }
-
-    /// Diagnosi sintetica dagli stati delle tre porte (matrice spec §3.2):
-    /// evidence-based, mai "Enable-PSRemoting" come unica risposta.
-    fn diagnosis(&self) -> &'static str {
-        if self.smb == PortState::Open {
-            // Host vivo, canale alternativo disponibile: il bootstrap lo
-            // usa come fallback automatico (o forzato con BOOTSTRAP=smb).
-            return "host VIVO e SMB/SCM raggiungibile: il bootstrap provera' \
-                    il canale SMB/SCM automaticamente (campo BOOTSTRAP=smb \
-                    per forzarlo). WinRM resta spento/filtrato.";
-        }
-        if self.winrm == PortState::Refused {
-            return "servizio WinRM fermo (RST: host vivo, nessun listener): \
-                    'Start-Service WinRM' + 'Set-Service WinRM -StartupType \
-                    Automatic' (le regole firewall esistono gia').";
-        }
-        if self.server == PortState::Open
-            || self.smb == PortState::Refused
-            || self.winrm == PortState::Refused
-        {
-            // Qualcosa risponde con RST: host vivo ma management filtrato.
-            return "host parzialmente raggiungibile ma i canali di management \
-                    (SMB 445 / WinRM) sono filtrati — verificare firewall/GPO.";
-        }
-        "host non raggiungibile (nessuna porta management risponde): verificare \
-         che sia acceso/connesso — 'Enable-PSRemoting' non basta."
-    }
-}
-
-/// Probe TCP dei canali di management del remote. Sequenziali — niente
-/// probe parallele (best-practice: ridurre il traffico verso il server);
-/// ogni probe ha timeout 3s, costo peggiore ~9s su host morto. Eseguita
-/// una sola volta per processo (dedup HINT_PRINTED nel chiamante).
-async fn probe_management_channels(host: &str, winrm_port: u16) -> MgmtProbe {
-    let server_port = server_tcp_port();
-
-    let server = tcp_probe(host, server_port).await;
-    let smb = tcp_probe(host, 445).await;
-    let winrm = tcp_probe(host, winrm_port).await;
-
-    MgmtProbe {
-        server_port,
-        server,
-        smb,
-        winrm_port,
-        winrm,
-    }
-}
-
-/// Stampa una volta il remediation per WinRM non abilitato sull'host remoto.
-/// Se l'ambiente punta a un remote Unix (EXE_PATH unix-style o OS=linux)
-/// il messaggio WinRM sarebbe fuorviante: su quell'host WinRM non esistera'
-/// MAI — il canale di bootstrap corretto e' SSH (bug B2).
-/// Su remote Windows la diagnosi e' evidence-based (probe TCP, spec §3).
+/// Stampa una volta il remediation per il canale WinRM non funzionante.
+/// Renderizza dal PRESCAN gia' eseguito (dedup OnceCell: costo zero se
+/// il prescan e' gia' avvenuto — e nel nuovo flow e' sempre avvenuto
+/// prima della scelta del canale, spec §2.7).
 async fn print_psremoting_hint(host: &str, port: u16) {
     if HINT_PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!();
+    let p = bootstrap_prescan::prescan().await;
+    let evidence = p.render();
+    let diagnosis = p.diagnosis();
     if remote_is_unix() {
-        eprintln!("[HINT] Endpoint WinRM {}:{} non raggiungibile (servizio non attivo o firewall).", host, port);
-        eprintln!("       L'ambiente attivo punta a un remote Linux/Unix: WinRM non e'");
-        eprintln!("       applicabile — il bootstrap usa SSH (campi SSH_HOST/SSH_USER/SSH_PORT,");
-        eprintln!("       auth a chiavi/agent; vedi 'crosspilot env show').");
-        eprintln!();
-        return;
+        eprintln!("[HINT] Bootstrap SSH fallito verso {} (porta WinRM {} non applicabile).", host, port);
+    } else {
+        eprintln!("[HINT] Bootstrap Windows fallito su {}.", host);
     }
-
-    // Probe evidence-based sui tre canali prima del remediation.
-    let probe = probe_management_channels(host, port).await;
-    let evidence = probe.render();
-    let diagnosis = probe.diagnosis();
-    if let Ok(mut guard) = MGMT_EVIDENCE.lock() {
-        *guard = Some(format!("{}\n       Diagnosi: {}", evidence, diagnosis));
-    }
-    eprintln!("[HINT] Bootstrap Windows fallito su {}.", host);
     eprintln!("{}", evidence);
     eprintln!("       Diagnosi: {}", diagnosis);
     eprintln!();
@@ -356,58 +231,73 @@ fn winrm_context() -> Result<WinrmCtx> {
     })
 }
 
-/// Preflight del canale di bootstrap per il fallback di
-/// update::reconcile: verifica che il canale dedicato (WinRM su remote
-/// Windows, SSH su remote Linux/Unix) sia VIVO prima di fermare un
-/// server funzionante.
+/// Script PowerShell della catena schtasks per l'avvio detached del
+/// server (condivisa tra path WinRM e canale SSH-win — spec ssh-unified
+/// §1.4). Catena di tentativi per privilegi massimi + esecuzione nascosta:
+///   1) /RU SYSTEM /RL HIGHEST: gira come SYSTEM in sessione 0 -> hidden;
+///   2) /RU <utente> /NP /RL HIGHEST: logon S4U (senza password
+///      memorizzata), token elevato se admin, sessione 0 -> hidden;
+///   3) fallback storico: task interattivo — finestra visibile, token
+///      non elevato.
 ///
-/// PERCHE': quando l'update via TCP fallisce (es. server zombificato con
-/// versione protocollo incompatibile — il caso H101, build intermedia con
-/// VERSION=2 che chiude il socket su ogni messaggio framed), l'unica via
-/// di recovery e' il deploy sul canale di bootstrap. Ma il deploy
-/// richiede di fermare il vecchio server (`quit` in shell-mode) PRIMA
-/// del riavvio: farlo col canale morto lascerebbe il remote senza server
-/// e senza via d'uscita (brick volontario). Questo preflight risponde
-/// alla domanda "posso permettermi di fermare il server?".
-///
-/// Ritorna Some(info) se remote_build_info risponde (deploy possibile),
-/// None se il canale non e' utilizzabile.
-pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
-    // Remote Unix: il preflight del canale e' SSH, non WinRM (bug B3) —
-    // stessa domanda ("posso permettermi di fermare il server?") su un
-    // trasporto diverso.
-    if remote_is_unix() {
-        let exe_path = match envs::var("EXE_PATH") {
-            Some(p) => p,
-            None => {
-                eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
-                return None;
-            }
-        };
-        return bootstrap_ssh::probe(&exe_path).await;
-    }
-    let exe_path = match envs::var("EXE_PATH") {
-        Some(p) => p,
-        None => {
-            eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
-            return None;
+/// Stampa RUNAS=<mode> interpretato da report_runas_mode.
+pub(crate) fn schtasks_start_script(exe_path: &str, schtasks_user: &str) -> String {
+    format!(
+        "$tn='crosspilot-server'; $tr='\"{}\" --server'; $mode='FAILED'; \
+         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ $mode='SYSTEM' }} else {{ \
+         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU '{}' /NP /RL HIGHEST /F | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ $mode='USER_S4U' }} else {{ \
+         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /F | Out-Null; \
+         if ($LASTEXITCODE -eq 0) {{ $mode='INTERACTIVE' }} \
+         }} }}; \
+         Write-Output \"RUNAS=$mode\"; \
+         schtasks /Run /TN $tn | Out-Null",
+        exe_path, schtasks_user
+    )
+}
+
+/// Interpreta l'output della catena schtasks (RUNAS=<mode>) e stampa il
+/// messaggio corrispondente. Condiviso tra WinRM (bootstrap_winrm) e il
+/// canale SSH-win (bootstrap_ssh::start_server).
+pub(crate) fn report_runas_mode(stdout: &str, schtasks_user: &str) {
+    let mut runas_mode = "";
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(mode) = trimmed.strip_prefix("RUNAS=") {
+            runas_mode = mode;
         }
-    };
-    // Remote Windows: BOOTSTRAP=smb forza il preflight SMB/SCM (WinRM
-    // intenzionalmente off — spec smb-scm §1.3). Altrimenti WinRM
-    // primario, con fallback automatico sul canale SMB quando WinRM non
-    // risponde.
-    if bootstrap_smb::channel_forced() {
-        return bootstrap_smb::probe(&exe_path).await;
     }
+    match runas_mode {
+        "SYSTEM" => {
+            println!("Remote server scheduled as SYSTEM (elevated, hidden).");
+        }
+        "USER_S4U" => {
+            println!("Remote server scheduled as {} (elevated if admin, hidden).", schtasks_user);
+        }
+        "INTERACTIVE" => {
+            eprintln!("[WARNING] Server avviato in sessione interattiva: finestra cmd visibile e privilegi non elevati.");
+            eprintln!("          Per privilegi admin + esecuzione nascosta servono diritti admin sull'account remoto.");
+        }
+        "FAILED" => {
+            eprintln!("[ERROR] bootstrap: creazione task schedulato fallita in tutte le modalita'.");
+        }
+        _ => {}
+    }
+}
+
+/// Preflight WinRM: remote_build_info via client WinRM. Un candidato
+/// del loop di channel_probe (spec §2.6) — None se il canale non
+/// risponde (config non valida o chiamata fallita).
+pub(crate) async fn winrm_probe(exe_path: &str) -> Option<version::RemoteBuildInfo> {
     let ctx = match winrm_context() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[update-fallback] preflight: configurazione WinRM non valida: {}", e);
-            return bootstrap_smb::probe(&exe_path).await;
+            return None;
         }
     };
-    match deploy::remote_build_info(&ctx.client, &ctx.host, &exe_path).await {
+    match deploy::remote_build_info(&ctx.client, &ctx.host, exe_path).await {
         Ok(info) => {
             eprintln!(
                 "[update-fallback] preflight WinRM OK: ts remoto={:?} locale={} exe_present={}",
@@ -417,39 +307,130 @@ pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
         }
         Err(e) => {
             eprintln!("[update-fallback] preflight WinRM fallito: {}", e);
-            eprintln!("[update-fallback] tento preflight sul canale SMB/SCM...");
-            bootstrap_smb::probe(&exe_path).await
+            None
         }
     }
 }
 
-/// FIX: sostituito evil-winrm con winrm-rs (puro Rust, async, NTLMv2).
-/// winrm-rs esegue il comando PowerShell via protocollo WinRM nativo e
-/// ritorna immediatamente con stdout/stderr/exit_code del comando remoto.
-/// Inoltre run_powershell codifica lo script come UTF-16LE base64
-/// (-EncodedCommand), eliminando i problemi di quoting/escaping.
+/// Preflight del canale di bootstrap per il fallback di
+/// update::reconcile: verifica che ALMENO un canale sia VIVO prima di
+/// fermare un server funzionante.
+///
+/// PERCHE': quando l'update via TCP fallisce (es. server zombificato con
+/// versione protocollo incompatibile — il caso H101, build intermedia con
+/// VERSION=2 che chiude il socket su ogni messaggio framed), l'unica via
+/// di recovery e' il deploy sul canale di bootstrap. Ma il deploy
+/// richiede di fermare il vecchio server (`quit` in shell-mode) PRIMA
+/// del riavvio: farlo coi canali morti lascerebbe il remote senza server
+/// e senza via d'uscita (brick volontario). Questo preflight risponde
+/// alla domanda "posso permettermi di fermare il server?".
+///
+/// Spec §2.6: prescan + tentativi sull'ordine dei candidati; il canale
+/// che risponde viene registrato in PROBED_CHANNEL — bootstrap_server
+/// lo tenta per primo senza ri-bussare a canali morti.
+///
+/// Ritorna Some(info) se un remote_build_info risponde (deploy
+/// possibile), None se nessun canale e' utilizzabile.
+pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
+    let exe_path = match envs::var("EXE_PATH") {
+        Some(p) => p,
+        None => {
+            eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
+            return None;
+        }
+    };
+    let p = bootstrap_prescan::prescan().await;
+    let order = bootstrap_prescan::candidates(p);
+    for ch in order {
+        let info = ch.probe(&exe_path).await;
+        if let Some(info) = info {
+            bootstrap_prescan::set_probed_channel(ch);
+            return Some(info);
+        }
+    }
+    None
+}
+
+/// Orchestratore del bootstrap (spec ssh-unified §2.4): prescan TCP
+/// delle porte di management, lista candidati ordinata, poi tentativi
+/// in sequenza SOLO sui canali vivi. TUTTI gli errori di un candidato
+/// portano al successivo — credenziali e privilegi differiscono per
+/// canale, un fallimento non predice l'altro. Eccezione: il mismatch
+/// della host key SSH e' FATALE (possibile MITM) e interrompe il loop.
+///
+/// Se e' stato fatto un preflight (channel_probe nel fallback update),
+/// il canale che ha risposto viene tentato per primo (PROBED_CHANNEL).
+///
+/// Esiti: Ok(()) se un canale ha completato deploy+avvio (il polling
+/// TCP interno al canale decide il "server up"), Err(ChannelUnreachable)
+/// se tutti i canali hanno fallito — fail-fast nel retry loop del
+/// chiamante, con l'ultimo errore reale conservato per il messaggio
+/// finale (mai ingoiato, spec §2.4).
 pub async fn bootstrap_server() -> Result<()> {
     // --- Path del server remoto (da .env) ---
     // Risoluzione via envs: CROSSPILOT_<ENV>_EXE_PATH -> fallback CROSSPILOT_EXE_PATH.
     let exe_path = envs::var("EXE_PATH")
         .context("CROSSPILOT_EXE_PATH (o CROSSPILOT_<ENV>_EXE_PATH) must be set in the .env file")?;
 
-    // Remote Unix/Linux: WinRM non esiste — il bootstrap passa da SSH
-    // (deploy staged + avvio detached via setsid). Selezione: EXE_PATH
-    // unix-style o campo OS=linux (bug B3).
-    if remote_is_unix() {
-        return bootstrap_ssh::bootstrap_server(&exe_path).await;
-    }
+    // Prescan una-tantum (OnceCell) + lista candidati ordinata per stato
+    // probe: Open prima, Refused dopo, Filtered ultimi (spec §2.3).
+    let p = bootstrap_prescan::prescan().await;
+    let order = bootstrap_prescan::candidates(p);
 
-    // Selezione canale su remote Windows (spec smb-scm §1.3):
-    // BOOTSTRAP=smb forza SMB/SCM come primario — per host dove WinRM
-    // e' volutamente spento (es. H166) evita il timeout 5985 del path
-    // WinRM e il suo fallback.
-    if bootstrap_smb::channel_forced() {
-        eprintln!("[bootstrap] BOOTSTRAP=smb: canale SMB/SCM forzato (WinRM saltato).");
-        return bootstrap_smb::bootstrap_server(&exe_path).await;
+    // Il canale che ha risposto al preflight (channel_probe) va tentato
+    // per primo: evita di ri-bussare a canali morti nel path a server
+    // vivo (spec §2.6).
+    let probed = bootstrap_prescan::probed_channel();
+    let mut ordered: Vec<BootstrapChannel> = Vec::new();
+    if let Some(first) = probed {
+        ordered.push(first);
     }
+    for ch in order {
+        if Some(ch) != probed {
+            ordered.push(ch);
+        }
+    }
+    eprintln!("[bootstrap] ordine tentativi: {:?}", ordered);
 
+    for ch in ordered {
+        eprintln!("[bootstrap] tentativo canale {:?}...", ch);
+        match ch.bootstrap(&exe_path).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Mismatch host key SSH: FATALE — mai proseguire su altri
+                // canali verso lo stesso host (possibile MITM, spec §2.8).
+                if e
+                    .downcast_ref::<ssh_transport::HostKeyMismatch>()
+                    .is_some()
+                {
+                    bootstrap_prescan::set_last_bootstrap_error(format!(
+                        "{:?}: {:#}",
+                        ch, e
+                    ));
+                    return Err(e);
+                }
+                eprintln!("[bootstrap] canale {:?} fallito: {:#}", ch, e);
+                bootstrap_prescan::set_last_bootstrap_error(format!("{:?}: {:#}", ch, e));
+            }
+        }
+    }
+    Err(ChannelUnreachable("all").into())
+}
+
+/// Bootstrap via WinRM — il corpo storico di bootstrap_server da
+/// winrm_context() in poi (spec §2.4: estratto per il loop candidati).
+///
+/// FIX: sostituito evil-winrm con winrm-rs (puro Rust, async, NTLMv2).
+/// winrm-rs esegue il comando PowerShell via protocollo WinRM nativo e
+/// ritorna immediatamente con stdout/stderr/exit_code del comando remoto.
+/// Inoltre run_powershell codifica lo script come UTF-16LE base64
+/// (-EncodedCommand), eliminando i problemi di quoting/escaping.
+///
+/// Se WinRM risulta deterministicamente morto (winrm_dead) ritorna
+/// ChannelUnreachable("WinRM"): il loop candidati passa al canale
+/// successivo — il fallback SMB/SCM non e' piu' interno a questa
+/// funzione ma e' un candidato ordinato come gli altri.
+pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
     // --- Credenziali e endpoint WinRM (da .env) ---
     let ctx = winrm_context()?;
 
@@ -480,7 +461,7 @@ pub async fn bootstrap_server() -> Result<()> {
     // In quel caso deploy e schtasks fallirebbero identicamente: si salta
     // direttamente al polling (il server potrebbe comunque essere attivo).
     let mut winrm_dead = false;
-    match deploy::remote_build_info(&client, &host, &exe_path).await {
+    match deploy::remote_build_info(&client, &host, exe_path).await {
         Ok(info) => {
             eprintln!(
                 "[DEBUG] bootstrap_server: ts remoto={:?} locale={} exe_present={} linux_present={}",
@@ -490,7 +471,7 @@ pub async fn bootstrap_server() -> Result<()> {
             if !info.exe_present {
                 // Exe mancante (bug 3.6): deploy completo.
                 eprintln!("[bootstrap] Exe remoto mancante. Avvio auto-deploy...");
-                if let Err(e) = deploy::deploy_exe(&client, &host, &exe_path, &info).await {
+                if let Err(e) = deploy::deploy_exe(&client, &host, exe_path, &info).await {
                     eprintln!("[ERROR] bootstrap_server: auto-deploy fallito: {}", e);
                     // Non ritorniamo errore: il server potrebbe essere già in
                     // esecuzione da un bootstrap precedente. Il polling deciderà.
@@ -515,7 +496,7 @@ pub async fn bootstrap_server() -> Result<()> {
                     // sostituisce l'exe corrente e fa re-exec: su successo
                     // NON ritorna. Su errore: warning e si prosegue col
                     // binario corrente, SENZA deployare (mai downgrade).
-                    let remote_dir = deploy::remote_dir_of(&exe_path);
+                    let remote_dir = deploy::remote_dir_of(exe_path);
                     let update_result = self_update::run(
                         &client,
                         &host,
@@ -548,7 +529,7 @@ pub async fn bootstrap_server() -> Result<()> {
                 // Remote piu' vecchio o uguale: deploy idempotente. Se gli
                 // hash coincidono gia', deploy_exe skippa l'upload (costo:
                 // le verifiche .ver/.env, pochi ms di WinRM).
-                if let Err(e) = deploy::deploy_exe(&client, &host, &exe_path, &info).await {
+                if let Err(e) = deploy::deploy_exe(&client, &host, exe_path, &info).await {
                     eprintln!("[ERROR] bootstrap_server: auto-deploy fallito: {}", e);
                 }
             }
@@ -590,20 +571,10 @@ pub async fn bootstrap_server() -> Result<()> {
     //      non elevato, ma meglio un server visibile che nessun server.
     // Lo script stampa RUNAS=<mode> per permettere al client di loggare
     // la modalita' effettivamente selezionata.
-    let ps_script = format!(
-        "$tn='crosspilot-server'; $tr='\"{}\" --server'; $mode='FAILED'; \
-         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null; \
-         if ($LASTEXITCODE -eq 0) {{ $mode='SYSTEM' }} else {{ \
-         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /RU '{}' /NP /RL HIGHEST /F | Out-Null; \
-         if ($LASTEXITCODE -eq 0) {{ $mode='USER_S4U' }} else {{ \
-         schtasks /Create /TN $tn /TR $tr /SC ONCE /ST 00:00 /F | Out-Null; \
-         if ($LASTEXITCODE -eq 0) {{ $mode='INTERACTIVE' }} \
-         }} }}; \
-         Write-Output \"RUNAS=$mode\"; \
-         schtasks /Run /TN $tn | Out-Null",
-        exe_path, schtasks_user
-    );
-    eprintln!("[DEBUG] bootstrap_server: script PowerShell = {}", ps_script);
+    // (Estratto in schtasks_start_script: condiviso col canale SSH-win —
+    // spec ssh-unified §1.4, stessa catena SYSTEM->S4U->interattivo.)
+    let ps_script = schtasks_start_script(exe_path, &schtasks_user);
+    eprintln!("[DEBUG] bootstrap_winrm: script PowerShell = {}", ps_script);
 
     // --- Esecuzione comando remoto ---
     // Skip se WinRM e' deterministicamente non utilizzabile: la chiamata
@@ -635,31 +606,10 @@ pub async fn bootstrap_server() -> Result<()> {
                 eprintln!("[DEBUG] bootstrap_server: stderr={}", stderr_str.trim());
             }
 
-            // Individua la modalita' di avvio scelta dalla catena di
-            // fallback nello script (RUNAS=SYSTEM|USER_S4U|INTERACTIVE|FAILED).
-            let mut runas_mode = "";
-            for line in stdout_str.lines() {
-                let trimmed = line.trim();
-                if let Some(mode) = trimmed.strip_prefix("RUNAS=") {
-                    runas_mode = mode;
-                }
-            }
-            match runas_mode {
-                "SYSTEM" => {
-                    println!("Remote server scheduled as SYSTEM (elevated, hidden).");
-                }
-                "USER_S4U" => {
-                    println!("Remote server scheduled as {} (elevated if admin, hidden).", schtasks_user);
-                }
-                "INTERACTIVE" => {
-                    eprintln!("[WARNING] Server avviato in sessione interattiva: finestra cmd visibile e privilegi non elevati.");
-                    eprintln!("          Per privilegi admin + esecuzione nascosta servono diritti admin sull'account WinRM.");
-                }
-                "FAILED" => {
-                    eprintln!("[ERROR] bootstrap_server: creazione task fallita in tutte le modalita'.");
-                }
-                _ => {}
-            }
+            // Modalita' di avvio scelta dalla catena di fallback nello
+            // script (RUNAS=SYSTEM|USER_S4U|INTERACTIVE|FAILED) — parser
+            // condiviso col canale SSH-win (bootstrap_ssh::start_server).
+            report_runas_mode(&stdout_str, &schtasks_user);
 
             if output.exit_code != 0 {
                 // Start-Process fallito (es. exe inesistente, permessi).
@@ -689,16 +639,12 @@ pub async fn bootstrap_server() -> Result<()> {
     // stato escluso dal connect_raw iniziale del retry loop) e
     // remote_startup_diag — anch'essa via WinRM — aggiungerebbe solo un
     // altro timeout identico (~10-60s). L'errore dedicato
-    // ChannelUnreachable fa interrompere subito il retry loop di
-    // connect_and_handshake: prima questo caso bruciava ~40s x 5 attempt.
+    // ChannelUnreachable passa la mano al prossimo candidato del loop
+    // (spec ssh-unified §2.4 — il fallback SMB/SCM e' ora un candidato
+    // ordinato, non piu' un fallback interno di questa funzione).
     if winrm_dead || WINRM_UNREACHABLE.load(Ordering::Relaxed) {
-        // Fallback automatico sul canale SMB/SCM (spec smb-scm §1.3): se
-        // TCP 445 e' raggiungibile il bootstrap prosegue senza WinRM —
-        // upload su C$ + esecuzione via Service Control Manager.
-        // Se anche SMB e' morto bootstrap_smb ritorna ChannelUnreachable
-        // e il fail-fast del retry loop si conserva identico.
-        eprintln!("[bootstrap] WinRM irraggiungibile: fallback sul canale SMB/SCM...");
-        return bootstrap_smb::bootstrap_server(&exe_path).await;
+        let err = anyhow::Error::from(ChannelUnreachable("WinRM"));
+        return Err(err.context("endpoint WinRM deterministicamente irraggiungibile"));
     }
 
     // --- Polling: verifica che il server TCP sia effettivamente partito ---
@@ -763,18 +709,15 @@ async fn ensure_firewall_rule(client: &winrm_rs::WinrmClient, host: &str) {
     }
 }
 
-/// Diagnostica post-bootstrap-fallito, eseguita via WinRM sul remote.
-/// Riporta: processo crosspilot attivo (PID), porta in ascolto LOCALE,
-/// regola firewall. Con questi tre dati il fallimento e' classificabile:
-///   PROC vuoto          -> il task non ha avviato il processo (crash?)
+/// Script PowerShell della diagnostica post-bootstrap-fallito su remote
+/// Windows (estratto da remote_startup_diag per essere condiviso col
+/// canale SSH-win, spec §1.4). Emette righe PROC=<pid>|/LISTEN=<pid>|/
+/// FW=0|1 interpretate da interpret_windows_diag.
+///   PROC vuoto            -> il task non ha avviato il processo (crash?)
 ///   PROC pieno, LISTEN vuoto -> processo vivo ma bind fallito
-///   PROC+LISTEN pieni   -> server OK: e' il FIREWALL/inbound a bloccare
-async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
-    let port = server_tcp_port();
-    eprintln!(
-        "[bootstrap] server non in ascolto dopo 30s: diagnostica remota via WinRM..."
-    );
-    let script = format!(
+///   PROC+LISTEN pieni     -> server OK: e' il FIREWALL/inbound a bloccare
+pub(crate) fn windows_diag_script(port: u16) -> String {
+    format!(
         "$p={p}; \
          $proc = (Get-Process -Name crosspilot -ErrorAction SilentlyContinue | Select-Object -First 1).Id; \
          if (-not $proc) {{ Write-Output 'PROC=' }} else {{ Write-Output \"PROC=$proc\" }}; \
@@ -783,48 +726,69 @@ async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
          $fw = Get-NetFirewallRule -DisplayName (\"crosspilot-server-\" + $p) -ErrorAction SilentlyContinue; \
          if ($fw) {{ Write-Output 'FW=1' }} else {{ Write-Output 'FW=0' }}",
         p = port
+    )
+}
+
+/// Interpreta l'output di windows_diag_script e stampa la diagnosi
+/// (condivisa tra il path WinRM e il canale SSH-win — stesso formato
+/// righe, stessa classificazione a tre casi).
+pub(crate) fn interpret_windows_diag(port: u16, stdout: &str) {
+    let mut has_pid = false;
+    let mut listen_pid = false;
+    let mut fw = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("PROC=") {
+            has_pid = !v.trim().is_empty();
+        }
+        if let Some(v) = trimmed.strip_prefix("LISTEN=") {
+            listen_pid = !v.trim().is_empty();
+        }
+        if trimmed == "FW=1" {
+            fw = true;
+        }
+    }
+    if has_pid && listen_pid {
+        if fw {
+            eprintln!(
+                "[bootstrap] processo ATTIVO e porta {} in ascolto LOCALE con regola firewall: \
+                 il SYN in ingresso e' bloccato altrove (rete/VPN/profilo firewall) — verificare la rete.",
+                port
+            );
+        } else {
+            eprintln!(
+                "[bootstrap] processo ATTIVO e porta {} in ascolto LOCALE ma SENZA regola firewall: \
+                 e' il Windows Firewall a droppare l'inbound (ritentare: la regola viene creata al prossimo bootstrap).",
+                port
+            );
+        }
+    } else if has_pid && !listen_pid {
+        eprintln!(
+            "[bootstrap] processo ATTIVO ma porta {} NON in ascolto: bind fallito \
+             (porta occupata? configurazione .env?).",
+            port
+        );
+    } else {
+        eprintln!(
+            "[bootstrap] NESSUN processo crosspilot attivo: il task schedulato non ha avviato \
+             il server (crash all'avvio? controllare LOG_PATH/ERR_PATH sul remote)."
+        );
+    }
+}
+
+/// Diagnostica post-bootstrap-fallito, eseguita via WinRM sul remote:
+/// script+interpretazione condivisi col canale SSH-win.
+async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
+    let port = server_tcp_port();
+    eprintln!(
+        "[bootstrap] server non in ascolto dopo 30s: diagnostica remota via WinRM..."
     );
+    let script = windows_diag_script(port);
     match client.run_powershell(host, &script).await {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             eprintln!("[bootstrap] diagnostica remota:\n{}", stdout);
-            let has_pid = stdout
-                .lines()
-                .find(|l| l.starts_with("PROC="))
-                .map(|l| !l.trim_start_matches("PROC=").trim().is_empty())
-                .unwrap_or(false);
-            let listen_pid = stdout
-                .lines()
-                .find(|l| l.starts_with("LISTEN="))
-                .map(|l| !l.trim_start_matches("LISTEN=").is_empty())
-                .unwrap_or(false);
-            let fw = stdout.lines().any(|l| l.trim() == "FW=1");
-            if has_pid && listen_pid {
-                if fw {
-                    eprintln!(
-                        "[bootstrap] processo ATTIVO e porta {} in ascolto LOCALE con regola firewall: \
-                         il SYN in ingresso e' bloccato altrove (rete/VPN/profilo firewall) — verificare la rete.",
-                        port
-                    );
-                } else {
-                    eprintln!(
-                        "[bootstrap] processo ATTIVO e porta {} in ascolto LOCALE ma SENZA regola firewall: \
-                         e' il Windows Firewall a droppare l'inbound (ritentare: la regola viene creata al prossimo bootstrap).",
-                        port
-                    );
-                }
-            } else if has_pid && !listen_pid {
-                eprintln!(
-                    "[bootstrap] processo ATTIVO ma porta {} NON in ascolto: bind fallito \
-                     (porta occupata? configurazione .env?).",
-                    port
-                );
-            } else {
-                eprintln!(
-                    "[bootstrap] NESSUN processo crosspilot attivo: il task schedulato non ha avviato \
-                     il server (crash all'avvio? controllare LOG_PATH/ERR_PATH sul remote)."
-                );
-            }
+            interpret_windows_diag(port, &stdout);
         }
         Err(e) => eprintln!("[bootstrap] diagnostica remota non disponibile: {}", e),
     }
@@ -878,44 +842,27 @@ pub(crate) async fn poll_server_startup() -> bool {
 mod tests {
     use super::*;
 
-    fn probe(server: PortState, smb: PortState, winrm: PortState) -> MgmtProbe {
-        MgmtProbe {
-            server_port: 5330,
-            server,
-            smb,
-            winrm_port: 5985,
-            winrm,
-        }
+    #[test]
+    fn schtasks_script_catena_completa() {
+        let s = schtasks_start_script("C:\\ci\\crosspilot.exe", "AC\\user");
+        // La catena SYSTEM -> S4U -> interattivo deve comparire intera.
+        assert!(s.contains("crosspilot-server"));
+        assert!(s.contains("--server"));
+        assert!(s.contains("/RU SYSTEM"));
+        assert!(s.contains("/RU 'AC\\user'"));
+        assert!(s.contains("/NP"));
+        assert!(s.contains("RUNAS="));
+        assert!(s.contains("schtasks /Run"));
     }
 
     #[test]
-    fn mgmt_diagnosis_matrix() {
-        // SMB aperta -> canale alternativo (mai "Enable-PSRemoting" secco).
-        let d = probe(PortState::Filtered, PortState::Open, PortState::Filtered);
-        assert!(d.diagnosis().contains("SMB/SCM raggiungibile"));
-        assert!(d.diagnosis().contains("BOOTSTRAP=smb"));
-
-        // WinRM refused + SMB morta -> servizio WinRM fermo.
-        let d = probe(PortState::Filtered, PortState::Filtered, PortState::Refused);
-        assert!(d.diagnosis().contains("WinRM fermo"));
-
-        // Qualcosa refused ma niente management utile -> host parziale.
-        let d = probe(PortState::Open, PortState::Refused, PortState::Filtered);
-        assert!(d.diagnosis().contains("filtrati"));
-
-        // Tutto filtrato -> host irraggiungibile.
-        let d = probe(PortState::Filtered, PortState::Filtered, PortState::Filtered);
-        assert!(d.diagnosis().contains("non raggiungibile"));
-    }
-
-    #[test]
-    fn mgmt_render_shape() {
-        let ev = probe(PortState::Filtered, PortState::Open, PortState::Refused).render();
-        assert!(ev.contains("TCP 5330 (server):"));
-        assert!(ev.contains("TCP 445 (SMB/SCM):"));
-        assert!(ev.contains("TCP 5985 (WinRM):"));
-        assert!(ev.contains("aperta"));
-        assert!(ev.contains("chiusa (refused"));
-        assert!(ev.contains("filtrata"));
+    fn interpret_windows_diag_tre_casi() {
+        // Nessun processo -> crash/avvio mancato.
+        interpret_windows_diag(5330, "PROC=\nLISTEN=\nFW=0");
+        // Processo vivo + listen + regola: classificazione coperta dai
+        // rami (qui si verifica solo che il parser non panichi e legga
+        // i flag — l'output va su stderr).
+        interpret_windows_diag(5330, "PROC=123\nLISTEN=123\nFW=1");
+        interpret_windows_diag(5330, "PROC=123\nLISTEN=\nFW=0");
     }
 }

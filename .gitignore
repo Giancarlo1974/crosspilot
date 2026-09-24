@@ -6,5 +6,8 @@
 # .env contiene credenziali reali (WinRM password). Non committare mai.
 # Usa .env.example come template.
 .env
+# Keystore TOFU del canale SSH unificato (russh): host key registrate al
+# primo connect. Stato runtime accanto al .env — non committare.
+crosspilot_known_hosts
 # Anche il sidecar linux musl e' un artefatto di build (build-release.sh).
 /assets/crosspilot.linux

@@ -16,10 +16,10 @@
 //   binpath arbitrario + start + delete (pattern "psexec" validato in
 //   vivo su H166: stesso risultato di `net rpc service create`).
 //
-// SELEZIONE (bootstrap::bootstrap_server / channel_probe):
-// - campo ambiente BOOTSTRAP=smb -> questo canale come primario;
-// - altrimenti fallback automatico quando WinRM e' deterministicamente
-//   irraggiungibile (TCP 5985 refused/timeout).
+// SELEZIONE (bootstrap_prescan::candidates — spec ssh-unified §2.3):
+// - campo ambiente BOOTSTRAP=smb -> questo canale come unico;
+// - altrimenti posizione nella lista ordinata dal prescan (SMB Open ->
+//   primo se WinRM/SSH sono morti — il caso H166 senza timeout).
 //
 // ESECUZIONE REMOTA (bug.md §2 — il pattern provato): ms_scmr::run crea
 // un servizio transitorio il cui binpath e' `start "" /b cmd /c "<cmd>"`:
@@ -81,23 +81,16 @@ pub fn smb_unreachable() -> bool {
 }
 
 /// Dedup del remediation SMB (stesso pattern di HINT_PRINTED WinRM /
-/// SSH_HINT_PRINTED: bootstrap_server puo' essere richiamata dal retry
+/// del dedup hint SSH: bootstrap_server puo' essere richiamata dal retry
 /// loop — il hint va stampato una sola volta per processo).
 static SMB_HINT_PRINTED: AtomicBool = AtomicBool::new(false);
 
 /// Contatore per nomi temporanei remoti univoci (bat/out/tmp su C$).
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// True se il campo ambiente BOOTSTRAP=smb forza il canale SMB/SCM come
-/// primario su remote Windows (spec §1.3). Qualunque altro valore lascia
-/// il comportamento standard (WinRM primario + fallback automatico).
-pub fn channel_forced() -> bool {
-    let raw = match envs::var("BOOTSTRAP") {
-        Some(v) => v,
-        None => return false,
-    };
-    raw.trim().eq_ignore_ascii_case("smb")
-}
+// NOTA: l'override BOOTSTRAP=smb|ssh|winrm e' ora parsato da
+// bootstrap_prescan::candidates (spec ssh-unified §2.3 — lista
+// candidati ordinata, un solo punto di selezione del canale).
 
 /// Contesto SMB risolto dai campi ambiente (host + credenziali NTLM).
 /// pub(crate): riusato da bootstrap_smb_deploy.
