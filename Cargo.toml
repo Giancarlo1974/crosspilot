@@ -20,6 +20,15 @@ sha2 = "0.10"
 # Vedi bootstrap_server() in src/bootstrap.rs per i dettagli del bug.
 winrm-rs = "1.2.2"
 
+# Canale di bootstrap alternativo SMB/SCM per remote Windows senza WinRM
+# (spec docs/smb-scm-bootstrap-spec.md): smb2-client = trasporto SMB2
+# (NTLMv2, named pipe, file I/O su admin share), ms-scmr = esecuzione
+# remota via Service Control Manager (pattern psexec validato su H166,
+# bug.md §2). Entrambi puro Rust: niente FFI, compatibili col build
+# musl statico e windows-gnu di build-release.sh.
+smb2-client = "0.2.5"
+ms-scmr = "0.1"
+
 [patch.crates-io]
 # PATCH LOCALE: winrm-rs 1.2.2 ha un bug in create_shell_request (soap/envelope.rs):
 # emette <wsman:OptionSet> FUORI da </s:Header>, producendo un envelope SOAP 1.2
@@ -28,6 +37,15 @@ winrm-rs = "1.2.2"
 # header.replace("</s:Header>", ...), come già fa create_psrp_shell_request.
 # TODO: rimuovere quando upstream fixa (segnalare su github.com/muchiny/winrm-rs).
 winrm-rs = { path = "vendor/winrm-rs" }
+
+# PATCH LOCALE: smb2-client 0.2.5 espone la WRITE solo su named pipe, non su
+# file disco — l'upload degli artefatti su C$ (deploy staged SMB/SCM)
+# richiede CREATE+WRITE+CLOSE su share admin. Aggiunti
+# SmbClient::write_file / delete_file in vendor/smb2-client/src/client.rs.
+# Il patch si applica anche alla dipendenza transitiva di ms-scmr
+# (ms-scmr -> smb2-client ^0.2 usa lo stesso sorgente vendored).
+# TODO: proporre upstream (github.com/icedracon/smb2-client).
+smb2-client = { path = "vendor/smb2-client" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["jobapi2", "processthreadsapi", "winnt", "handleapi", "synchapi", "fileapi", "winbase"] }
