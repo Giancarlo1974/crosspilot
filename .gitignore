@@ -11,3 +11,5 @@
 crosspilot_known_hosts
 # Anche il sidecar linux musl e' un artefatto di build (build-release.sh).
 /assets/crosspilot.linux
+# Appunti personali — non committare.
+PRIVATE_NOTES.md
