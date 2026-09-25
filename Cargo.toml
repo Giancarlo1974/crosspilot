@@ -13,7 +13,7 @@ dotenvy = "0.15"
 fast_rsync = "0.2"
 # SHA-256 whole-file: fast_rsync usa MD4 (insicuro) come strong hash per-blocco.
 # SHA-256 sul file ricostruito garantisce integrità end-to-end (delta sbagliato -> mismatch -> ERR 4).
-sha2 = "0.10"
+sha2 = "0.11"
 # Client WinRM nativo (puro Rust, async, NTLMv2) per il bootstrap del server remoto.
 # Sostituisce evil-winrm (shell Ruby interattiva) che non gestiva lo stdin piped
 # in modo deterministico, causando il bug "server did not come up within 30s".
