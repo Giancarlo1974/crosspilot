@@ -141,7 +141,9 @@ mod win_job {
     Usage:\n\
       crosspilot -- <COMMAND>   Execute a command on the remote Windows server\n\
       crosspilot --server       Run in server mode (Windows side)\n\
-      crosspilot put|get|status|sync  File transfer and directory sync\n\n\
+      crosspilot put|get|status|sync  File transfer and directory sync\n\
+      crosspilot quit           Shut down the remote server\n\
+      crosspilot --ephemeral -- <CMD>  Run, then server self-shuts down (agentless)\n\n\
     The -- form passes everything after it literally to cmd.exe on the remote\n\
     Windows host, with no shell escaping. Use single quotes around paths with\n\
     trailing backslashes: crosspilot -- dir 'c:\\'")]
@@ -152,6 +154,29 @@ struct Cli {
     /// Run as server (listens for incoming commands)
     #[arg(long, help = "Run in server mode - listens for incoming command requests")]
     server: bool,
+
+    /// Esecuzione effimera ("agentless"): al termine dell'operazione il
+    /// server remoto si spegne da solo.
+    ///
+    /// Con la forma `--` il vincolo e' atomico: il client invia il
+    /// prefisso di protocollo QUIT_AFTER_PREFIX e il server si auto-
+    /// spegne a fine comando a QUALUNQUE esito — anche se il client si
+    /// interrompe a meta' (l'agente non resta mai appeso). Con i
+    /// sottocomandi framed (put/get/status/sync) il client invia `quit`
+    /// su connessione fresca dopo l'operazione.
+    ///
+    /// Senza altri argomenti equivale a `crosspilot quit`: solo
+    /// spegnimento, nessuna operazione eseguita.
+    ///
+    ///   crosspilot --ephemeral -- make test
+    ///   crosspilot --ephemeral sync ./dist C:\\ci\\dist
+    ///   crosspilot --ephemeral            # == crosspilot quit
+    #[arg(
+        long,
+        global = true,
+        help = "Shut down the remote server when the operation completes (ephemeral/agentless mode; alone = quit only)"
+    )]
+    ephemeral: bool,
 
     /// Comando da eseguire sul server Windows remoto.
     ///
@@ -227,6 +252,11 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
+    /// Spegne il server remoto senza eseguire altro: invia `quit` su una
+    /// connessione shell-mode. Equivale a `crosspilot --ephemeral` senza
+    /// comando e a `crosspilot -- quit`.
+    #[command(visible_alias = "shutdown", alias = "stop")]
+    Quit,
     /// (interno) Updater staged: attende la morte del server, fa lo swap
     /// exe -> exe.old / staged -> exe, poi rilancia `exe --server`.
     /// Lanciato detached dal server (MSG_UPDATE_REQ) o via schtasks/setsid
@@ -323,24 +353,28 @@ async fn main() -> Result<()> {
         // presi letteralmente da clap (allow_hyphen_values + trailing_var_arg)
         // e uniti con spazi per ricostruire il comando cmd.exe.
         let cmd = cli.raw_cmd.join(" ");
-        client_mode(&cmd).await?;
+        client_mode(&cmd, cli.ephemeral).await?;
     } else {
         match cli.command {
             // Transfer file: upload (put) lato client.
             Some(Commands::Put { local_src, remote_dst }) => {
-                client_transfer_put(&local_src, &remote_dst).await?;
+                client_transfer_put(&local_src, &remote_dst, cli.ephemeral).await?;
             }
             // Transfer file: download (get) lato client.
             Some(Commands::Get { remote_src, local_dst }) => {
-                client_transfer_get(&remote_src, &local_dst).await?;
+                client_transfer_get(&remote_src, &local_dst, cli.ephemeral).await?;
             }
             // Directory sync: status (diff read-only) lato client.
             Some(Commands::Status { local_dir, remote_dir, checksum, quiet }) => {
-                client_sync_status(&local_dir, &remote_dir, checksum, quiet).await?;
+                client_sync_status(&local_dir, &remote_dir, checksum, quiet, cli.ephemeral).await?;
             }
             // Directory sync: sync (mirror one-way upload) lato client.
             Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet }) => {
-                client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet).await?;
+                client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet, cli.ephemeral).await?;
+            }
+            // Spegnimento esplicito del server remoto (nessuna operazione).
+            Some(Commands::Quit) => {
+                client_quit().await?;
             }
             // Updater staged (auto-update via TCP): uso interno.
             Some(Commands::Update { target, wait_pid, port, wait_secs, relaunch_args, console }) => {
@@ -351,6 +385,13 @@ async fn main() -> Result<()> {
                 envs::run(&action)?;
             }
             _ => {
+                if cli.ephemeral {
+                    // `--ephemeral` senza comando ne' sottocomando: il
+                    // flag stesso e' la richiesta di shutdown ("chiuditi
+                    // e basta"). Equivale a `crosspilot quit`.
+                    client_quit().await?;
+                    return Ok(());
+                }
                 println!("CrossPilot - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
                 // Ambiente attivo ben visibile: e' il target di TUTTI i comandi.
@@ -364,6 +405,8 @@ async fn main() -> Result<()> {
                 println!("  crosspilot get <remote> <local>   # Download file (rsync delta)");
                 println!("  crosspilot status <local> <remote>  # Diff directory (read-only)");
                 println!("  crosspilot sync   <local> <remote>  # Mirror directory (upload)");
+                println!("  crosspilot quit                 # Shut down the remote server");
+                println!("  crosspilot --ephemeral -- <CMD> # Run, then server self-shuts down (agentless)");
                 println!();
                 println!("Environments (.env multi-host):");
                 println!("  crosspilot env list                  # ambienti definiti (* = attivo)");
@@ -389,7 +432,10 @@ async fn main() -> Result<()> {
                 println!("     crosspilot -- powershell -File C:\\Scripts\\test.ps1");
                 println!();
                 println!("  4. Close remote server:");
-                println!("     crosspilot -- quit");
+                println!("     crosspilot quit        (o: crosspilot --ephemeral)");
+                println!();
+                println!("  4b. Agentless: run a command, then the server self-shuts down:");
+                println!("     crosspilot --ephemeral -- make test");
                 println!();
                 println!("  5. Upload a file:");
                 println!("     crosspilot put ./app.exe C:\\ci\\app.exe");
@@ -730,7 +776,7 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
     if n == 0 {
         return Ok(());
     }
-    let command_line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+    let mut command_line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
     println!("Received command: {}", command_line);
 
     // Check for quit/exit command
@@ -740,6 +786,56 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
         return Ok(());
     }
 
+    // Esecuzione effimera ("agentless", flag --ephemeral del client): il
+    // prefisso QUIT_AFTER_PREFIX marca la richiesta come "run-and-die" —
+    // il server esegue il comando e si auto-spegne a QUALUNQUE esito
+    // (ok, errore di spawn, client disconnesso a meta' stream). La
+    // decisione e' presa dal server alla ricezione della richiesta: a
+    // differenza di un `quit` inviato dal client a fine stream, qui
+    // l'agente non puo' restare appeso se il client muore in corsa.
+    let mut quit_after = false;
+    if let Some(rest) = command_line.strip_prefix(QUIT_AFTER_PREFIX) {
+        command_line = rest.trim().to_string();
+        if command_line.is_empty() {
+            // Prefisso senza comando: solo shutdown (equivale a `quit`).
+            println!("Ephemeral quit received. notifying shutdown.");
+            shutdown_signal.notify_one();
+            return Ok(());
+        }
+        quit_after = true;
+        println!("[DEBUG] ephemeral request: shutdown del server a fine comando ({})", command_line);
+    }
+
+    // 2. Esegue il comando e streamma stdout+stderr sul socket.
+    let run_result = run_shell_command(socket, &command_line).await;
+
+    // 3. Ephemeral: a richiesta conclusa — a qualunque esito — il server
+    // deve spegnersi. La notify arriva DOPO il flush del writer interno
+    // a run_shell_command: il client riceve tutto l'output prima che il
+    // processo server esca.
+    if quit_after {
+        let outcome = if run_result.is_ok() { "ok" } else { "errore" };
+        println!("Ephemeral request terminata ({}). notifying shutdown.", outcome);
+        shutdown_signal.notify_one();
+    }
+    run_result
+}
+
+/// Sentinella del protocollo shell-mode per l'esecuzione effimera
+/// ("agentless"): il client la prepone al comando (`--ephemeral -- <cmd>`)
+/// e il server — riconoscendola — si auto-spegne alla fine dell'esecuzione
+/// a qualunque esito. Token di protocollo (case-sensitive, non destinato
+/// all'uso manuale); un server pre-feature lo passerebbe a cmd.exe come
+/// testo ignoto, ma reconcile (update.rs) allinea client/server allo
+/// stesso BUILD_TS prima dell'invio — salvo CROSSPILOT_NO_UPDATE=1.
+const QUIT_AFTER_PREFIX: &str = "crosspilot:quit-after ";
+
+/// Esegue `command_line` nella shell del remote e streamma stdout+stderr
+/// sul socket fino a EOF (comando terminato) o fino alla disconnessione
+/// del client (il processo viene ucciso). Estratto da handle_connection
+/// (best-practice: unita' piccole): il caller decide il post-esecuzione —
+/// la modalita' effimera notifica lo shutdown del server a qualunque esito.
+async fn run_shell_command(socket: TcpStream, command_line: &str) -> Result<()> {
     // 2. Spawn process
     // ... rest of implementation matches previous logic
     // Detect OS for shell execution
@@ -757,7 +853,7 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
     #[cfg(target_os = "windows")]
     let mut child = Command::new(shell)
         .arg(flag)
-        .raw_arg(&command_line)
+        .raw_arg(command_line)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // .stdin(Stdio::piped()) // Future improvement for interactive
@@ -766,7 +862,7 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
     #[cfg(not(target_os = "windows"))]
     let mut child = Command::new(shell)
         .arg(flag)
-        .arg(&command_line)
+        .arg(command_line)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // .stdin(Stdio::piped()) // Future improvement for interactive
@@ -1200,7 +1296,7 @@ async fn connect_and_handshake() -> Result<TcpStream> {
 /// Lato client: PUT (upload) di un file locale verso il server.
 /// Stabilisce la connessione, handshake, poi delega a transfer::put_client.
 /// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
-async fn client_transfer_put(local_src: &str, remote_dst: &str) -> Result<()> {
+async fn client_transfer_put(local_src: &str, remote_dst: &str, quit_after: bool) -> Result<()> {
     // Valida il path sorgente locale prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_file_exists(local_src) {
         eprintln!("[ERROR] put: {}", e);
@@ -1208,7 +1304,13 @@ async fn client_transfer_put(local_src: &str, remote_dst: &str) -> Result<()> {
     }
 
     let mut socket = connect_and_handshake().await?;
-    transfer::put_client(&mut socket, local_src, remote_dst).await?;
+    let result = transfer::put_client(&mut socket, local_src, remote_dst).await;
+    // --ephemeral: lo shutdown va inviato a QUALUNQUE esito del transfer
+    // (stessa semantica del prefisso shell-mode: l'agente non resta appeso).
+    if quit_after {
+        ephemeral_quit_best_effort().await;
+    }
+    result?;
     eprintln!("put: trasferimento completato ({} -> {})", local_src, remote_dst);
     Ok(())
 }
@@ -1216,16 +1318,20 @@ async fn client_transfer_put(local_src: &str, remote_dst: &str) -> Result<()> {
 /// Lato client: GET (download) di un file remoto verso un path locale.
 /// Stabilisce la connessione, handshake, poi delega a transfer::get_client.
 /// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
-async fn client_transfer_get(remote_src: &str, local_dst: &str) -> Result<()> {
+async fn client_transfer_get(remote_src: &str, local_dst: &str, quit_after: bool) -> Result<()> {
     let mut socket = connect_and_handshake().await?;
-    transfer::get_client(&mut socket, remote_src, local_dst).await?;
+    let result = transfer::get_client(&mut socket, remote_src, local_dst).await;
+    if quit_after {
+        ephemeral_quit_best_effort().await;
+    }
+    result?;
     eprintln!("get: trasferimento completato ({} -> {})", remote_src, local_dst);
     Ok(())
 }
 
 /// Lato client: status (diff read-only) tra directory locale e remota.
 /// sync-spec §6. Exit code: 0 ok (anche con differenze), 1 errore, 2 path invalido.
-async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, quiet: bool) -> Result<()> {
+async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, quiet: bool, quit_after: bool) -> Result<()> {
     // Valida local_dir prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_dir_exists(local_dir) {
         eprintln!("[ERROR] status: {}", e);
@@ -1245,6 +1351,9 @@ async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, q
     // Output testuale (o riepilogo numerico se --quiet).
     sync::print_status(&diff, quiet);
 
+    if quit_after {
+        ephemeral_quit_best_effort().await;
+    }
     Ok(())
 }
 
@@ -1258,6 +1367,7 @@ async fn client_sync(
     dry_run: bool,
     checksum: bool,
     quiet: bool,
+    quit_after: bool,
 ) -> Result<()> {
     // Valida local_dir prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_dir_exists(local_dir) {
@@ -1290,6 +1400,13 @@ async fn client_sync(
     // Report finale.
     sync::print_sync_report(&report, quiet);
 
+    // --ephemeral: il quit va inviato PRIMA dell'eventuale exit(1) per
+    // errori di sync — un agente effimero non deve restare appeso per
+    // un job fallito.
+    if quit_after {
+        ephemeral_quit_best_effort().await;
+    }
+
     // Exit code 1 se almeno un errore (sync-spec §11).
     if report.error_count > 0 {
         std::process::exit(1);
@@ -1297,14 +1414,25 @@ async fn client_sync(
     Ok(())
 }
 
-async fn client_mode(cmd: &str) -> Result<()> {
+/// Lato client, forma `--`: invia il comando shell-mode e streamma la
+/// risposta su stdout fino a EOF. Con `quit_after` (flag --ephemeral)
+/// il comando parte col prefisso QUIT_AFTER_PREFIX: e' il SERVER a
+/// spegnersi a fine esecuzione (a qualunque esito — vedi
+/// handle_connection), non il client a inviare un `quit` dopo.
+async fn client_mode(cmd: &str, quit_after: bool) -> Result<()> {
     // Connessione + handshake + auto-update (stessa logica di put/get/sync:
     // connect_and_handshake orchestra retry, bootstrap e version skew).
     let mut socket = connect_and_handshake().await?;
 
-    // Send command
-    socket.write_all(cmd.as_bytes()).await?;
-    
+    // Send command. In modalita' effimera il prefisso e' parte della
+    // stessa riga di comando: una sola write, nessuna seconda connessione.
+    let mut wire_cmd = String::new();
+    if quit_after {
+        wire_cmd.push_str(QUIT_AFTER_PREFIX);
+    }
+    wire_cmd.push_str(cmd);
+    socket.write_all(wire_cmd.as_bytes()).await?;
+
     // Stream output to stdout
     let mut stdout = tokio::io::stdout();
     let mut buf = [0; 1024];
@@ -1318,6 +1446,41 @@ async fn client_mode(cmd: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Lato client: spegnimento esplicito del server remoto. Apre una
+/// connessione shell-mode fresca (connect_and_handshake = handshake +
+/// auto-update, nessuna operazione intermedia) e invia `quit` — il
+/// comando che handle_connection riconosce gia' oggi. Usata dal
+/// sottocomando `quit`, da `--ephemeral` senza comando e come
+/// post-operazione dei comandi framed (put/get/status/sync).
+async fn client_quit() -> Result<()> {
+    let mut socket = connect_and_handshake().await?;
+    socket.write_all(b"quit").await?;
+    let _ = socket.flush().await;
+    // Attende l'EOF: il server chiude il socket subito dopo la notify di
+    // shutdown (handle_connection ritorna, il task droppa il socket) —
+    // conferma che la richiesta e' stata consegnata. Timeout di guardia:
+    // su un remote anomalo il client non deve restare appeso.
+    let mut buf = [0u8; 64];
+    let eof = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await;
+    match eof {
+        Ok(Ok(0)) => eprintln!("[DEBUG] quit consegnato: server in shutdown."),
+        _ => eprintln!("[WARN] quit inviato ma nessun EOF entro 5s: il server potrebbe non spegnersi."),
+    }
+    Ok(())
+}
+
+/// `quit` post-operazione per --ephemeral sui comandi framed
+/// (put/get/status/sync): la shell-mode non copre quei messaggi, quindi
+/// lo shutdown e' guidato dal client su connessione fresca. Best-effort:
+/// un fallimento del quit NON deve mascherare l'esito dell'operazione
+/// principale — il warning resta nel log.
+async fn ephemeral_quit_best_effort() {
+    eprintln!("[ephemeral] operazione conclusa: invio quit al server...");
+    if let Err(e) = client_quit().await {
+        eprintln!("[WARN] --ephemeral: quit post-operazione fallito: {:#}", e);
+    }
 }
 
 #[cfg(test)]

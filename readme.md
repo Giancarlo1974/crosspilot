@@ -27,6 +27,7 @@ CrossPilot provides a single remote channel for system operations:
 * 🗑️ **File and directory deletion**
 * 📋 **Remote filesystem listing**
 * 🚀 **Automatic agent deployment**
+* 🕒 **Ephemeral (agentless-like) execution**
 * 🧩 **Windows and Linux support**
 * 📦 **Standalone agent**
 * 🐳 **Usable with VMs, containers, and physical machines**
@@ -324,10 +325,12 @@ META
 LIST
 MKDIR
 DELETE
+QUIT
 ```
 
 The structure is designed to allow new operations to be added without changing the base framing.
 
+The shell channel also accepts `quit`/`exit` to stop a running agent (`crosspilot quit`), and an ephemeral "agentless-like" mode (`--ephemeral`): the agent runs the operation, then shuts itself down — nothing is left running on the remote host.
 ---
 
 # 🖥️ Windows and Linux
