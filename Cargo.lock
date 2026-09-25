@@ -478,7 +478,7 @@ dependencies = [
  "ms-scmr",
  "russh",
  "russh-sftp",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "smb2-client",
  "tokio",
  "tracing",
