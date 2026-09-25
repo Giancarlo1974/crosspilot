@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Storia completa + tag: build.rs deriva la versione semver da
           # `git describe --match 'v[0-9]*'` (auto-incremento dopo il tag).
