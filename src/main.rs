@@ -186,16 +186,28 @@ struct Cli {
     )]
     ephemeral: bool,
 
-    /// Output diagnostico minimo su stderr (modalità scripting): sopprime
-    /// [DEBUG], progressi e messaggi di connessione. Warning ed errori
-    /// restano sempre visibili; l'output dei comandi (stdout) è invariato.
+    /// Diagnostica minima su stderr: E' GIA' IL DEFAULT. Il flag resta per
+    /// compat con script/CI scritti quando il default era verbose —
+    /// esplicitarlo forza quiet anche in combinazione con -v.
+    /// Warning ed errori restano sempre visibili; stdout e' invariato.
     #[arg(
         short = 'q',
         long,
         global = true,
-        help = "Quiet: suppress debug/progress diagnostics on stderr (warnings and errors still shown)"
+        help = "Quiet: suppress debug/progress diagnostics on stderr (already the default)"
     )]
     quiet: bool,
+
+    /// Riabilita l'output diagnostico su stderr ([DEBUG], progressi e
+    /// messaggi di connessione), soppresso di default (v. log.rs).
+    /// Warning ed errori sono comunque sempre visibili.
+    #[arg(
+        short = 'v',
+        long,
+        global = true,
+        help = "Verbose: show debug/progress diagnostics on stderr (suppressed by default)"
+    )]
+    verbose: bool,
 
     /// Comando da eseguire sul server remoto.
     ///
@@ -365,6 +377,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Parse CLI + setup quiet PRIMA di sweep/dotenv/debug-ambiente:
+    // quiet e' ATTIVO di default (i diagnostici qprintln! sono opt-in
+    // via -v/--verbose); il parse anticipato permette a -v di mostrare
+    // anche i [DEBUG] emessi durante l'avvio (sweep, .env, ambiente).
+    // -q resta accettato per compat e forza quiet anche in presenza di -v.
+    let cli = Cli::parse();
+    log::set_quiet(cli.quiet || !cli.verbose);
+
     // Igiene d'avvio: se questo exe ha il nome canonico (crosspilot[.exe])
     // spazza gli artefatti staged/residui dell'auto-update nella sua dir.
     // Uno staged crosspilot-<ts> in esecuzione non sweeps mai (ne' se'
@@ -387,12 +407,6 @@ async fn main() -> Result<()> {
         "[DEBUG] ambiente attivo: {} -> host={} winrm={} client={}",
         env_label, env_host, env_winrm, env_client
     );
-
-    let cli = Cli::parse();
-
-    // Flag globale -q/--quiet: sopprime SOLO il chiacchiericcio di
-    // progresso/debug (qprintln!); warning ed errori restano su stderr.
-    log::set_quiet(cli.quiet);
 
     if cli.server || matches!(cli.command, Some(Commands::Server { .. })) {
         let port = if let Some(Commands::Server { port }) = cli.command {
@@ -419,7 +433,10 @@ async fn main() -> Result<()> {
             }
             // Directory sync: status (diff read-only) lato client.
             Some(Commands::Status { local_dir, remote_dir, checksum, quiet, exclude }) => {
-                client_sync_status(&local_dir, &remote_dir, checksum, quiet, &exclude, cli.ephemeral).await?;
+                // Il report minimale segue solo i flag ESPLICITI (subcommand
+                // --quiet o -q globale): il default quiet di log.rs NON deve
+                // collassare il report — righe per-entry restano il default.
+                client_sync_status(&local_dir, &remote_dir, checksum, quiet || cli.quiet, &exclude, cli.ephemeral).await?;
             }
             // Directory sync: sync (mirror one-way upload) lato client.
             // I flag sono gia' raggruppati in SyncParams (clippy too_many_arguments).
@@ -1831,8 +1848,9 @@ async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, q
     // e' sconosciuto, va mostrato come warning (non come "identico").
     diff.skipped_remote = outcome.skipped;
 
-    // Output testuale (o riepilogo numerico se --quiet).
-    sync::print_status(&diff, quiet || log::is_quiet());
+    // Output testuale (o riepilogo numerico se --quiet esplicito:
+    // subcommand o -q globale — NON is_quiet(), che ora e' default-on).
+    sync::print_status(&diff, quiet);
 
     if quit_after {
         ephemeral_quit_best_effort().await;
