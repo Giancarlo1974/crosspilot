@@ -132,8 +132,7 @@ pub async fn install_staged_file(
     // --- Verifica SHA-256 dello staged vs hash dichiarato ---
     let mut staged_handle = std::fs::File::open(staged)
         .with_context(|| format!("apertura staged {}", staged.display()))?;
-    let staged_digest = verify::sha256_file_handle(&mut staged_handle)
-        .context("hash staged")?;
+    let staged_digest = verify::sha256_file_handle(&mut staged_handle).context("hash staged")?;
     let local_hash = staged_digest
         .iter()
         .map(|b| format!("{:02x}", b))
@@ -190,7 +189,10 @@ async fn finish_update(
             .with_context(|| format!("chmod {}", new_path.display()))?;
     }
 
-    eprintln!("[self-update] functional check: '{}' --version", new_path.display());
+    eprintln!(
+        "[self-update] functional check: '{}' --version",
+        new_path.display()
+    );
     let check = tokio::process::Command::new(new_path)
         .arg("--version")
         .output()
@@ -224,7 +226,11 @@ async fn finish_update(
     let bak_path = PathBuf::from(bak_os);
     if let Err(e) = std::fs::copy(self_path, &bak_path) {
         // Backup non critico: log e prosegui (il .new e' verificato).
-        eprintln!("[self-update] WARNING: backup {} fallito: {}", bak_path.display(), e);
+        eprintln!(
+            "[self-update] WARNING: backup {} fallito: {}",
+            bak_path.display(),
+            e
+        );
     } else {
         eprintln!("[self-update] backup: {}", bak_path.display());
     }
@@ -251,14 +257,11 @@ async fn finish_update(
     // processo rientra nel flow connect->bootstrap con ts aggiornato
     // (== remote) -> deploy skippato -> schtasks avvia il server.
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    eprintln!(
-        "[self-update] re-exec: {} {:?}",
-        self_path.display(),
-        args
-    );
+    eprintln!("[self-update] re-exec: {} {:?}", self_path.display(), args);
     println!(
         "Self-update completato (build {} -> {}). Riavvio il comando...",
-        version::BUILD_TS, remote_ts
+        version::BUILD_TS,
+        remote_ts
     );
 
     #[cfg(unix)]

@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use crate::bootstrap;
 use crate::bootstrap_smb_deploy;
+use crate::deploy;
 use crate::envs;
 use crate::update;
 use crate::version::{self, RemoteBuildInfo};
@@ -116,7 +117,9 @@ pub(crate) fn smb_context() -> SmbCtx {
     let (user, domain) = bootstrap::split_domain_user(&user_raw);
     crate::qprintln!(
         "[DEBUG] smb_context: host={} user={} domain={}",
-        host, user, domain
+        host,
+        user,
+        domain
     );
     SmbCtx {
         host,
@@ -235,7 +238,10 @@ pub(crate) async fn smb_connect(ctx: &SmbCtx) -> Result<SmbClient> {
             // canale morto di fatto — stesso hint del connect timeout,
             // senza di esso il fallimento era completamente silenzioso.
             SMB_UNREACHABLE.store(true, Ordering::Relaxed);
-            print_smb_hint(ctx, "TCP 445 accetta ma il login NTLMv2 non risponde (timeout)");
+            print_smb_hint(
+                ctx,
+                "TCP 445 accetta ma il login NTLMv2 non risponde (timeout)",
+            );
             anyhow::Error::from(bootstrap::ChannelUnreachable("SMB/SCM"))
         })?
         .map_err(|e| smb_err(ctx, e, "login NTLMv2"))?;
@@ -245,11 +251,7 @@ pub(crate) async fn smb_connect(ctx: &SmbCtx) -> Result<SmbClient> {
 /// Tree connect su una share del remote (es. "C$", "IPC$").
 /// SmbClient tiene UN solo tree_id: ogni cambio share richiede una
 /// tree_connect esplicita (ms_scmr::exec fa lo stesso internamente).
-pub(crate) async fn tree_connect(
-    client: &mut SmbClient,
-    ctx: &SmbCtx,
-    share: &str,
-) -> Result<()> {
+pub(crate) async fn tree_connect(client: &mut SmbClient, ctx: &SmbCtx, share: &str) -> Result<()> {
     let unc = format!("\\\\{}\\{}", ctx.host, share);
     let fut = client.tree_connect(&unc);
     tokio::time::timeout(SMB_OP_TIMEOUT, fut)
@@ -387,8 +389,7 @@ pub(crate) fn swap_bat(exe_win: &str, staged_win: &str, tmp_rel: &str) -> String
 pub(crate) fn parse_certutil_hash(output: &str) -> Option<String> {
     for line in output.lines() {
         let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        let is_hex64 = stripped.len() == 64
-            && stripped.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex64 = stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit());
         if is_hex64 {
             return Some(stripped.to_uppercase());
         }
@@ -525,10 +526,7 @@ pub(crate) async fn scm_run_bat(ctx: &SmbCtx, bat_body: &str) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("svcctl start fallito: {}", e))?;
     if !scm_start_ok(start_ret) {
-        bail!(
-            "servizio SCM transitorio non avviato (win32 {})",
-            start_ret
-        );
+        bail!("servizio SCM transitorio non avviato (win32 {})", start_ret);
     }
     Ok(())
 }
@@ -567,7 +565,11 @@ async fn remote_build_info(
 
     // Report CHIAVE=valore — stesso formato dei canali WinRM/SSH.
     let mut report = String::new();
-    report.push_str(if exe_present { "EXE=True\n" } else { "EXE=False\n" });
+    report.push_str(if exe_present {
+        "EXE=True\n"
+    } else {
+        "EXE=False\n"
+    });
     report.push_str(if linux_present {
         "LINUX_PRESENT=True\n"
     } else {
@@ -584,8 +586,7 @@ async fn remote_build_info(
             }
         }
         Err(SmbError::Status(status, _))
-            if status == STATUS_OBJECT_NAME_NOT_FOUND
-                || status == STATUS_OBJECT_PATH_NOT_FOUND =>
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
         {
             // Deploy legacy senza .ver: ts effettivo 0.
         }
@@ -615,10 +616,39 @@ async fn remote_build_info(
         }
     }
 
+    // Discovery RUNNING_EXE (spec §6, estensione al canale SMB): il path
+    // REALE del processo vivo — indispensabile quando EXE_PATH d'env e'
+    // errato (il file cercato sopra puo' essere assente mentre il server
+    // gira da un altro path). Via PowerShell da cmd (wmic deprecato).
+    let tmp_rel = format!("Windows\\Temp\\cp{}.tmp", temp_tag());
+    let bat = exe_capture_lines(
+        "powershell -NoProfile -Command \"if ($p = Get-Process crosspilot* -ErrorAction SilentlyContinue | Select-Object -First 1) { Write-Output ('RUNNING_EXE=' + $p.Path) }\"",
+        &tmp_rel,
+    );
+    match scm_exec(ctx, &bat, SCM_EXEC_TIMEOUT_SECS).await {
+        Ok(out) => {
+            for line in out.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("RUNNING_EXE=") {
+                    report.push_str(trimmed);
+                    report.push('\n');
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[bootstrap-smb] WARNING discovery RUNNING_EXE via SCM: {}",
+                e
+            );
+        }
+    }
+
     let info = version::parse_remote_info(&report);
     crate::qprintln!(
         "[DEBUG] remote_build_info (smb): exe_present={} ts={:?} linux_present={}",
-        info.exe_present, info.build_ts, info.linux_present
+        info.exe_present,
+        info.build_ts,
+        info.linux_present
     );
     if let Some(h) = &info.exe_sha256 {
         crate::qprintln!(
@@ -690,13 +720,13 @@ pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
                 match bootstrap_smb_deploy::deploy_exe(&ctx, exe_path, &info).await {
                     Ok(()) => {}
                     Err(e) => {
-                        // Trasporto morto -> fail-fast; altri errori ->
-                        // warning: il server potrebbe essere gia' attivo
-                        // (il polling decide).
-                        if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some() {
-                            return Err(e);
-                        }
-                        eprintln!("[ERROR] bootstrap-smb: deploy fallito: {}", e);
+                        // §7.3 onesta': exe MANCANTE + deploy fallito =
+                        // niente puo' partire -> propagare Err, mai
+                        // warning + polling su una porta che non si
+                        // aprira' mai.
+                        return Err(
+                            e.context("bootstrap-smb: deploy fallito con exe remoto mancante")
+                        );
                     }
                 }
             } else if info.is_newer_than_local() {
@@ -724,7 +754,9 @@ pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
                     match update_result {
                         Ok(()) => {
                             // Irraggiungibile su unix (exec sostituisce il processo).
-                            eprintln!("[self-update] re-exec completato senza sostituzione processo?");
+                            eprintln!(
+                                "[self-update] re-exec completato senza sostituzione processo?"
+                            );
                         }
                         Err(e) => {
                             if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some() {
@@ -783,7 +815,116 @@ pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
     let up = bootstrap::poll_server_startup().await;
     if !up {
         bootstrap_smb_deploy::remote_startup_diag(&ctx).await;
+        // §7.3 onesta': bootstrap NON riuscito -> Err, mai Ok su porta
+        // morta (il chiamante non deve loggare "completato").
+        return Err(anyhow::anyhow!(
+            "server NON tornato in ascolto entro 30s dopo il bootstrap SMB/SCM \
+             (verificare {} — log crosspilot-server.log sul remote)",
+            ctx.host
+        ));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fallback di update via canale SMB (spec selfdescribe-guardrail §7):
+// solo trasporto file + exec SCM — mai quit prima della verifica.
+// ---------------------------------------------------------------------------
+
+/// §7.1: upload staged via write_file su admin share + hash certutil +
+/// functional check '<staged>' --version. SENZA swap ne' quit: il
+/// trigger resta UPDATE_REQ sul canale TCP verso il server vivo.
+pub async fn channel_deploy_staged(staged_win: &str, payload: &[u8]) -> Result<()> {
+    let ctx = smb_context();
+    let mut client = smb_connect(&ctx).await?;
+    let (share, rel) = admin_share_path(staged_win)?;
+    tree_connect(&mut client, &ctx, &share).await?;
+    client
+        .write_file(&rel, payload)
+        .await
+        .map_err(|e| smb_err(&ctx, e, "write staged"))?;
+    let expected = deploy::sha256_bytes(payload).to_uppercase();
+
+    // Hash dello staged via certutil su SCM.
+    let tmp = format!("Windows\\Temp\\cp{}.tmp", temp_tag());
+    let out = scm_exec(&ctx, &certutil_bat(staged_win, &tmp), SCM_EXEC_TIMEOUT_SECS).await?;
+    let got = parse_certutil_hash(&out).unwrap_or_default();
+    if !got.eq_ignore_ascii_case(&expected) {
+        let _ = client.delete_file(&rel).await;
+        bail!(
+            "SHA-256 MISMATCH staged '{}' via SMB: atteso {} remoto {}",
+            staged_win,
+            &expected[..16.min(expected.len())],
+            &got[..16.min(got.len())]
+        );
+    }
+
+    // Functional check: '<staged>' --version deve stampare il ts atteso.
+    let tmp = format!("Windows\\Temp\\cp{}.tmp", temp_tag());
+    let out = scm_exec(
+        &ctx,
+        &version_check_bat(staged_win, &tmp),
+        SCM_EXEC_TIMEOUT_SECS,
+    )
+    .await?;
+    let mut staged_ts: Option<u64> = None;
+    for line in out.lines() {
+        if let Some(ts) = version::parse_version_ts(line) {
+            staged_ts = Some(ts);
+        }
+    }
+    if staged_ts != Some(version::BUILD_TS) {
+        let _ = client.delete_file(&rel).await;
+        bail!(
+            "functional check staged '{}' fallito via SMB: ts={:?} (atteso {})",
+            staged_win,
+            staged_ts,
+            version::BUILD_TS
+        );
+    }
+    eprintln!(
+        "[update-fallback] staged {} verificato via SMB (hash + --version).",
+        staged_win
+    );
+    Ok(())
+}
+
+/// §7.2: swap exe -> exe.old, staged -> exe + hash finale (swap_bat).
+pub async fn channel_swap_exe(exe_path: &str, staged: &str, expected_hash: &str) -> Result<()> {
+    let ctx = smb_context();
+    let tmp = format!("Windows\\Temp\\cp{}.tmp", temp_tag());
+    let out = scm_exec(
+        &ctx,
+        &swap_bat(exe_path, staged, &tmp),
+        SCM_EXEC_TIMEOUT_SECS,
+    )
+    .await?;
+    let got = parse_certutil_hash(&out).unwrap_or_default();
+    if !got.eq_ignore_ascii_case(expected_hash) {
+        bail!(
+            "SHA-256 MISMATCH post-swap '{}': atteso {} remoto {} (backup in .old)",
+            exe_path,
+            &expected_hash[..16.min(expected_hash.len())],
+            &got[..16.min(got.len())]
+        );
+    }
+    Ok(())
+}
+
+/// §7.2: avvio detached del server via SCM (batch start /b condiviso).
+pub async fn channel_start_server(exe_path: &str) -> Result<()> {
+    let ctx = smb_context();
+    bootstrap_smb_deploy::start_server(&ctx, exe_path).await
+}
+
+/// §7.2 rescue: ripristino `exe.old` -> exe via batch SCM.
+pub async fn channel_restore_old(exe_path: &str) -> Result<()> {
+    let ctx = smb_context();
+    let bat = format!(
+        "if exist \"{}.old\" move /y \"{}.old\" \"{}\"",
+        exe_path, exe_path, exe_path
+    );
+    scm_exec(&ctx, &bat, 30).await?;
     Ok(())
 }
 

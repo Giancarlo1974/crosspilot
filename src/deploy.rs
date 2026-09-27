@@ -120,12 +120,20 @@ pub(crate) fn remote_dir_of(remote_exe_path: &str) -> &str {
 
 /// Path remoto del sidecar linux (accanto all'exe).
 fn linux_sidecar_path(remote_exe_path: &str) -> String {
-    format!("{}\\{}", remote_dir_of(remote_exe_path), version::LINUX_SIDECAR_NAME)
+    format!(
+        "{}\\{}",
+        remote_dir_of(remote_exe_path),
+        version::LINUX_SIDECAR_NAME
+    )
 }
 
 /// Path remoto del file metadati .ver (accanto all'exe).
 fn ver_file_path(remote_exe_path: &str) -> String {
-    format!("{}\\{}", remote_dir_of(remote_exe_path), version::VER_FILE_NAME)
+    format!(
+        "{}\\{}",
+        remote_dir_of(remote_exe_path),
+        version::VER_FILE_NAME
+    )
 }
 
 /// Legge lo stato della build deployata sul remote con UNA sola chiamata
@@ -169,10 +177,16 @@ pub async fn remote_build_info(
 
     crate::qprintln!(
         "[DEBUG] remote_build_info: exe_present={} ts={:?} linux_present={} exit_code={}",
-        info.exe_present, info.build_ts, info.linux_present, out.exit_code
+        info.exe_present,
+        info.build_ts,
+        info.linux_present,
+        out.exit_code
     );
     if let Some(h) = &info.exe_sha256 {
-        crate::qprintln!("[DEBUG] remote_build_info: exe_sha256={}", &h[..16.min(h.len())]);
+        crate::qprintln!(
+            "[DEBUG] remote_build_info: exe_sha256={}",
+            &h[..16.min(h.len())]
+        );
     }
 
     Ok(info)
@@ -240,7 +254,11 @@ pub async fn deploy_exe(
     } else {
         eprintln!(
             "[deploy] exe remoto {}: upload staged di {} byte...",
-            if info.exe_present { "obsoleto/assente" } else { "mancante" },
+            if info.exe_present {
+                "obsoleto/assente"
+            } else {
+                "mancante"
+            },
             exe_data.len()
         );
         ensure_remote_dir(client, host, remote_exe_path).await?;
@@ -261,7 +279,10 @@ pub async fn deploy_exe(
         if aligned {
             eprintln!("[deploy] sidecar linux gia' allineato. Skip.");
         } else {
-            eprintln!("[deploy] upload staged sidecar linux ({} byte)...", linux_data.len());
+            eprintln!(
+                "[deploy] upload staged sidecar linux ({} byte)...",
+                linux_data.len()
+            );
             upload_artifact(client, host, linux_data, &linux_path, false).await?;
         }
     }
@@ -300,7 +321,11 @@ pub async fn deploy_exe(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     } else {
-        eprintln!("[deploy] .ver scritto: {} (ts={})", ver_path, version::BUILD_TS);
+        eprintln!(
+            "[deploy] .ver scritto: {} (ts={})",
+            ver_path,
+            version::BUILD_TS
+        );
     }
 
     // --- Step 4: .env minimale per il server (invariato) ---
@@ -309,7 +334,10 @@ pub async fn deploy_exe(
     let server_port = envs::var("SERVER_PORT").unwrap_or_else(|| "5330".to_string());
     let env_content = format!("CROSSPILOT_SERVER_PORT={}", server_port);
     let env_remote = format!("{}\\.env", remote_dir_of(remote_exe_path));
-    let env_script = format!("[IO.File]::WriteAllText('{}', '{}')", env_remote, env_content);
+    let env_script = format!(
+        "[IO.File]::WriteAllText('{}', '{}')",
+        env_remote, env_content
+    );
     let out = client
         .run_powershell(host, &env_script)
         .await
@@ -323,7 +351,10 @@ pub async fn deploy_exe(
         eprintln!("[deploy] .env scritto: {}", env_remote);
     }
 
-    eprintln!("[deploy] artefatti remoti allineati al build locale (ts={})", version::BUILD_TS);
+    eprintln!(
+        "[deploy] artefatti remoti allineati al build locale (ts={})",
+        version::BUILD_TS
+    );
     Ok(())
 }
 
@@ -338,7 +369,10 @@ async fn ensure_remote_dir(client: &WinrmClient, host: &str, remote_exe_path: &s
         .run_powershell(host, &mkdir_script)
         .await
         .context("mkdir remoto")?;
-    eprintln!("[deploy] dir target: {}", String::from_utf8_lossy(&out.stdout).trim());
+    eprintln!(
+        "[deploy] dir target: {}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
     Ok(())
 }
 
@@ -394,10 +428,29 @@ async fn upload_artifact(
         format!("{}.new", remote_path)
     };
 
+    winrm_upload_blob(client, host, data, &temp_b64, remote_path).await?;
+    winrm_decode_to(client, host, &temp_b64, &staged, &local_hash).await?;
+    if check_version {
+        winrm_functional_check(client, host, &staged).await?;
+    }
+    winrm_swap_and_verify(client, host, remote_path, &staged, &local_hash).await
+}
+
+/// Upload base64 chunked via send_input (stdin) verso `<temp_b64>`.
+/// `label` e' il path logico mostrato nei log.
+/// Estratto da upload_artifact: riusato dal deploy staged-only del
+/// fallback §7.1 (canale = solo trasporto, il trigger resta TCP).
+async fn winrm_upload_blob(
+    client: &WinrmClient,
+    host: &str,
+    data: &[u8],
+    temp_b64: &str,
+    label: &str,
+) -> Result<()> {
     // --- Upload base64 chunked via send_input (stdin) ---
     eprintln!(
         "[deploy] '{}' upload chunked ({} byte, chunk={} base64)...",
-        remote_path,
+        label,
         data.len(),
         CHUNK_B64_SIZE
     );
@@ -458,7 +511,10 @@ async fn upload_artifact(
         if recv.done {
             done = true;
             if !recv.stderr.is_empty() {
-                eprintln!("[deploy] stderr: {}", String::from_utf8_lossy(&recv.stderr).trim());
+                eprintln!(
+                    "[deploy] stderr: {}",
+                    String::from_utf8_lossy(&recv.stderr).trim()
+                );
             }
             break;
         }
@@ -469,10 +525,18 @@ async fn upload_artifact(
         anyhow::bail!("comando upload non completato entro 30s");
     }
     eprintln!("[deploy] upload base64 completato.");
+    Ok(())
+}
 
-    // --- Decode .b64 -> .new + verifica hash dello staged ---
-    // Il decode avviene su un FILE NUOVO (.new): l'originale resta intatto
-    // fino allo swap finale.
+/// Decode `<temp_b64>` -> `<staged>` + verifica SHA-256 dello staged
+/// (confronto con `local_hash` uppercase). L'originale non e' toccato.
+async fn winrm_decode_to(
+    client: &WinrmClient,
+    host: &str,
+    temp_b64: &str,
+    staged: &str,
+    local_hash: &str,
+) -> Result<()> {
     let decode_script = format!(
         "$b64 = Get-Content '{}' -Raw -Encoding ASCII; \
          $bytes = [Convert]::FromBase64String($b64); \
@@ -484,7 +548,7 @@ async fn upload_artifact(
     let out = client
         .run_powershell(host, &decode_script)
         .await
-        .context("decode base64 -> .new")?;
+        .context("decode base64 -> staged")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let staged_hash = stdout
         .lines()
@@ -493,70 +557,95 @@ async fn upload_artifact(
         .to_uppercase();
     eprintln!(
         "[deploy] hash staged: {}",
-        if staged_hash.is_empty() { "(vuoto)" } else { &staged_hash[..16.min(staged_hash.len())] }
+        if staged_hash.is_empty() {
+            "(vuoto)"
+        } else {
+            &staged_hash[..16.min(staged_hash.len())]
+        }
     );
     if staged_hash != local_hash {
         // Pulizia best-effort dello staged corrotto.
-        let rm = format!("if (Test-Path '{}') {{ Remove-Item '{}' -Force }}", staged, staged);
+        let rm = format!(
+            "if (Test-Path '{}') {{ Remove-Item '{}' -Force }}",
+            staged, staged
+        );
         let _ = client.run_powershell(host, &rm).await;
         anyhow::bail!(
             "SHA-256 MISMATCH staged '{}': atteso {} remoto {}",
             staged,
-            &local_hash[..16],
+            &local_hash[..16.min(local_hash.len())],
             &staged_hash[..16.min(staged_hash.len())]
         );
     }
+    Ok(())
+}
 
-    // --- Functional check (solo exe Windows): lo staged deve eseguire ---
-    // '<path>.new' --version deve uscire 0 e stampare il build_ts atteso.
-    // Prova che il PE e' integro (non troncato, non corrotto) PRIMA di
-    // sostituire l'exe in produzione. Per il sidecar linux non e'
-    // eseguibile su Windows: check_version=false, basta l'hash.
-    if check_version {
-        let ver_script = format!(
-            "$o = & '{}' --version 2>&1 | Out-String; \
-             Write-Output \"EXIT=$LASTEXITCODE\"; \
-             Write-Output \"VER=$($o.Trim())\"",
-            staged
-        );
-        let out = client
-            .run_powershell(host, &ver_script)
-            .await
-            .context("functional check --version staged")?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut exit_ok = false;
-        let mut remote_ts: Option<u64> = None;
-        for line in stdout.lines() {
-            let line = line.trim();
-            if let Some(v) = line.strip_prefix("EXIT=") {
-                exit_ok = v == "0";
-            }
-            if let Some(v) = line.strip_prefix("VER=") {
-                remote_ts = version::parse_version_ts(v);
-            }
+/// Functional check dello staged via WinRM: `& '<staged>' --version`
+/// deve uscire 0 e riportare il build_ts atteso — prova che il PE e'
+/// integro ED eseguibile PRIMA di qualunque swap (spec §7: mai
+/// fermare/sostituire un server sano senza questa prova).
+async fn winrm_functional_check(client: &WinrmClient, host: &str, staged: &str) -> Result<()> {
+    let ver_script = format!(
+        "$o = & '{}' --version 2>&1 | Out-String; \
+         Write-Output \"EXIT=$LASTEXITCODE\"; \
+         Write-Output \"VER=$($o.Trim())\"",
+        staged
+    );
+    let out = client
+        .run_powershell(host, &ver_script)
+        .await
+        .context("functional check --version staged")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut exit_ok = false;
+    let mut remote_ts: Option<u64> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("EXIT=") {
+            exit_ok = v == "0";
         }
-        crate::qprintln!(
-            "[DEBUG] functional check staged: exit_ok={} ts={:?} atteso={}",
-            exit_ok, remote_ts, version::BUILD_TS
-        );
-        if !exit_ok || remote_ts != Some(version::BUILD_TS) {
-            let rm = format!("if (Test-Path '{}') {{ Remove-Item '{}' -Force }}", staged, staged);
-            let _ = client.run_powershell(host, &rm).await;
-            anyhow::bail!(
-                "functional check fallito su '{}': exit_ok={} ts={:?} (atteso {}). \
-                 Exe originale NON toccato.",
-                staged,
-                exit_ok,
-                remote_ts,
-                version::BUILD_TS
-            );
+        if let Some(v) = line.strip_prefix("VER=") {
+            remote_ts = version::parse_version_ts(v);
         }
-        eprintln!("[deploy] functional check OK: staged esegue e riporta ts={}", version::BUILD_TS);
     }
+    crate::qprintln!(
+        "[DEBUG] functional check staged: exit_ok={} ts={:?} atteso={}",
+        exit_ok,
+        remote_ts,
+        version::BUILD_TS
+    );
+    if !exit_ok || remote_ts != Some(version::BUILD_TS) {
+        let rm = format!(
+            "if (Test-Path '{}') {{ Remove-Item '{}' -Force }}",
+            staged, staged
+        );
+        let _ = client.run_powershell(host, &rm).await;
+        anyhow::bail!(
+            "functional check fallito su '{}': exit_ok={} ts={:?} (atteso {}). \
+             Exe originale NON toccato.",
+            staged,
+            exit_ok,
+            remote_ts,
+            version::BUILD_TS
+        );
+    }
+    eprintln!(
+        "[deploy] functional check OK: staged esegue e riporta ts={}",
+        version::BUILD_TS
+    );
+    Ok(())
+}
 
-    // --- Swap atomico-ish: <path> -> <path>.old, <staged> -> <path> ---
-    // Windows consente la RINOMINA di un exe in esecuzione (no overwrite):
-    // questo rende il deploy sicuro anche se il server sta girando.
+/// Swap atomico-ish `<path>` -> `<path>.old`, `<staged>` -> `<path>` +
+/// verifica hash finale. Windows consente la RINOMINA di un exe in
+/// esecuzione (no overwrite): deploy sicuro anche a server attivo.
+/// pub(crate): riusato dal fallback §7.2 (swap via canale prima del quit).
+pub(crate) async fn winrm_swap_and_verify(
+    client: &WinrmClient,
+    host: &str,
+    remote_path: &str,
+    staged: &str,
+    local_hash: &str,
+) -> Result<()> {
     let swap_script = format!(
         "if (Test-Path '{0}.old') {{ Remove-Item '{0}.old' -Force }}; \
          if (Test-Path '{0}') {{ Move-Item '{0}' '{0}.old' -Force }}; \
@@ -567,7 +656,7 @@ async fn upload_artifact(
     let out = client
         .run_powershell(host, &swap_script)
         .await
-        .context("swap .new -> finale")?;
+        .context("swap staged -> finale")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let final_hash = stdout
         .lines()
@@ -583,12 +672,33 @@ async fn upload_artifact(
         anyhow::bail!(
             "SHA-256 MISMATCH post-swap '{}': atteso {} remoto {}",
             remote_path,
-            &local_hash[..16],
+            &local_hash[..16.min(local_hash.len())],
             &final_hash[..16.min(final_hash.len())]
         );
     }
-    eprintln!("[deploy] '{}' aggiornato e verificato (backup in .old).", remote_path);
+    eprintln!(
+        "[deploy] '{}' aggiornato e verificato (backup in .old).",
+        remote_path
+    );
     Ok(())
+}
+
+/// Deploy del SOLO staged via WinRM (fallback §7.1, spec
+/// selfdescribe-guardrail): upload chunked + decode + hash + functional
+/// check, SENZA swap e SENZA quit — il trigger resta UPDATE_REQ sul
+/// canale TCP verso il server ancora vivo.
+/// `staged_path` e' il path remoto completo (es. `C:\ci\crosspilot-<ts>.exe`).
+pub async fn deploy_staged_winrm(
+    client: &WinrmClient,
+    host: &str,
+    staged_path: &str,
+    data: &[u8],
+) -> Result<()> {
+    let local_hash = sha256_bytes(data).to_uppercase();
+    let temp_b64 = format!("{}.b64", staged_path);
+    winrm_upload_blob(client, host, data, &temp_b64, staged_path).await?;
+    winrm_decode_to(client, host, &temp_b64, staged_path, &local_hash).await?;
+    winrm_functional_check(client, host, staged_path).await
 }
 
 /// Calcola SHA-256 (lowercase hex) di byte in memoria.
@@ -644,10 +754,7 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>> {
             _ => anyhow::bail!("carattere base64 invalido: {:?}", c as char),
         }
     }
-    let clean: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
     for chunk in clean.chunks(4) {
         if chunk.len() < 4 {

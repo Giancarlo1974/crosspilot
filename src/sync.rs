@@ -20,14 +20,13 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
 use crate::tls::Link;
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::path;
 use crate::proto::{
-    self, DeleteBatchReq, DeleteItem, ListEntry, ListReq,
-    MkdirBatchReq,
-    MSG_DELETE_BATCH_RES, MSG_ERR, MSG_LIST_RES, MSG_MKDIR_BATCH_RES,
+    self, DeleteBatchReq, DeleteItem, ListEntry, ListReq, MkdirBatchReq, MSG_DELETE_BATCH_RES,
+    MSG_ERR, MSG_LIST_RES, MSG_MKDIR_BATCH_RES,
 };
 use crate::verify::sha256_file_handle;
 
@@ -177,10 +176,22 @@ pub fn walk_local_dir(dir: &Path) -> Result<WalkResult> {
     let mut skipped_non_utf8 = Vec::new();
     let mut skipped_reserved = Vec::<(String, &'static str)>::new();
     let mut skipped_unreadable = Vec::new();
-    walk_recursive(dir, Path::new(""), &mut entries, &mut skipped_non_utf8, &mut skipped_reserved, &mut skipped_unreadable)?;
+    walk_recursive(
+        dir,
+        Path::new(""),
+        &mut entries,
+        &mut skipped_non_utf8,
+        &mut skipped_reserved,
+        &mut skipped_unreadable,
+    )?;
     // Ordina per rel_path per output deterministico (sync-spec §16).
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok(WalkResult { entries, skipped_non_utf8, skipped_reserved, skipped_unreadable })
+    Ok(WalkResult {
+        entries,
+        skipped_non_utf8,
+        skipped_reserved,
+        skipped_unreadable,
+    })
 }
 
 /// Funzione ricorsiva interna del walk. `base` è la dir root, `rel` è il path
@@ -204,7 +215,11 @@ fn walk_recursive(
             // gia' enumerata come entry dal chiamante: con --delete il
             // contenuto mancante non va cancellato (vedi execute_sync).
             if rel.as_os_str().is_empty() {
-                return Err(anyhow!("impossibile leggere directory {}: {}", full.display(), e));
+                return Err(anyhow!(
+                    "impossibile leggere directory {}: {}",
+                    full.display(),
+                    e
+                ));
             }
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             eprintln!(
@@ -220,7 +235,11 @@ fn walk_recursive(
             Ok(e) => e,
             Err(e) => {
                 // Entry singola non leggibile: skip + log, non abortire tutto il walk.
-                eprintln!("[WARN] walk: skip entry non leggibile in {}: {}", full.display(), e);
+                eprintln!(
+                    "[WARN] walk: skip entry non leggibile in {}: {}",
+                    full.display(),
+                    e
+                );
                 continue;
             }
         };
@@ -245,7 +264,10 @@ fn walk_recursive(
             Some(s) => s.replace('\\', "/"),
             None => {
                 // Non dovrebbe succedere dato che name_str è UTF-8, ma difensivo.
-                eprintln!("[WARN] walk: skip rel_path non-UTF-8: {}", child_rel.display());
+                eprintln!(
+                    "[WARN] walk: skip rel_path non-UTF-8: {}",
+                    child_rel.display()
+                );
                 continue;
             }
         };
@@ -266,7 +288,10 @@ fn walk_recursive(
         let metadata = match dir_entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[WARN] walk: skip metadata non leggibile {}: {}", child_rel_str, e);
+                eprintln!(
+                    "[WARN] walk: skip metadata non leggibile {}: {}",
+                    child_rel_str, e
+                );
                 continue;
             }
         };
@@ -278,7 +303,14 @@ fn walk_recursive(
                 sha256: None,
             });
             // Ricorsione nella sottodirectory.
-            walk_recursive(base, &child_rel, out, skipped_non_utf8, skipped_reserved, skipped_unreadable)?;
+            walk_recursive(
+                base,
+                &child_rel,
+                out,
+                skipped_non_utf8,
+                skipped_reserved,
+                skipped_unreadable,
+            )?;
         } else {
             out.push(Entry {
                 rel_path: child_rel_str,
@@ -321,7 +353,8 @@ pub async fn list_remote_dir(
     };
     crate::qprintln!(
         "[DEBUG] list_remote_dir: LIST_REQ path={} recursive=1 with_hash={}",
-        remote_dir, req.with_hash
+        remote_dir,
+        req.with_hash
     );
     proto::send_list_req(stream, &req).await?;
 
@@ -330,7 +363,11 @@ pub async fn list_remote_dir(
     if msg_type == MSG_ERR {
         let err = proto::decode_err(&payload)?;
         // ERR 1 = path invalido, ERR 5 = cap superato / proto.
-        bail!("LIST_REQ rifiutata dal server: ERR {}: {}", err.code, err.message);
+        bail!(
+            "LIST_REQ rifiutata dal server: ERR {}: {}",
+            err.code,
+            err.message
+        );
     }
     if msg_type != MSG_LIST_RES {
         bail!(
@@ -341,7 +378,10 @@ pub async fn list_remote_dir(
     }
     // Decodifica con il flag with_hash coerente con la richiesta.
     let res = proto::decode_list_res(&payload, with_hash)?;
-    crate::qprintln!("[DEBUG] list_remote_dir: ricevute {} entry", res.entries.len());
+    crate::qprintln!(
+        "[DEBUG] list_remote_dir: ricevute {} entry",
+        res.entries.len()
+    );
 
     // Validazione difensiva (sync-spec §8): ogni rel_path ricevuto dal server
     // non deve contenere '..' (un server malevolo/buggato non deve far escapare
@@ -457,11 +497,7 @@ pub fn is_excluded(rel_path: &str, patterns: &[String]) -> bool {
 /// Filtra le entry locali e remote secondo le esclusioni --exclude.
 /// Entrambi i lati: un path escluso non e' ne' trasferito ne' cancellato
 /// (esattamente come rsync --exclude).
-pub fn apply_exclusions(
-    local: &mut WalkResult,
-    remote: &mut Vec<Entry>,
-    patterns: &[String],
-) {
+pub fn apply_exclusions(local: &mut WalkResult, remote: &mut Vec<Entry>, patterns: &[String]) {
     if patterns.is_empty() {
         return;
     }
@@ -524,7 +560,12 @@ pub fn apply_exclusions(
 /// nessun altro set.
 ///
 /// `local_dir` serve per calcolare gli hash locali quando `checksum=true`.
-pub fn compute_diff(local: &WalkResult, remote: &[Entry], checksum: bool, local_dir: &Path) -> Diff {
+pub fn compute_diff(
+    local: &WalkResult,
+    remote: &[Entry],
+    checksum: bool,
+    local_dir: &Path,
+) -> Diff {
     // Mappa remote per lowercase rel_path (Windows case-insensitive, sync-spec §8.1).
     let mut remote_by_lower: HashMap<String, &Entry> = HashMap::new();
     for r in remote {
@@ -550,7 +591,8 @@ pub fn compute_diff(local: &WalkResult, remote: &[Entry], checksum: bool, local_
 
     let mut entries = Vec::new();
     // Traccia i rel_path remote già "consumati" da un match locale, per calcolare MISSING.
-    let mut matched_remote_lower: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut matched_remote_lower: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for l in &local.entries {
         let lower = l.rel_path.to_lowercase();
@@ -596,7 +638,10 @@ pub fn compute_diff(local: &WalkResult, remote: &[Entry], checksum: bool, local_
                 if local_is_dir != remote_is_dir {
                     let kind_local = if local_is_dir { "dir" } else { "file" };
                     let kind_remote = if remote_is_dir { "dir" } else { "file" };
-                    let reason = format!("file vs dir (locale {}, remoto {})", kind_local, kind_remote);
+                    let reason = format!(
+                        "file vs dir (locale {}, remoto {})",
+                        kind_local, kind_remote
+                    );
                     entries.push(DiffEntry {
                         rel_path: l.rel_path.clone(),
                         status: EntryStatus::Conflict,
@@ -1095,10 +1140,7 @@ impl SyncSession {
     /// Esegue un'operazione framed sulla connessione corrente.
     /// Su drop di trasporto: una riconnessione + retry (le op sync sono
     /// idempotenti). Errori di protocollo: propagati subito, mai ritentati.
-    pub async fn op<T>(
-        &mut self,
-        mut f: impl AsyncFnMut(&mut Link) -> Result<T>,
-    ) -> Result<T> {
+    pub async fn op<T>(&mut self, mut f: impl AsyncFnMut(&mut Link) -> Result<T>) -> Result<T> {
         let mut attempt = 0u32;
         loop {
             if self.link.is_none() {
@@ -1136,9 +1178,7 @@ impl SyncSession {
                         self.single_shot = true;
                     }
                     self.reconnects += 1;
-                    crate::qprintln!(
-                        "[sync] connessione remota chiusa, riconnessione e retry..."
-                    );
+                    crate::qprintln!("[sync] connessione remota chiusa, riconnessione e retry...");
                 }
             }
         }
@@ -1195,8 +1235,8 @@ where
     // "IO error encountered -- skipping file deletion". Warning esplicito
     // + skip di TUTTA la fase delete, anche in dry-run... no: in dry-run
     // il piano si mostra comunque com'e' (nessun effetto collaterale).
-    let delete_guard = params.delete
-        && (!plan.skipped_unreadable.is_empty() || !plan.skipped_remote.is_empty());
+    let delete_guard =
+        params.delete && (!plan.skipped_unreadable.is_empty() || !plan.skipped_remote.is_empty());
     if delete_guard {
         eprintln!(
             "[WARN] sync: --delete sospeso: {} dir locali e {} dir remote non leggibili \
@@ -1344,7 +1384,10 @@ where
                     }
                     report.delete_count += plan.dirs_to_delete.len() as u32;
                     if !params.quiet {
-                        crate::qprintln!("[sync] DELETE {} dir (recursive)", plan.dirs_to_delete.len());
+                        crate::qprintln!(
+                            "[sync] DELETE {} dir (recursive)",
+                            plan.dirs_to_delete.len()
+                        );
                     }
                 }
                 Err(e) => {
@@ -1372,7 +1415,11 @@ where
 
 /// Esegue MKDIR_BATCH_REQ sulla connessione della sessione. Ritorna la lista
 /// di messaggi di errore per-path (status=2). Count mismatch -> errore fatale.
-async fn run_mkdir_batch(plan: &Plan, params: &SyncParams, session: &mut SyncSession) -> Result<Vec<String>> {
+async fn run_mkdir_batch(
+    plan: &Plan,
+    params: &SyncParams,
+    session: &mut SyncSession,
+) -> Result<Vec<String>> {
     let mut paths = Vec::with_capacity(plan.dirs_to_create.len());
     for rel in &plan.dirs_to_create {
         let full = join_remote_path(&params.remote_dir, rel);
@@ -1423,7 +1470,10 @@ async fn run_delete_batch_files(
     let mut items = Vec::with_capacity(plan.files_to_delete.len());
     for rel in &plan.files_to_delete {
         let full = join_remote_path(&params.remote_dir, rel);
-        items.push(DeleteItem { path: full, recursive: 0 });
+        items.push(DeleteItem {
+            path: full,
+            recursive: 0,
+        });
     }
     run_delete_batch(&plan.files_to_delete, items, session).await
 }
@@ -1437,7 +1487,10 @@ async fn run_delete_batch_dirs(
     let mut items = Vec::with_capacity(plan.dirs_to_delete.len());
     for rel in &plan.dirs_to_delete {
         let full = join_remote_path(&params.remote_dir, rel);
-        items.push(DeleteItem { path: full, recursive: 1 });
+        items.push(DeleteItem {
+            path: full,
+            recursive: 1,
+        });
     }
     run_delete_batch(&plan.dirs_to_delete, items, session).await
 }
@@ -1565,14 +1618,34 @@ mod tests {
         // sync-spec §14 test 1: due directory identiche -> tutto IDENTICAL.
         let local = WalkResult {
             entries: vec![
-                Entry { rel_path: "a.txt".into(), size: 5, is_dir: 0, sha256: None },
-                Entry { rel_path: "sub".into(), size: 0, is_dir: 1, sha256: None },
+                Entry {
+                    rel_path: "a.txt".into(),
+                    size: 5,
+                    is_dir: 0,
+                    sha256: None,
+                },
+                Entry {
+                    rel_path: "sub".into(),
+                    size: 0,
+                    is_dir: 1,
+                    sha256: None,
+                },
             ],
             ..Default::default()
         };
         let remote = vec![
-            Entry { rel_path: "a.txt".into(), size: 5, is_dir: 0, sha256: None },
-            Entry { rel_path: "sub".into(), size: 0, is_dir: 1, sha256: None },
+            Entry {
+                rel_path: "a.txt".into(),
+                size: 5,
+                is_dir: 0,
+                sha256: None,
+            },
+            Entry {
+                rel_path: "sub".into(),
+                size: 0,
+                is_dir: 1,
+                sha256: None,
+            },
         ];
         let dir = Path::new("/tmp");
         let diff = compute_diff(&local, &remote, false, dir);
@@ -1590,16 +1663,46 @@ mod tests {
         // size diversa -> CHANGED.
         let local = WalkResult {
             entries: vec![
-                Entry { rel_path: "new.txt".into(), size: 3, is_dir: 0, sha256: None },
-                Entry { rel_path: "changed.txt".into(), size: 10, is_dir: 0, sha256: None },
-                Entry { rel_path: "same.txt".into(), size: 5, is_dir: 0, sha256: None },
+                Entry {
+                    rel_path: "new.txt".into(),
+                    size: 3,
+                    is_dir: 0,
+                    sha256: None,
+                },
+                Entry {
+                    rel_path: "changed.txt".into(),
+                    size: 10,
+                    is_dir: 0,
+                    sha256: None,
+                },
+                Entry {
+                    rel_path: "same.txt".into(),
+                    size: 5,
+                    is_dir: 0,
+                    sha256: None,
+                },
             ],
             ..Default::default()
         };
         let remote = vec![
-            Entry { rel_path: "changed.txt".into(), size: 7, is_dir: 0, sha256: None },
-            Entry { rel_path: "same.txt".into(), size: 5, is_dir: 0, sha256: None },
-            Entry { rel_path: "missing.txt".into(), size: 8, is_dir: 0, sha256: None },
+            Entry {
+                rel_path: "changed.txt".into(),
+                size: 7,
+                is_dir: 0,
+                sha256: None,
+            },
+            Entry {
+                rel_path: "same.txt".into(),
+                size: 5,
+                is_dir: 0,
+                sha256: None,
+            },
+            Entry {
+                rel_path: "missing.txt".into(),
+                size: 8,
+                is_dir: 0,
+                sha256: None,
+            },
         ];
         let dir = Path::new("/tmp");
         let diff = compute_diff(&local, &remote, false, dir);
@@ -1610,28 +1713,46 @@ mod tests {
         assert_eq!(counts.identical, 1);
         // Verifica per-entry.
         assert_eq!(find_diff(&diff.entries, "new.txt").status, EntryStatus::New);
-        assert_eq!(find_diff(&diff.entries, "changed.txt").status, EntryStatus::Changed);
-        assert_eq!(find_diff(&diff.entries, "missing.txt").status, EntryStatus::Missing);
-        assert_eq!(find_diff(&diff.entries, "same.txt").status, EntryStatus::Identical);
+        assert_eq!(
+            find_diff(&diff.entries, "changed.txt").status,
+            EntryStatus::Changed
+        );
+        assert_eq!(
+            find_diff(&diff.entries, "missing.txt").status,
+            EntryStatus::Missing
+        );
+        assert_eq!(
+            find_diff(&diff.entries, "same.txt").status,
+            EntryStatus::Identical
+        );
     }
 
     #[test]
     fn diff_conflict_file_vs_dir() {
         // sync-spec §14 test 13: file vs dir sullo stesso rel_path -> CONFLICT.
         let local = WalkResult {
-            entries: vec![
-                Entry { rel_path: "data".into(), size: 100, is_dir: 0, sha256: None },
-            ],
+            entries: vec![Entry {
+                rel_path: "data".into(),
+                size: 100,
+                is_dir: 0,
+                sha256: None,
+            }],
             ..Default::default()
         };
-        let remote = vec![
-            Entry { rel_path: "data".into(), size: 0, is_dir: 1, sha256: None },
-        ];
+        let remote = vec![Entry {
+            rel_path: "data".into(),
+            size: 0,
+            is_dir: 1,
+            sha256: None,
+        }];
         let dir = Path::new("/tmp");
         let diff = compute_diff(&local, &remote, false, dir);
         let counts = diff.counts();
         assert_eq!(counts.conflict, 1);
-        assert_eq!(find_diff(&diff.entries, "data").status, EntryStatus::Conflict);
+        assert_eq!(
+            find_diff(&diff.entries, "data").status,
+            EntryStatus::Conflict
+        );
     }
 
     #[test]
@@ -1639,8 +1760,18 @@ mod tests {
         // sync-spec §14 test 18: source con a.txt + A.txt -> entrambi CONFLICT.
         let local = WalkResult {
             entries: vec![
-                Entry { rel_path: "a.txt".into(), size: 3, is_dir: 0, sha256: None },
-                Entry { rel_path: "A.txt".into(), size: 4, is_dir: 0, sha256: None },
+                Entry {
+                    rel_path: "a.txt".into(),
+                    size: 3,
+                    is_dir: 0,
+                    sha256: None,
+                },
+                Entry {
+                    rel_path: "A.txt".into(),
+                    size: 4,
+                    is_dir: 0,
+                    sha256: None,
+                },
             ],
             ..Default::default()
         };
@@ -1670,24 +1801,39 @@ mod tests {
         fake_remote_hash[0] = 0xFF;
 
         let local = WalkResult {
-            entries: vec![
-                Entry { rel_path: "same_size.txt".into(), size: 4, is_dir: 0, sha256: None },
-            ],
+            entries: vec![Entry {
+                rel_path: "same_size.txt".into(),
+                size: 4,
+                is_dir: 0,
+                sha256: None,
+            }],
             ..Default::default()
         };
-        let remote = vec![
-            Entry { rel_path: "same_size.txt".into(), size: 4, is_dir: 0, sha256: Some(fake_remote_hash) },
-        ];
+        let remote = vec![Entry {
+            rel_path: "same_size.txt".into(),
+            size: 4,
+            is_dir: 0,
+            sha256: Some(fake_remote_hash),
+        }];
         let diff = compute_diff(&local, &remote, true, &root);
         // size uguale ma hash diverso -> CHANGED.
-        assert_eq!(find_diff(&diff.entries, "same_size.txt").status, EntryStatus::Changed);
+        assert_eq!(
+            find_diff(&diff.entries, "same_size.txt").status,
+            EntryStatus::Changed
+        );
 
         // Ora con hash uguale -> IDENTICAL.
-        let remote_ok = vec![
-            Entry { rel_path: "same_size.txt".into(), size: 4, is_dir: 0, sha256: Some(local_hash) },
-        ];
+        let remote_ok = vec![Entry {
+            rel_path: "same_size.txt".into(),
+            size: 4,
+            is_dir: 0,
+            sha256: Some(local_hash),
+        }];
         let diff2 = compute_diff(&local, &remote_ok, true, &root);
-        assert_eq!(find_diff(&diff2.entries, "same_size.txt").status, EntryStatus::Identical);
+        assert_eq!(
+            find_diff(&diff2.entries, "same_size.txt").status,
+            EntryStatus::Identical
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1699,9 +1845,42 @@ mod tests {
         // sync-spec §7: MKDIR in ordine profondità crescente (genitori prima).
         let diff = Diff {
             entries: vec![
-                DiffEntry { rel_path: "a/b/c/d".into(), status: EntryStatus::New, local: Some(Entry { rel_path: "a/b/c/d".into(), size: 0, is_dir: 1, sha256: None }), remote: None, conflict_reason: String::new() },
-                DiffEntry { rel_path: "a".into(), status: EntryStatus::New, local: Some(Entry { rel_path: "a".into(), size: 0, is_dir: 1, sha256: None }), remote: None, conflict_reason: String::new() },
-                DiffEntry { rel_path: "a/b".into(), status: EntryStatus::New, local: Some(Entry { rel_path: "a/b".into(), size: 0, is_dir: 1, sha256: None }), remote: None, conflict_reason: String::new() },
+                DiffEntry {
+                    rel_path: "a/b/c/d".into(),
+                    status: EntryStatus::New,
+                    local: Some(Entry {
+                        rel_path: "a/b/c/d".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    remote: None,
+                    conflict_reason: String::new(),
+                },
+                DiffEntry {
+                    rel_path: "a".into(),
+                    status: EntryStatus::New,
+                    local: Some(Entry {
+                        rel_path: "a".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    remote: None,
+                    conflict_reason: String::new(),
+                },
+                DiffEntry {
+                    rel_path: "a/b".into(),
+                    status: EntryStatus::New,
+                    local: Some(Entry {
+                        rel_path: "a/b".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    remote: None,
+                    conflict_reason: String::new(),
+                },
             ],
             ..Default::default()
         };
@@ -1714,9 +1893,42 @@ mod tests {
         // sync-spec §7: DELETE dir in profondità decrescente (figli prima).
         let diff = Diff {
             entries: vec![
-                DiffEntry { rel_path: "x".into(), status: EntryStatus::Missing, local: None, remote: Some(Entry { rel_path: "x".into(), size: 0, is_dir: 1, sha256: None }), conflict_reason: String::new() },
-                DiffEntry { rel_path: "x/y/z".into(), status: EntryStatus::Missing, local: None, remote: Some(Entry { rel_path: "x/y/z".into(), size: 0, is_dir: 1, sha256: None }), conflict_reason: String::new() },
-                DiffEntry { rel_path: "x/y".into(), status: EntryStatus::Missing, local: None, remote: Some(Entry { rel_path: "x/y".into(), size: 0, is_dir: 1, sha256: None }), conflict_reason: String::new() },
+                DiffEntry {
+                    rel_path: "x".into(),
+                    status: EntryStatus::Missing,
+                    local: None,
+                    remote: Some(Entry {
+                        rel_path: "x".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    conflict_reason: String::new(),
+                },
+                DiffEntry {
+                    rel_path: "x/y/z".into(),
+                    status: EntryStatus::Missing,
+                    local: None,
+                    remote: Some(Entry {
+                        rel_path: "x/y/z".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    conflict_reason: String::new(),
+                },
+                DiffEntry {
+                    rel_path: "x/y".into(),
+                    status: EntryStatus::Missing,
+                    local: None,
+                    remote: Some(Entry {
+                        rel_path: "x/y".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    conflict_reason: String::new(),
+                },
             ],
             ..Default::default()
         };
@@ -1729,9 +1941,18 @@ mod tests {
     fn plan_delete_off_without_flag() {
         // sync-spec §14 test 7: senza --delete -> tutto lasciato (niente delete set).
         let diff = Diff {
-            entries: vec![
-                DiffEntry { rel_path: "extra.txt".into(), status: EntryStatus::Missing, local: None, remote: Some(Entry { rel_path: "extra.txt".into(), size: 5, is_dir: 0, sha256: None }), conflict_reason: String::new() },
-            ],
+            entries: vec![DiffEntry {
+                rel_path: "extra.txt".into(),
+                status: EntryStatus::Missing,
+                local: None,
+                remote: Some(Entry {
+                    rel_path: "extra.txt".into(),
+                    size: 5,
+                    is_dir: 0,
+                    sha256: None,
+                }),
+                conflict_reason: String::new(),
+            }],
             ..Default::default()
         };
         let plan = build_plan(&diff, false);
@@ -1744,8 +1965,35 @@ mod tests {
         // sync-spec §7: i path in conflicts NON compaiono in nessun altro set.
         let diff = Diff {
             entries: vec![
-                DiffEntry { rel_path: "conf".into(), status: EntryStatus::Conflict, local: Some(Entry { rel_path: "conf".into(), size: 1, is_dir: 0, sha256: None }), remote: Some(Entry { rel_path: "conf".into(), size: 0, is_dir: 1, sha256: None }), conflict_reason: "file vs dir".into() },
-                DiffEntry { rel_path: "ok.txt".into(), status: EntryStatus::New, local: Some(Entry { rel_path: "ok.txt".into(), size: 1, is_dir: 0, sha256: None }), remote: None, conflict_reason: String::new() },
+                DiffEntry {
+                    rel_path: "conf".into(),
+                    status: EntryStatus::Conflict,
+                    local: Some(Entry {
+                        rel_path: "conf".into(),
+                        size: 1,
+                        is_dir: 0,
+                        sha256: None,
+                    }),
+                    remote: Some(Entry {
+                        rel_path: "conf".into(),
+                        size: 0,
+                        is_dir: 1,
+                        sha256: None,
+                    }),
+                    conflict_reason: "file vs dir".into(),
+                },
+                DiffEntry {
+                    rel_path: "ok.txt".into(),
+                    status: EntryStatus::New,
+                    local: Some(Entry {
+                        rel_path: "ok.txt".into(),
+                        size: 1,
+                        is_dir: 0,
+                        sha256: None,
+                    }),
+                    remote: None,
+                    conflict_reason: String::new(),
+                },
             ],
             ..Default::default()
         };
@@ -1775,7 +2023,11 @@ mod tests {
 
     #[test]
     fn exclude_basename_and_path_patterns() {
-        let pats = vec!["*.log".to_string(), "data/postgres".to_string(), "cache".to_string()];
+        let pats = vec![
+            "*.log".to_string(),
+            "data/postgres".to_string(),
+            "cache".to_string(),
+        ];
         // Pattern basename-only: matcha ovunque nel path.
         assert!(is_excluded("sub/debug.log", &pats));
         assert!(is_excluded("debug.log", &pats));

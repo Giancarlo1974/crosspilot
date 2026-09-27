@@ -51,11 +51,26 @@ pub const MSG_DELETE_BATCH_RES: u8 = 13;
 
 // Messaggi self-update via TCP (update-spec): il client chiede al server di
 // spawnare l'updater staged e uscire. Inviati solo a server che dichiarano
-// un BUILD_TS nell'handshake "READY <ts> [<os>]" (il tag OS L|W e'
-// opzionale e non ancora inviato; i server legacy mandano "READY"
-// secco e non ricevono mai UPDATE_REQ: per loro c'e' il path WMI/setsid).
+// un BUILD_TS nell'handshake "READY <ts>" (READY porta solo il ts —
+// spec selfdescribe §1.1: l'OS remoto arriva da INFO_RES, non da un
+// tag del saluto; i server legacy mandano "READY" secco e non ricevono
+// mai UPDATE_REQ: per loro c'e' il path schtasks/setsid).
 pub const MSG_UPDATE_REQ: u8 = 14;
 pub const MSG_UPDATE_RES: u8 = 15;
+
+// Messaggi self-describe del server (spec selfdescribe-guardrail §2):
+// il server dichiara CHI E' davvero (OS + path dell'exe in esecuzione)
+// invece di lasciare che il client lo deduca dall'env — il disastro
+// dell'update e' nato da un EXE_PATH ereditato incoerente con l'OS.
+// Anche questi viaggiano con VERSION=1: i server vecchi rispondono ERR
+// a tipo sconosciuto e il client degrada alla discovery RUNNING_EXE.
+/// Richiesta self-describe (C→S): payload vuoto.
+pub const MSG_INFO_REQ: u8 = 16;
+/// Risposta self-describe (S→C): payload UTF-8 multilinea, formato
+/// righe `CHIAVE=valore`: OS=<L|W>, EXE_PATH=<path canonico>, BUILD_TS,
+/// EXE_SHA256 (hex minuscolo dell'exe in esecuzione). Righe ignote
+/// tollerate dal decoder (forward-compat).
+pub const MSG_INFO_RES: u8 = 17;
 
 /// Cap massimo sul numero di entry restituite da LIST_RES (sync-spec §5).
 /// Oltre questo limite il server risponde ERR 5 esplicito (non payload da 1 GB).
@@ -231,6 +246,22 @@ pub struct UpdateRes {
     pub message: String,
 }
 
+/// Payload di INFO_RES (S→C): identita' REALE del server che parla
+/// (spec selfdescribe-guardrail §2.1). I campi sono stringhe grezze del
+/// formato righe CHIAVE=valore — il mapping del tag OS su RemoteOs e'
+/// compito del consumer (version.rs), non del trasporto.
+#[derive(Debug, Clone)]
+pub struct InfoRes {
+    /// Tag OS grezzo ("L"=Linux, "W"=Windows; valori ignoti tollerati).
+    pub os_tag: String,
+    /// Path canonico dell'exe in esecuzione sul remote.
+    pub exe_path: String,
+    /// Build timestamp del binario in esecuzione.
+    pub build_ts: u64,
+    /// SHA-256 hex (minuscolo) dell'exe in esecuzione.
+    pub exe_sha256: String,
+}
+
 // ---------------------------------------------------------------------------
 // Framing di basso livello: read_msg / write_msg.
 // Usano read_exact (niente read() singolo: insicuro per binario framed).
@@ -244,35 +275,37 @@ pub async fn read_msg<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<(u8, Ve
     reader.read_exact(&mut header).await?;
 
     // Estrae il magic dai primi 4 byte little-endian.
-    let magic = u32::from_le_bytes([
-        header[0],
-        header[1],
-        header[2],
-        header[3],
-    ]);
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     if magic != MAGIC {
-        bail!("Magic non valido: atteso 0x{:08X}, ricevuto 0x{:08X}", MAGIC, magic);
+        bail!(
+            "Magic non valido: atteso 0x{:08X}, ricevuto 0x{:08X}",
+            MAGIC,
+            magic
+        );
     }
 
     // Verifica la versione del protocollo.
     let version = header[4];
     if version != VERSION {
-        bail!("Versione protocollo non supportata: attesa {}, ricevuta {}", VERSION, version);
+        bail!(
+            "Versione protocollo non supportata: attesa {}, ricevuta {}",
+            VERSION,
+            version
+        );
     }
 
     // Estrae il tipo di messaggio.
     let msg_type = header[5];
 
     // Estrae la lunghezza del payload (little-endian).
-    let payload_len = u32::from_le_bytes([
-        header[6],
-        header[7],
-        header[8],
-        header[9],
-    ]) as usize;
+    let payload_len = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
 
     if payload_len > MAX_PAYLOAD_LEN {
-        bail!("Payload troppo grande: {} byte (max {})", payload_len, MAX_PAYLOAD_LEN);
+        bail!(
+            "Payload troppo grande: {} byte (max {})",
+            payload_len,
+            MAX_PAYLOAD_LEN
+        );
     }
 
     // Legge il payload per intero.
@@ -370,7 +403,10 @@ pub fn decode_put_req(payload: &[u8]) -> Result<PutReq> {
     // Dopo il null: block_size(4) + segment_size(8) + total_new_size(8) = 20 byte.
     let rest = &payload[null_pos + 1..];
     if rest.len() < 20 {
-        bail!("PutReq: payload troppo corto dopo il path ({} byte, attesi 20)", rest.len());
+        bail!(
+            "PutReq: payload troppo corto dopo il path ({} byte, attesi 20)",
+            rest.len()
+        );
     }
 
     let block_size = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
@@ -423,7 +459,10 @@ pub fn decode_get_req(payload: &[u8]) -> Result<GetReq> {
     // Dopo il null: block_size(4) + segment_size(8) = 12 byte.
     let rest = &payload[null_pos + 1..];
     if rest.len() < 12 {
-        bail!("GetReq: payload troppo corto dopo il path ({} byte, attesi 12)", rest.len());
+        bail!(
+            "GetReq: payload troppo corto dopo il path ({} byte, attesi 12)",
+            rest.len()
+        );
     }
 
     let block_size = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
@@ -446,11 +485,14 @@ pub fn encode_meta(meta: &Meta) -> Vec<u8> {
 /// Decodifica un Meta dal payload.
 pub fn decode_meta(payload: &[u8]) -> Result<Meta> {
     if payload.len() < 8 {
-        bail!("Meta: payload troppo corto ({} byte, attesi 8)", payload.len());
+        bail!(
+            "Meta: payload troppo corto ({} byte, attesi 8)",
+            payload.len()
+        );
     }
     let total_new_size = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-        payload[4], payload[5], payload[6], payload[7],
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
     ]);
     Ok(Meta { total_new_size })
 }
@@ -467,13 +509,17 @@ pub fn encode_signature(sig: &Signature) -> Vec<u8> {
 /// Decodifica una Signature dal payload.
 pub fn decode_signature(payload: &[u8]) -> Result<Signature> {
     if payload.len() < 4 {
-        bail!("Signature: payload troppo corto ({} byte, attesi almeno 4)", payload.len());
+        bail!(
+            "Signature: payload troppo corto ({} byte, attesi almeno 4)",
+            payload.len()
+        );
     }
-    let segment_index = u32::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-    ]);
+    let segment_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let blob = payload[4..].to_vec();
-    Ok(Signature { segment_index, blob })
+    Ok(Signature {
+        segment_index,
+        blob,
+    })
 }
 
 /// Codifica un Delta in payload (u32 LE segment_index + blob + [u8;32] sha256 + u64 LE segment_new_size).
@@ -494,12 +540,14 @@ pub fn decode_delta(payload: &[u8]) -> Result<Delta> {
     // Il blob ha lunghezza = payload.len() - 4 - 32 - 8.
     let min_len = 4 + 32 + 8;
     if payload.len() < min_len {
-        bail!("Delta: payload troppo corto ({} byte, attesi almeno {}", payload.len(), min_len);
+        bail!(
+            "Delta: payload troppo corto ({} byte, attesi almeno {}",
+            payload.len(),
+            min_len
+        );
     }
 
-    let segment_index = u32::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-    ]);
+    let segment_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
 
     // Il blob sta tra offset 4 e (len - 40).
     let blob_end = payload.len() - 40;
@@ -512,10 +560,14 @@ pub fn decode_delta(payload: &[u8]) -> Result<Delta> {
     // segment_new_size: ultimi 8 byte.
     let size_start = blob_end + 32;
     let segment_new_size = u64::from_le_bytes([
-        payload[size_start], payload[size_start + 1],
-        payload[size_start + 2], payload[size_start + 3],
-        payload[size_start + 4], payload[size_start + 5],
-        payload[size_start + 6], payload[size_start + 7],
+        payload[size_start],
+        payload[size_start + 1],
+        payload[size_start + 2],
+        payload[size_start + 3],
+        payload[size_start + 4],
+        payload[size_start + 5],
+        payload[size_start + 6],
+        payload[size_start + 7],
     ]);
 
     Ok(Delta {
@@ -539,12 +591,15 @@ pub fn encode_ack(ack: &Ack) -> Vec<u8> {
 /// Decodifica un Ack dal payload.
 pub fn decode_ack(payload: &[u8]) -> Result<Ack> {
     if payload.len() < 41 {
-        bail!("Ack: payload troppo corto ({} byte, attesi 41)", payload.len());
+        bail!(
+            "Ack: payload troppo corto ({} byte, attesi 41)",
+            payload.len()
+        );
     }
     let status = payload[0];
     let total_bytes_written = u64::from_le_bytes([
-        payload[1], payload[2], payload[3], payload[4],
-        payload[5], payload[6], payload[7], payload[8],
+        payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+        payload[8],
     ]);
     let mut sha256_whole_file = [0u8; 32];
     sha256_whole_file.copy_from_slice(&payload[9..41]);
@@ -568,7 +623,10 @@ pub fn encode_err(err: &ErrMsg) -> Vec<u8> {
 /// Decodifica un ErrMsg dal payload.
 pub fn decode_err(payload: &[u8]) -> Result<ErrMsg> {
     if payload.len() < 2 {
-        bail!("Err: payload troppo corto ({} byte, attesi almeno 2)", payload.len());
+        bail!(
+            "Err: payload troppo corto ({} byte, attesi almeno 2)",
+            payload.len()
+        );
     }
     let code = u16::from_le_bytes([payload[0], payload[1]]);
     let msg_bytes = &payload[2..];
@@ -582,28 +640,19 @@ pub fn decode_err(payload: &[u8]) -> Result<ErrMsg> {
 // ---------------------------------------------------------------------------
 
 /// Invia una PutReq.
-pub async fn send_put_req<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    req: &PutReq,
-) -> Result<()> {
+pub async fn send_put_req<W: AsyncWriteExt + Unpin>(writer: &mut W, req: &PutReq) -> Result<()> {
     let payload = encode_put_req(req)?;
     write_msg(writer, MSG_PUT_REQ, &payload).await
 }
 
 /// Invia una GetReq.
-pub async fn send_get_req<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    req: &GetReq,
-) -> Result<()> {
+pub async fn send_get_req<W: AsyncWriteExt + Unpin>(writer: &mut W, req: &GetReq) -> Result<()> {
     let payload = encode_get_req(req)?;
     write_msg(writer, MSG_GET_REQ, &payload).await
 }
 
 /// Invia un Meta.
-pub async fn send_meta<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    meta: &Meta,
-) -> Result<()> {
+pub async fn send_meta<W: AsyncWriteExt + Unpin>(writer: &mut W, meta: &Meta) -> Result<()> {
     let payload = encode_meta(meta);
     write_msg(writer, MSG_META, &payload).await
 }
@@ -618,28 +667,19 @@ pub async fn send_signature<W: AsyncWriteExt + Unpin>(
 }
 
 /// Invia un Delta.
-pub async fn send_delta<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    delta: &Delta,
-) -> Result<()> {
+pub async fn send_delta<W: AsyncWriteExt + Unpin>(writer: &mut W, delta: &Delta) -> Result<()> {
     let payload = encode_delta(delta);
     write_msg(writer, MSG_DELTA, &payload).await
 }
 
 /// Invia un Ack.
-pub async fn send_ack<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    ack: &Ack,
-) -> Result<()> {
+pub async fn send_ack<W: AsyncWriteExt + Unpin>(writer: &mut W, ack: &Ack) -> Result<()> {
     let payload = encode_ack(ack);
     write_msg(writer, MSG_ACK, &payload).await
 }
 
 /// Invia un ErrMsg.
-pub async fn send_err<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    err: &ErrMsg,
-) -> Result<()> {
+pub async fn send_err<W: AsyncWriteExt + Unpin>(writer: &mut W, err: &ErrMsg) -> Result<()> {
     let payload = encode_err(err);
     write_msg(writer, MSG_ERR, &payload).await
 }
@@ -795,11 +835,18 @@ pub fn decode_list_req(payload: &[u8]) -> Result<ListReq> {
         .map_err(|e| anyhow!("ListReq: path non UTF-8 valido: {}", e))?;
     let rest = &payload[null_pos + 1..];
     if rest.len() < 2 {
-        bail!("ListReq: payload troppo corto dopo il path ({} byte, attesi 2)", rest.len());
+        bail!(
+            "ListReq: payload troppo corto dopo il path ({} byte, attesi 2)",
+            rest.len()
+        );
     }
     let recursive = rest[0];
     let with_hash = rest[1];
-    Ok(ListReq { path, recursive, with_hash })
+    Ok(ListReq {
+        path,
+        recursive,
+        with_hash,
+    })
 }
 
 /// Cap sul numero di path "skipped" nel trailer di LIST_RES (difensivo:
@@ -845,7 +892,10 @@ pub fn encode_list_res(res: &ListRes) -> Result<Vec<u8>> {
 /// per metadati diagnostici).
 pub fn decode_list_res(payload: &[u8], with_hash: bool) -> Result<ListRes> {
     if payload.len() < 4 {
-        bail!("ListRes: payload troppo corto ({} byte, attesi almeno 4)", payload.len());
+        bail!(
+            "ListRes: payload troppo corto ({} byte, attesi almeno 4)",
+            payload.len()
+        );
     }
     let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if count > LIST_ENTRY_CAP {
@@ -949,8 +999,14 @@ fn decode_list_entry(payload: &[u8], offset: &mut usize, with_hash: bool) -> Res
         bail!("ListRes: payload troncato in size");
     }
     let size = u64::from_le_bytes([
-        payload[*offset], payload[*offset + 1], payload[*offset + 2], payload[*offset + 3],
-        payload[*offset + 4], payload[*offset + 5], payload[*offset + 6], payload[*offset + 7],
+        payload[*offset],
+        payload[*offset + 1],
+        payload[*offset + 2],
+        payload[*offset + 3],
+        payload[*offset + 4],
+        payload[*offset + 5],
+        payload[*offset + 6],
+        payload[*offset + 7],
     ]);
     *offset += 8;
     // is_dir u8.
@@ -973,7 +1029,12 @@ fn decode_list_entry(payload: &[u8], offset: &mut usize, with_hash: bool) -> Res
     } else {
         None
     };
-    Ok(ListEntry { rel_path, size, is_dir, sha256 })
+    Ok(ListEntry {
+        rel_path,
+        size,
+        is_dir,
+        sha256,
+    })
 }
 
 // --- MKDIR_BATCH_REQ / MKDIR_BATCH_RES -------------------------------------
@@ -1000,7 +1061,10 @@ pub fn encode_mkdir_batch_req(req: &MkdirBatchReq) -> Result<Vec<u8>> {
 /// Decodifica una MkdirBatchReq dal payload.
 pub fn decode_mkdir_batch_req(payload: &[u8]) -> Result<MkdirBatchReq> {
     if payload.len() < 4 {
-        bail!("MkdirBatchReq: payload troppo corto ({} byte, attesi 4)", payload.len());
+        bail!(
+            "MkdirBatchReq: payload troppo corto ({} byte, attesi 4)",
+            payload.len()
+        );
     }
     let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     let mut offset = 4usize;
@@ -1062,7 +1126,10 @@ pub fn encode_delete_batch_req(req: &DeleteBatchReq) -> Result<Vec<u8>> {
 /// Decodifica una DeleteBatchReq dal payload.
 pub fn decode_delete_batch_req(payload: &[u8]) -> Result<DeleteBatchReq> {
     if payload.len() < 4 {
-        bail!("DeleteBatchReq: payload troppo corto ({} byte, attesi 4)", payload.len());
+        bail!(
+            "DeleteBatchReq: payload troppo corto ({} byte, attesi 4)",
+            payload.len()
+        );
     }
     let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     let mut offset = 4usize;
@@ -1128,7 +1195,11 @@ fn decode_batch_res_inner(
     expected: usize,
 ) -> Result<Vec<BatchResult>> {
     if payload.len() < 4 {
-        bail!("{}: payload troppo corto ({} byte, attesi 4)", label, payload.len());
+        bail!(
+            "{}: payload troppo corto ({} byte, attesi 4)",
+            label,
+            payload.len()
+        );
     }
     let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     // sync-spec §9: count mismatch -> il client stoppa immediatamente (ERR 5).
@@ -1166,7 +1237,11 @@ fn decode_batch_res_inner(
         let message = String::from_utf8(msg_bytes.to_vec())
             .unwrap_or_else(|_| "<messaggio non UTF-8>".to_string());
         offset += msg_len;
-        results.push(BatchResult { status, code, message });
+        results.push(BatchResult {
+            status,
+            code,
+            message,
+        });
         i += 1;
     }
     Ok(results)
@@ -1175,10 +1250,7 @@ fn decode_batch_res_inner(
 // --- Helper di alto livello per sync (invio/ricezione tipizzati) -----------
 
 /// Invia una ListReq.
-pub async fn send_list_req<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    req: &ListReq,
-) -> Result<()> {
+pub async fn send_list_req<W: AsyncWriteExt + Unpin>(writer: &mut W, req: &ListReq) -> Result<()> {
     let payload = encode_list_req(req)?;
     write_msg(writer, MSG_LIST_REQ, &payload).await
 }
@@ -1266,6 +1338,72 @@ pub async fn send_update_res<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Messaggi self-describe (INFO_REQ / INFO_RES — spec selfdescribe §2.1).
+// ---------------------------------------------------------------------------
+
+/// Codifica una InfoRes in payload UTF-8 multilinea `CHIAVE=valore`.
+/// Difensivo: i valori non possono contenere '\n' (spezzerebbero una
+/// riga) — un exe path con newline e' patologico e va rifiutato qui.
+pub fn encode_info_res(res: &InfoRes) -> Result<Vec<u8>> {
+    for (key, value) in [
+        ("OS", res.os_tag.as_str()),
+        ("EXE_PATH", res.exe_path.as_str()),
+        ("EXE_SHA256", res.exe_sha256.as_str()),
+    ] {
+        if value.contains('\n') || value.contains('\r') {
+            bail!("InfoRes: il campo {} contiene un newline", key);
+        }
+    }
+    let text = format!(
+        "OS={}\nEXE_PATH={}\nBUILD_TS={}\nEXE_SHA256={}\n",
+        res.os_tag, res.exe_path, res.build_ts, res.exe_sha256
+    );
+    Ok(text.into_bytes())
+}
+
+/// Decodifica una InfoRes dal payload (righe CHIAVE=valore UTF-8).
+/// Righe sconosciute o malformate (senza '=') sono ignorate: forward-
+/// compat con server futuri che aggiungano chiavi.
+pub fn decode_info_res(payload: &[u8]) -> Result<InfoRes> {
+    let text = String::from_utf8(payload.to_vec())
+        .map_err(|e| anyhow!("InfoRes: payload non UTF-8: {}", e))?;
+    let mut os_tag: Option<String> = None;
+    let mut exe_path: Option<String> = None;
+    let mut build_ts: Option<u64> = None;
+    let mut exe_sha256: Option<String> = None;
+    for line in text.lines() {
+        let (key, value) = match line.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        match key {
+            "OS" => os_tag = Some(value.to_string()),
+            "EXE_PATH" => exe_path = Some(value.to_string()),
+            "BUILD_TS" => build_ts = value.trim().parse::<u64>().ok(),
+            "EXE_SHA256" => exe_sha256 = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Ok(InfoRes {
+        os_tag: os_tag.unwrap_or_default(),
+        exe_path: exe_path.unwrap_or_default(),
+        build_ts: build_ts.unwrap_or(0),
+        exe_sha256: exe_sha256.unwrap_or_default(),
+    })
+}
+
+/// Invia una INFO_REQ (payload vuoto).
+pub async fn send_info_req<W: AsyncWriteExt + Unpin>(writer: &mut W) -> Result<()> {
+    write_msg(writer, MSG_INFO_REQ, &[]).await
+}
+
+/// Invia una INFO_RES.
+pub async fn send_info_res<W: AsyncWriteExt + Unpin>(writer: &mut W, res: &InfoRes) -> Result<()> {
+    let payload = encode_info_res(res)?;
+    write_msg(writer, MSG_INFO_RES, &payload).await
+}
+
+// ---------------------------------------------------------------------------
 // Test di roundtrip encode/decode (spec §17 passo 2).
 // ---------------------------------------------------------------------------
 
@@ -1305,7 +1443,9 @@ mod tests {
 
     #[test]
     fn roundtrip_meta() {
-        let meta = Meta { total_new_size: 123456789 };
+        let meta = Meta {
+            total_new_size: 123456789,
+        };
         let payload = encode_meta(&meta);
         let decoded = decode_meta(&payload).unwrap();
         assert_eq!(decoded.total_new_size, meta.total_new_size);
@@ -1314,7 +1454,10 @@ mod tests {
     #[test]
     fn roundtrip_signature_empty_blob() {
         // Segmento base assente: blob vuoto.
-        let sig = Signature { segment_index: 0, blob: Vec::new() };
+        let sig = Signature {
+            segment_index: 0,
+            blob: Vec::new(),
+        };
         let payload = encode_signature(&sig);
         let decoded = decode_signature(&payload).unwrap();
         assert_eq!(decoded.segment_index, 0);
@@ -1325,7 +1468,10 @@ mod tests {
     fn roundtrip_signature_with_blob() {
         // Blob opaco simulato (in produzione è fast_rsync::Signature::serialized()).
         let blob = vec![0xAA; 128];
-        let sig = Signature { segment_index: 42, blob };
+        let sig = Signature {
+            segment_index: 42,
+            blob,
+        };
         let payload = encode_signature(&sig);
         let decoded = decode_signature(&payload).unwrap();
         assert_eq!(decoded.segment_index, 42);
@@ -1384,7 +1530,10 @@ mod tests {
 
     #[test]
     fn roundtrip_err() {
-        let err = ErrMsg { code: ERR_PATH_FORBIDDEN, message: "path vietato".to_string() };
+        let err = ErrMsg {
+            code: ERR_PATH_FORBIDDEN,
+            message: "path vietato".to_string(),
+        };
         let payload = encode_err(&err);
         let decoded = decode_err(&payload).unwrap();
         assert_eq!(decoded.code, ERR_PATH_FORBIDDEN);
@@ -1416,7 +1565,12 @@ mod tests {
         ];
         // Ogni codice deve essere nel range 1..=6 e univoco.
         for (i, &c) in codes.iter().enumerate() {
-            assert_eq!(c, (i + 1) as u16, "codice errore alla posizione {} non progressivo", i);
+            assert_eq!(
+                c,
+                (i + 1) as u16,
+                "codice errore alla posizione {} non progressivo",
+                i
+            );
         }
         // ERR_RESERVED è esplicitamente 6 (non usato, ma documentato).
         assert_eq!(ERR_RESERVED, 6);
@@ -1426,11 +1580,23 @@ mod tests {
     #[test]
     fn error_code_description_covers_all() {
         assert_eq!(error_code_description(ERR_PATH_FORBIDDEN), "path vietato");
-        assert_eq!(error_code_description(ERR_FILE_NOT_FOUND), "file non trovato");
+        assert_eq!(
+            error_code_description(ERR_FILE_NOT_FOUND),
+            "file non trovato"
+        );
         assert_eq!(error_code_description(ERR_IO), "errore di I/O");
-        assert_eq!(error_code_description(ERR_CHECKSUM_MISMATCH), "checksum mismatch");
-        assert_eq!(error_code_description(ERR_PROTO), "errore di protocollo (magic/version/parametri invalidi)");
-        assert_eq!(error_code_description(ERR_RESERVED), "riservato (non usato)");
+        assert_eq!(
+            error_code_description(ERR_CHECKSUM_MISMATCH),
+            "checksum mismatch"
+        );
+        assert_eq!(
+            error_code_description(ERR_PROTO),
+            "errore di protocollo (magic/version/parametri invalidi)"
+        );
+        assert_eq!(
+            error_code_description(ERR_RESERVED),
+            "riservato (non usato)"
+        );
         assert_eq!(error_code_description(999), "codice errore sconosciuto");
     }
 
@@ -1530,7 +1696,10 @@ mod tests {
                 sha256: None,
             },
         ];
-        let res = ListRes { entries, skipped: Vec::new() };
+        let res = ListRes {
+            entries,
+            skipped: Vec::new(),
+        };
         let payload = encode_list_res(&res).unwrap();
         let decoded = decode_list_res(&payload, false).unwrap();
         assert_eq!(decoded.entries.len(), 3);
@@ -1561,7 +1730,10 @@ mod tests {
                 sha256: None,
             },
         ];
-        let res = ListRes { entries, skipped: Vec::new() };
+        let res = ListRes {
+            entries,
+            skipped: Vec::new(),
+        };
         let payload = encode_list_res(&res).unwrap();
         let decoded = decode_list_res(&payload, true).unwrap();
         assert_eq!(decoded.entries.len(), 2);
@@ -1689,8 +1861,14 @@ mod tests {
     #[test]
     fn roundtrip_delete_batch_req() {
         let items = vec![
-            DeleteItem { path: r"C:\ci\old.dat".to_string(), recursive: 0 },
-            DeleteItem { path: r"C:\ci\old_dir".to_string(), recursive: 1 },
+            DeleteItem {
+                path: r"C:\ci\old.dat".to_string(),
+                recursive: 0,
+            },
+            DeleteItem {
+                path: r"C:\ci\old_dir".to_string(),
+                recursive: 1,
+            },
         ];
         let req = DeleteBatchReq { items };
         let payload = encode_delete_batch_req(&req).unwrap();
@@ -1774,5 +1952,80 @@ mod tests {
         let decoded = decode_update_res(&payload).unwrap();
         assert_eq!(decoded.status, 0);
         assert_eq!(decoded.message, "updater avviato");
+    }
+
+    // --- Test self-describe (spec §11 proto) ---------------------------------
+
+    #[test]
+    fn roundtrip_info_res_multilinea() {
+        // Payload multilinea: il path Windows contiene backslash e
+        // sopravvive inalterato (formato righe CHIAVE=valore).
+        let res = InfoRes {
+            os_tag: "W".to_string(),
+            exe_path: r"C:\ci\crosspilot.exe".to_string(),
+            build_ts: 1758530400,
+            exe_sha256: "a".repeat(64),
+        };
+        let payload = encode_info_res(&res).unwrap();
+        let text = String::from_utf8_lossy(&payload);
+        assert!(text.contains('\n'), "payload atteso multilinea");
+        let decoded = decode_info_res(&payload).unwrap();
+        assert_eq!(decoded.os_tag, "W");
+        assert_eq!(decoded.exe_path, res.exe_path);
+        assert_eq!(decoded.build_ts, 1758530400);
+        assert_eq!(decoded.exe_sha256, res.exe_sha256);
+    }
+
+    #[tokio::test]
+    async fn info_req_payload_vuoto_roundtrip() {
+        // INFO_REQ e' a payload vuoto: il framing lo trasporta invariato.
+        let mut buf: Vec<u8> = Vec::new();
+        send_info_req(&mut buf).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (msg_type, payload) = read_msg(&mut cursor).await.unwrap();
+        assert_eq!(msg_type, MSG_INFO_REQ);
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn info_res_framing_roundtrip() {
+        let res = InfoRes {
+            os_tag: "L".to_string(),
+            exe_path: "/home/rocky/crosspilot".to_string(),
+            build_ts: 7,
+            exe_sha256: "f".repeat(64),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        send_info_res(&mut buf, &res).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let (msg_type, payload) = read_msg(&mut cursor).await.unwrap();
+        assert_eq!(msg_type, MSG_INFO_RES);
+        let decoded = decode_info_res(&payload).unwrap();
+        assert_eq!(decoded.os_tag, "L");
+        assert_eq!(decoded.exe_path, "/home/rocky/crosspilot");
+    }
+
+    #[test]
+    fn info_res_righe_ignote_e_extra_tollerate() {
+        // Chiavi extra (server piu' nuovo) e righe malformate vengono
+        // ignorate; il tag OS ignoto resta grezzo (il consumer mappa).
+        let payload = b"OS=X\nEXTRA=yes\nnoequals\nEXE_PATH=/opt/cp\nBUILD_TS=9\nEXE_SHA256=abc\n";
+        let decoded = decode_info_res(payload).unwrap();
+        assert_eq!(decoded.os_tag, "X");
+        assert_eq!(decoded.exe_path, "/opt/cp");
+        assert_eq!(decoded.build_ts, 9);
+        assert_eq!(decoded.exe_sha256, "abc");
+    }
+
+    #[test]
+    fn encode_info_res_rifiuta_newline_nei_valori() {
+        // Un newline in un valore spezzerebbe il formato righe.
+        let res = InfoRes {
+            os_tag: "L".to_string(),
+            exe_path: "/opt/cp\nevils".to_string(),
+            build_ts: 1,
+            exe_sha256: "a".to_string(),
+        };
+        assert!(encode_info_res(&res).is_err());
     }
 }

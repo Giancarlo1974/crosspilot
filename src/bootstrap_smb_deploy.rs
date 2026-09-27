@@ -9,12 +9,12 @@
 use anyhow::{bail, Context, Result};
 
 use crate::bootstrap;
-use crate::deploy;
 use crate::bootstrap_smb::{
-    self, admin_share_path, certutil_bat, parse_certutil_hash, scm_exec, scm_run_bat,
-    share_dir, share_join, smb_connect, smb_err, temp_tag, tree_connect,
-    version_check_bat, win_abs, SmbCtx, SCM_EXEC_TIMEOUT_SECS,
+    self, admin_share_path, certutil_bat, parse_certutil_hash, scm_exec, scm_run_bat, share_dir,
+    share_join, smb_connect, smb_err, temp_tag, tree_connect, version_check_bat, win_abs, SmbCtx,
+    SCM_EXEC_TIMEOUT_SECS,
 };
+use crate::deploy;
 use crate::envs;
 use crate::self_update;
 use crate::update;
@@ -40,11 +40,7 @@ async fn ensure_remote_dir(ctx: &SmbCtx, dir_win: &str) -> Result<()> {
 /// functional check '<staged>' --version -> swap move (exe -> exe.old,
 /// staged -> exe) + hash finale, poi sidecar crosspilot.linux, .ver e
 /// merge del .env remoto. MAI overwrite diretto dell'exe in uso.
-pub(crate) async fn deploy_exe(
-    ctx: &SmbCtx,
-    exe_path: &str,
-    info: &RemoteBuildInfo,
-) -> Result<()> {
+pub(crate) async fn deploy_exe(ctx: &SmbCtx, exe_path: &str, info: &RemoteBuildInfo) -> Result<()> {
     // Payload: su remote Windows l'exe E' il PE embeddato (o self-read su
     // client Windows — vedi deploy::windows_exe_bytes).
     let exe_data = deploy::windows_exe_bytes().unwrap_or_default();
@@ -100,7 +96,11 @@ pub(crate) async fn deploy_exe(
         let staged_win = win_abs(&share, &staged_rel);
         eprintln!(
             "[deploy-smb] exe remoto {}: upload staged di {} byte -> {}",
-            if info.exe_present { "obsoleto" } else { "mancante" },
+            if info.exe_present {
+                "obsoleto"
+            } else {
+                "mancante"
+            },
             exe_data.len(),
             staged_win
         );
@@ -221,7 +221,11 @@ pub(crate) async fn deploy_exe(
     );
     let ver_rel = share_join(&dir_rel, version::VER_FILE_NAME);
     match client.write_file(&ver_rel, ver_content.as_bytes()).await {
-        Ok(()) => eprintln!("[deploy-smb] .ver scritto: {} (ts={})", ver_rel, version::BUILD_TS),
+        Ok(()) => eprintln!(
+            "[deploy-smb] .ver scritto: {} (ts={})",
+            ver_rel,
+            version::BUILD_TS
+        ),
         Err(e) => eprintln!("[deploy-smb] WARNING scrittura .ver: {}", e),
     }
 
@@ -246,7 +250,10 @@ pub(crate) async fn deploy_exe(
     envs::upsert_field(&mut lines, None, "SERVER_PORT", &port.to_string());
     let env_content = lines.join("\n") + "\n";
     match client.write_file(&env_rel, env_content.as_bytes()).await {
-        Ok(()) => eprintln!("[deploy-smb] .env remoto aggiornato (SERVER_PORT={}, merge)", port),
+        Ok(()) => eprintln!(
+            "[deploy-smb] .env remoto aggiornato (SERVER_PORT={}, merge)",
+            port
+        ),
         Err(e) => eprintln!("[deploy-smb] WARNING scrittura .env: {}", e),
     }
 
@@ -295,8 +302,7 @@ pub(crate) async fn self_update_smb(
 
     let self_path = std::env::current_exe().context("current_exe")?;
     let staged = self_update::staged_path(&self_path);
-    std::fs::write(&staged, &data)
-        .with_context(|| format!("scrittura {}", staged.display()))?;
+    std::fs::write(&staged, &data).with_context(|| format!("scrittura {}", staged.display()))?;
     // install_staged_file: verifica hash + functional check locale +
     // rename atomico + re-exec (non ritorna su successo).
     let result = self_update::install_staged_file(&staged, remote_ts, expected_sha256).await;
@@ -343,8 +349,8 @@ pub(crate) async fn start_server(ctx: &SmbCtx, exe_path: &str) -> Result<()> {
     let (share, exe_rel) = admin_share_path(exe_path)?;
     let dir_rel = share_dir(&exe_rel).to_string();
     let dir_win = win_abs(&share, &dir_rel);
-    let log = envs::var("LOG_PATH")
-        .unwrap_or_else(|| format!("{}\\crosspilot-server.log", dir_win));
+    let log =
+        envs::var("LOG_PATH").unwrap_or_else(|| format!("{}\\crosspilot-server.log", dir_win));
     eprintln!("Bootstrapping server via SMB/SCM (servizio transitorio + start /b)...");
     let bat = format!(
         "start \"\" /b cmd /c \"\"{}\" --server >> \"{}\" 2>&1\"",

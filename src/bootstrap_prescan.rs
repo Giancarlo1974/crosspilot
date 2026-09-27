@@ -24,7 +24,7 @@ use crate::bootstrap;
 use crate::bootstrap_smb;
 use crate::bootstrap_ssh;
 use crate::envs;
-use crate::version::RemoteBuildInfo;
+use crate::version::{self, RemoteBuildInfo};
 
 /// Timeout della singola probe TCP (vincolo esistente, invariato).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,12 +95,7 @@ impl Prescan {
             let _ = writeln!(ev, "       TCP 445 (SMB/SCM): {}", s.label());
         }
         if let Some(s) = self.ssh {
-            let _ = write!(
-                ev,
-                "       TCP {} (SSH):      {}",
-                self.ssh_port,
-                s.label()
-            );
+            let _ = write!(ev, "       TCP {} (SSH):      {}", self.ssh_port, s.label());
         }
         ev
     }
@@ -214,6 +209,88 @@ impl BootstrapChannel {
             }
             BootstrapChannel::WinRm => bootstrap::bootstrap_winrm(exe_path).await,
             BootstrapChannel::SmbScm => bootstrap_smb::bootstrap_server(exe_path).await,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Operazioni del fallback update §7 (spec selfdescribe-guardrail):
+    // il canale fa SOLO trasporto file + exec. `os` e' l'OS RISOLTO
+    // dall'identita' remota (INFO_RES/discovery) — per SSH seleziona il
+    // dialetto, per WinRM/SMB e' implicitamente Windows.
+    // ------------------------------------------------------------------
+
+    /// Dialetto SSH derivato dall'OS risolto (non dall'env).
+    fn ssh_dialect(os: version::RemoteOs) -> bootstrap_ssh::Dialect {
+        match os {
+            version::RemoteOs::Linux => bootstrap_ssh::Dialect::Posix,
+            version::RemoteOs::Windows => bootstrap_ssh::Dialect::PowerShell,
+        }
+    }
+
+    /// §7.1: upload staged + hash + functional check SENZA swap/quit.
+    pub(crate) async fn deploy_staged(
+        &self,
+        os: version::RemoteOs,
+        staged: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        match self {
+            BootstrapChannel::SshPosix | BootstrapChannel::SshWin => {
+                bootstrap_ssh::channel_deploy_staged(Self::ssh_dialect(os), staged, payload).await
+            }
+            BootstrapChannel::WinRm => {
+                bootstrap::channel_deploy_staged_winrm(staged, payload).await
+            }
+            BootstrapChannel::SmbScm => bootstrap_smb::channel_deploy_staged(staged, payload).await,
+        }
+    }
+
+    /// §7.2: swap exe -> exe.old, staged -> exe + verifica hash.
+    pub(crate) async fn swap_exe(
+        &self,
+        os: version::RemoteOs,
+        exe_path: &str,
+        staged: &str,
+        expected_hash: &str,
+    ) -> Result<()> {
+        match self {
+            BootstrapChannel::SshPosix | BootstrapChannel::SshWin => {
+                bootstrap_ssh::channel_swap_exe(
+                    Self::ssh_dialect(os),
+                    exe_path,
+                    staged,
+                    expected_hash,
+                )
+                .await
+            }
+            BootstrapChannel::WinRm => {
+                bootstrap::channel_swap_winrm(exe_path, staged, expected_hash).await
+            }
+            BootstrapChannel::SmbScm => {
+                bootstrap_smb::channel_swap_exe(exe_path, staged, expected_hash).await
+            }
+        }
+    }
+
+    /// §7.2: avvio detached del server via canale.
+    pub(crate) async fn start_remote(&self, os: version::RemoteOs, exe_path: &str) -> Result<()> {
+        match self {
+            BootstrapChannel::SshPosix | BootstrapChannel::SshWin => {
+                bootstrap_ssh::channel_start_server(Self::ssh_dialect(os), exe_path).await
+            }
+            BootstrapChannel::WinRm => bootstrap::channel_start_winrm(exe_path).await,
+            BootstrapChannel::SmbScm => bootstrap_smb::channel_start_server(exe_path).await,
+        }
+    }
+
+    /// §7.2 rescue: ripristino `exe.old` -> exe.
+    pub(crate) async fn restore_old(&self, os: version::RemoteOs, exe_path: &str) -> Result<()> {
+        match self {
+            BootstrapChannel::SshPosix | BootstrapChannel::SshWin => {
+                bootstrap_ssh::channel_restore_old(Self::ssh_dialect(os), exe_path).await
+            }
+            BootstrapChannel::WinRm => bootstrap::channel_restore_old_winrm(exe_path).await,
+            BootstrapChannel::SmbScm => bootstrap_smb::channel_restore_old(exe_path).await,
         }
     }
 }
@@ -402,7 +479,7 @@ pub(crate) fn candidates(p: &Prescan) -> Vec<BootstrapChannel> {
 /// 2. remote win, BOOTSTRAP=smb|ssh|winrm -> override a canale singolo;
 /// 3. remote win, nessun override -> ordine base [WinRm, SshWin, SmbScm]
 ///    riordinato per stato probe (Open -> Refused -> Filtered, stabile).
-fn candidates_for(
+pub(crate) fn candidates_for(
     unix: bool,
     p: &Prescan,
     bootstrap_override: Option<&str>,

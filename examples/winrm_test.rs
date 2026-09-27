@@ -17,7 +17,7 @@ async fn main() {
 
     // Combinazioni da provare: (username, domain)
     let combos: Vec<(&str, &str)> = vec![
-        ("giancarloalbanese@ac-s-srl.it", ""),      // UPN intero come username
+        ("giancarloalbanese@ac-s-srl.it", ""), // UPN intero come username
     ];
 
     for (user, domain) in combos {

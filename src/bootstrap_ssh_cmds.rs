@@ -24,9 +24,27 @@ pub enum Dialect {
     PowerShell,
 }
 
-/// Dialetto del remote: SOLO da remote_is_unix() (deterministico,
-/// testabile — niente auto-detect via `uname` in v1, spec §1.4).
+/// Dialetto rilevato a runtime dalla prima remote_build_info riuscita
+/// (guardrail §6): un env che dichiara l'OS sbagliato o non lo dichiara
+/// affatto viene corretto dal remote stesso — il remote sa chi e'.
+static DIALECT_DETECTED: std::sync::Mutex<Option<Dialect>> = std::sync::Mutex::new(None);
+
+/// Memorizza il dialetto rilevato (chiamata dal probe auto-detect).
+pub(crate) fn set_dialect_detected(d: Dialect) {
+    if let Ok(mut guard) = DIALECT_DETECTED.lock() {
+        *guard = Some(d);
+    }
+}
+
+/// Dialetto del remote: prima il verdetto auto-detect (una remote_
+/// build_info riuscita in un dialetto e' prova dell'OS reale), poi
+/// remote_is_unix() (deterministico, testabile — spec §1.4).
 pub(crate) fn dialect() -> Dialect {
+    if let Ok(guard) = DIALECT_DETECTED.lock() {
+        if let Some(d) = *guard {
+            return d;
+        }
+    }
     if bootstrap::remote_is_unix() {
         Dialect::Posix
     } else {
@@ -92,13 +110,26 @@ pub(crate) fn remote_build_info_cmd(d: Dialect, exe_path: &str, dir: &str) -> St
     let linux_path = update::remote_join(dir, version::LINUX_SIDECAR_NAME);
     let ver_path = update::remote_join(dir, version::VER_FILE_NAME);
     match d {
+        // sha256sum legge da stdin (`sha256sum < file`): con un path
+        // argomento i nomi con backslash/newline farebbero stampare a
+        // sha256sum l'escape `\hash` in testa riga — awk $1 catturava
+        // quell'escape, non l'hash (bug: "sha256sum mismatch" spurio).
+        // RUNNING_EXE (discovery §6): path REALE del processo vivo.
+        // `pgrep -x` (nome esatto) mai `-f`: la cmdline del nostro
+        // stesso `sh -c` contiene la stringa 'crosspilot' nei path
+        // quotati e `-f` self-matcherebbe -> RUNNING_EXE=/usr/bin/sh.
+        // Fallback sui nomi staged `crosspilot-<ts>` (comm troncato a
+        // 15 char, il regex `crosspilot-.*` li copre comunque).
         Dialect::Posix => format!(
             "if [ -f {e} ]; then echo EXE=True; \
-             sha256sum {e} | awk '{{print \"EXE_HASH=\" $1}}'; \
+             sha256sum < {e} | awk '{{print \"EXE_HASH=\" $1}}'; \
              else echo EXE=False; fi; \
              if [ -f {l} ]; then echo LINUX_PRESENT=True; \
              else echo LINUX_PRESENT=False; fi; \
-             if [ -f {v} ]; then cat {v}; fi",
+             if [ -f {v} ]; then cat {v}; fi; \
+             RP=$(pgrep -x crosspilot 2>/dev/null | head -1); \
+             if [ -z \"$RP\" ]; then RP=$(pgrep -x 'crosspilot-.*' 2>/dev/null | head -1); fi; \
+             if [ -n \"$RP\" ]; then readlink -f /proc/$RP/exe 2>/dev/null | sed 's/^/RUNNING_EXE=/'; fi",
             e = sh_sq(exe_path),
             l = sh_sq(&linux_path),
             v = sh_sq(&ver_path)
@@ -110,7 +141,9 @@ pub(crate) fn remote_build_info_cmd(d: Dialect, exe_path: &str, dir: &str) -> St
                  else {{ Write-Output 'EXE=False' }}; \
                  if (Test-Path {l}) {{ Write-Output 'LINUX_PRESENT=True' }} \
                  else {{ Write-Output 'LINUX_PRESENT=False' }}; \
-                 if (Test-Path {v}) {{ Get-Content {v} }}",
+                 if (Test-Path {v}) {{ Get-Content {v} }}; \
+                 $rp = Get-Process -Name 'crosspilot*' -ErrorAction SilentlyContinue | Select-Object -First 1; \
+                 if ($rp -and $rp.Path) {{ Write-Output \"RUNNING_EXE=$($rp.Path)\" }}",
                 e = ps_sq(exe_path),
                 l = ps_sq(&linux_path),
                 v = ps_sq(&ver_path)
@@ -125,7 +158,7 @@ pub(crate) fn remote_build_info_cmd(d: Dialect, exe_path: &str, dir: &str) -> St
 pub(crate) fn file_hash_cmd(d: Dialect, path: &str) -> String {
     match d {
         Dialect::Posix => format!(
-            "if [ -f {p} ]; then sha256sum {p} | awk '{{print $1}}'; fi",
+            "if [ -f {p} ]; then sha256sum < {p} | awk '{{print $1}}'; fi",
             p = sh_sq(path)
         ),
         Dialect::PowerShell => {
@@ -159,8 +192,10 @@ pub(crate) fn rm_cmd(d: Dialect, path: &str) -> String {
     match d {
         Dialect::Posix => format!("rm -f {}", sh_sq(path)),
         Dialect::PowerShell => {
-            let script =
-                format!("Remove-Item -Force {} -ErrorAction SilentlyContinue", ps_sq(path));
+            let script = format!(
+                "Remove-Item -Force {} -ErrorAction SilentlyContinue",
+                ps_sq(path)
+            );
             ps_encoded(&script)
         }
     }
@@ -188,7 +223,7 @@ pub(crate) fn swap_cmd(d: Dialect, exe_path: &str, staged: &str) -> String {
         Dialect::Posix => format!(
             "if [ -f {e} ]; then mv -f {e} {e}.old; fi; \
              mv -f {s} {e} && chmod 755 {e} && \
-             sha256sum {e} | awk '{{print $1}}'",
+             sha256sum < {e} | awk '{{print $1}}'",
             e = sh_sq(exe_path),
             s = sh_sq(staged)
         ),
@@ -201,6 +236,27 @@ pub(crate) fn swap_cmd(d: Dialect, exe_path: &str, staged: &str) -> String {
                 e = ps_sq(exe_path),
                 o = ps_sq(&old),
                 s = ps_sq(staged)
+            );
+            ps_encoded(&script)
+        }
+    }
+}
+
+/// Ripristino del backup `.old` sopra l'exe corrente (rescue §7.2 del
+/// fallback canale: il nuovo server non e' tornato in ascolto ->
+/// `mv exe.old exe` e riavvio, mai lasciare il remote sull'exe fallito).
+pub(crate) fn restore_old_cmd(d: Dialect, exe_path: &str) -> String {
+    match d {
+        Dialect::Posix => format!(
+            "if [ -f {e}.old ]; then mv -f {e}.old {e} && chmod 755 {e}; fi",
+            e = sh_sq(exe_path)
+        ),
+        Dialect::PowerShell => {
+            let old = format!("{}.old", exe_path);
+            let script = format!(
+                "if (Test-Path {o}) {{ Move-Item -Force {o} {e} }}",
+                o = ps_sq(&old),
+                e = ps_sq(exe_path)
             );
             ps_encoded(&script)
         }
@@ -372,15 +428,22 @@ mod tests {
 
     #[test]
     fn comandi_posix_invariati() {
-        // remote_build_info: stesso formato righe CHIAVE=valore di prima.
+        // remote_build_info: stesso formato righe CHIAVE=valore di prima
+        // + discovery RUNNING_EXE (spec §6).
         let cmd = remote_build_info_cmd(Dialect::Posix, "/opt/cp/crosspilot", "/opt/cp");
         assert!(cmd.contains("EXE=True"));
         assert!(cmd.contains("EXE_HASH="));
         assert!(cmd.contains("LINUX_PRESENT="));
         assert!(cmd.contains("crosspilot.linux"));
         assert!(cmd.contains("crosspilot.ver"));
+        assert!(cmd.contains("pgrep -x crosspilot"));
+        assert!(cmd.contains("RUNNING_EXE="));
 
-        let cmd = swap_cmd(Dialect::Posix, "/opt/cp/crosspilot", "/opt/cp/crosspilot.new");
+        let cmd = swap_cmd(
+            Dialect::Posix,
+            "/opt/cp/crosspilot",
+            "/opt/cp/crosspilot.new",
+        );
         assert!(cmd.contains("mv -f"));
         assert!(cmd.contains(".old"));
         assert!(cmd.contains("chmod 755"));
@@ -394,6 +457,39 @@ mod tests {
         let cmd = firewall_cmd(Dialect::Posix, 5330);
         assert!(cmd.contains("ufw"));
         assert!(cmd.contains("5330"));
+    }
+
+    #[test]
+    fn sha256_legge_da_stdin_e_running_exe() {
+        // Spec §8: TUTTI i comandi hash devono usare `sha256sum < file`
+        // (il path come argomento farebbe prefissare l'output con `\`
+        // per i nomi con backslash -> awk $1 prendeva l'escape).
+        let f = file_hash_cmd(Dialect::Posix, "/opt/cp/x");
+        assert!(f.contains("sha256sum <"), "cmd={}", f);
+        let b = remote_build_info_cmd(Dialect::Posix, "/opt/cp/x", "/opt/cp");
+        assert!(b.contains("sha256sum <"), "cmd={}", b);
+        let s = swap_cmd(Dialect::Posix, "/opt/cp/x", "/opt/cp/x.new");
+        assert!(s.contains("sha256sum <"), "cmd={}", s);
+        // Discovery §6 in entrambi i dialetti.
+        assert!(b.contains("pgrep") && b.contains("/proc/$RP/exe"));
+        let pw = decode_ps(&remote_build_info_cmd(
+            Dialect::PowerShell,
+            "C:\\ci\\x.exe",
+            "C:\\ci",
+        ));
+        assert!(pw.contains("RUNNING_EXE="));
+        assert!(pw.contains("Get-Process"));
+    }
+
+    #[test]
+    fn restore_old_cmd_per_dialetto() {
+        let p = restore_old_cmd(Dialect::Posix, "/opt/cp/crosspilot");
+        // Il suffisso .old e' FUORI dalle quote sh ('<path>'.old).
+        assert!(p.contains("mv -f '/opt/cp/crosspilot'.old '/opt/cp/crosspilot'"));
+        assert!(p.contains("[ -f"));
+        let w = decode_ps(&restore_old_cmd(Dialect::PowerShell, "C:\\ci\\cp.exe"));
+        assert!(w.contains("Test-Path 'C:\\ci\\cp.exe.old'"));
+        assert!(w.contains("Move-Item -Force 'C:\\ci\\cp.exe.old' 'C:\\ci\\cp.exe'"));
     }
 
     #[test]
@@ -430,8 +526,7 @@ mod tests {
 
     #[test]
     fn comandi_powershell_encoded() {
-        let cmd =
-            remote_build_info_cmd(Dialect::PowerShell, "C:\\ci\\crosspilot.exe", "C:\\ci");
+        let cmd = remote_build_info_cmd(Dialect::PowerShell, "C:\\ci\\crosspilot.exe", "C:\\ci");
         let ps = decode_ps(&cmd);
         assert!(ps.contains("Test-Path 'C:\\ci\\crosspilot.exe'"));
         assert!(ps.contains("EXE_HASH="));

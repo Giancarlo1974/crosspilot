@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Campi e regole di naming
@@ -247,6 +248,164 @@ pub fn var_for(name: Option<&str>, field: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Gate di coerenza OS <-> EXE_PATH (spec selfdescribe-guardrail §5) e
+// write-back --fix-env (§4) / `env doctor` (§P2).
+// ---------------------------------------------------------------------------
+
+/// Opt-in `--fix-env` del CLI (settato in main dopo il parse): senza di
+/// esso reconcile_config avverte ma NON scrive mai il .env (spec §4).
+static FIX_ENV: AtomicBool = AtomicBool::new(false);
+
+/// Registra il flag --fix-env passato da riga di comando.
+pub fn set_fix_env(v: bool) {
+    FIX_ENV.store(v, Ordering::Relaxed);
+}
+
+/// True se il write-back del .env e' autorizzato (--fix-env o
+/// CROSSPILOT_FIX_ENV=1/true).
+pub fn fix_env_enabled() -> bool {
+    if FIX_ENV.load(Ordering::Relaxed) {
+        return true;
+    }
+    var("FIX_ENV")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Auto-abilitazione del fix (richiesta esplicita dell'utente,
+/// deviazione documentata da spec §9): se CROSSPILOT_FIX_ENV manca del
+/// tutto — ne' variabile ne' flag --fix-env — viene scritta `=1` nel
+/// .env (chiave GLOBALE, non prefissata) e il write-back del drift e'
+/// abilitato da subito. Una chiave gia' presente (anche =0/false) non
+/// viene mai toccata: chi la disattiva esplicitamente vince.
+/// Ritorna true se la chiave e' stata appena scritta.
+pub(crate) fn ensure_fix_env() -> bool {
+    if var("FIX_ENV").is_some() || FIX_ENV.load(Ordering::Relaxed) {
+        return false;
+    }
+    match fix_field(None, "FIX_ENV", "1") {
+        Ok(()) => {
+            eprintln!("[config] CROSSPILOT_FIX_ENV=1 scritto nel .env (fix automatico del drift abilitato).");
+            true
+        }
+        Err(e) => {
+            eprintln!("[config] WARNING: impossibile abilitare FIX_ENV nel .env: {}", e);
+            false
+        }
+    }
+}
+
+/// True se il valore del campo OS dichiara un remote unix.
+fn os_declares_unix(os: &str) -> bool {
+    matches!(os.trim().to_lowercase().as_str(), "linux" | "unix")
+}
+
+/// True se il valore del campo OS dichiara un remote Windows.
+fn os_declares_windows(os: &str) -> bool {
+    matches!(
+        os.trim().to_lowercase().as_str(),
+        "windows" | "win" | "win32" | "nt"
+    )
+}
+
+/// Verifica pura di coerenza OS<->EXE_PATH su valori espliciti
+/// (spec §5): `OS=linux/unix` con path Windows (`C:\` o `\\UNC`) e'
+/// contraddizione, cosi' come `OS=windows` con path `/...`. OS assente
+/// -> nessun vincolo (la forma del path decide da sola; il disastro
+/// era proprio OS=linux + path Windows ereditato). Funzione pura:
+/// riusata dal gate runtime e da `env doctor`.
+fn coherence_problem(os: Option<&str>, exe_path: Option<&str>) -> Option<String> {
+    let exe = exe_path?;
+    let os = os?.trim();
+    if os.is_empty() {
+        return None;
+    }
+    if os_declares_unix(os) && crate::path::is_windows_path(exe) {
+        return Some(format!(
+            "OS='{}' (unix) ma EXE_PATH='{}' ha forma Windows",
+            os, exe
+        ));
+    }
+    if os_declares_windows(os) && exe.starts_with('/') {
+        return Some(format!(
+            "OS='{}' (windows) ma EXE_PATH='{}' ha forma unix",
+            os, exe
+        ));
+    }
+    None
+}
+
+/// Etichetta della chiave che ha risolto `field` per l'ambiente attivo:
+/// `CROSSPILOT_<ENV>_<FIELD>` se il campo e' definito specifico,
+/// altrimenti `CROSSPILOT_<FIELD> (ereditata)`.
+fn resolved_key_label(field: &str) -> String {
+    if let Some(n) = active_name() {
+        let specific = key_for(Some(&n), field);
+        let has_own = env::var(&specific).map(|v| !v.is_empty()).unwrap_or(false);
+        if has_own {
+            return specific;
+        }
+        return format!("{} (ereditata)", key_for(None, field));
+    }
+    key_for(None, field)
+}
+
+/// Gate di coerenza (spec §5): Err se l'ambiente attivo dichiara un OS
+/// contraddetto dalla forma di EXE_PATH. Chiamato SOLO quando la config
+/// e' la sola fonte di identita' (INFO_RES/discovery hanno precedenza
+/// e rendono l'incoerenza un semplice drift da segnalare, spec §4).
+/// L'errore nomina ENTRAMBE le chiavi e, se il path incoerente e'
+/// ereditato dal livello globale, lo dice esplicitamente (il caso
+/// reale: env per-host senza EXE_PATH proprio).
+pub fn check_os_exe_coherence() -> Result<()> {
+    let os = var("OS");
+    let exe = var("EXE_PATH");
+    let problem = match coherence_problem(os.as_deref(), exe.as_deref()) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let os_label = resolved_key_label("OS");
+    let exe_label = resolved_key_label("EXE_PATH");
+    let mut msg = format!(
+        "config incoerente: {} vs {} — {}",
+        os_label, exe_label, problem
+    );
+    if let Some(n) = active_name() {
+        let specific = key_for(Some(&n), "EXE_PATH");
+        let has_own = env::var(&specific).map(|v| !v.is_empty()).unwrap_or(false);
+        if !has_own {
+            msg.push_str(&format!(
+                "\n  (l'ambiente {} non definisce {}: ha ereditato la chiave globale {})",
+                n,
+                specific,
+                key_for(None, "EXE_PATH")
+            ));
+        }
+    }
+    msg.push_str(
+        "\n  correggere con: crosspilot env set <env> --exe-path <path-remoto> \
+         [--os linux|windows]",
+    );
+    bail!("{}", msg)
+}
+
+/// Write-back di reconcile_config (spec §4): upsert di una chiave nel
+/// .env risolto, prefissata per l'ambiente attivo (CROSSPILOT_<ENV>_<F>
+/// — o CROSSPILOT_<F> per il default). Riusa il meccanismo CRUD
+/// (parse + upsert_field + save atomico). Mai chiamata senza opt-in.
+pub(crate) fn fix_field(name: Option<&str>, field: &str, value: &str) -> Result<()> {
+    let path = env_file_path();
+    let content = if path.exists() {
+        fs::read_to_string(&path).with_context(|| format!("lettura {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    upsert_field(&mut lines, name, field, value);
+    save(&path, &lines)
+}
+
+// ---------------------------------------------------------------------------
 // Parsing delle righe .env
 // ---------------------------------------------------------------------------
 
@@ -359,9 +518,9 @@ fn unquote(value: &str) -> String {
 /// com'è. I backslash (path Windows) vengono quotati+escaped per coerenza
 /// con il formato gia' usato nel .env (C:\\Users\\...).
 fn quote_value(value: &str) -> String {
-    let needs_quote = value
-        .chars()
-        .any(|c| c.is_whitespace() || c == '#' || c == '"' || c == '\'' || c == '$' || c == '`' || c == '\\');
+    let needs_quote = value.chars().any(|c| {
+        c.is_whitespace() || c == '#' || c == '"' || c == '\'' || c == '$' || c == '`' || c == '\\'
+    });
     if needs_quote {
         let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{}\"", escaped)
@@ -438,14 +597,12 @@ fn collect_names(lines: &[String]) -> Vec<String> {
 /// True se il file contiene almeno una chiave campo per l'ambiente dato
 /// (None = default non prefissato).
 fn env_exists(lines: &[String], name: Option<&str>) -> bool {
-    lines.iter().any(|line| {
-        match parse_line(line) {
-            Some((key, _)) => match parse_key(&key) {
-                ParsedKey::Field(n, _) => n.as_deref() == name,
-                _ => false,
-            },
-            None => false,
-        }
+    lines.iter().any(|line| match parse_line(line) {
+        Some((key, _)) => match parse_key(&key) {
+            ParsedKey::Field(n, _) => n.as_deref() == name,
+            _ => false,
+        },
+        None => false,
     })
 }
 
@@ -695,6 +852,10 @@ pub enum EnvAction {
         /// Nome ambiente (es. prod) oppure "default".
         name: String,
     },
+    /// Diagnosi offline degli ambienti (spec §P2): incoerenze
+    /// OS<->EXE_PATH, campi mancanti critici, path ambigui. Read-only:
+    /// stampa i problemi e le righe di correzione suggerite.
+    Doctor,
 }
 
 /// Entry point del sottocomando `env`: legge il .env, applica l'azione e
@@ -702,8 +863,7 @@ pub enum EnvAction {
 pub fn run(action: &EnvAction) -> Result<()> {
     let path = env_file_path();
     let content = if path.exists() {
-        fs::read_to_string(&path)
-            .with_context(|| format!("lettura {}", path.display()))?
+        fs::read_to_string(&path).with_context(|| format!("lettura {}", path.display()))?
     } else {
         String::new()
     };
@@ -728,6 +888,7 @@ pub fn run(action: &EnvAction) -> Result<()> {
             cmd_use(&mut lines, name)?;
             save(&path, &lines)?;
         }
+        EnvAction::Doctor => cmd_doctor(&lines)?,
     }
     Ok(())
 }
@@ -739,8 +900,7 @@ fn save(path: &Path, lines: &[String]) -> Result<()> {
     content.push('\n');
 
     let tmp = path.with_extension("env.tmp");
-    fs::write(&tmp, &content)
-        .with_context(|| format!("scrittura {}", tmp.display()))?;
+    fs::write(&tmp, &content).with_context(|| format!("scrittura {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     crate::qprintln!("[DEBUG] .env salvato: {}", path.display());
@@ -752,8 +912,7 @@ fn save(path: &Path, lines: &[String]) -> Result<()> {
 fn cmd_list(path: &Path, lines: &[String]) -> Result<()> {
     let names = collect_names(lines);
     let has_default = env_exists(lines, None);
-    let active = selector_value(lines)
-        .map(|v| v.to_uppercase());
+    let active = selector_value(lines).map(|v| v.to_uppercase());
 
     println!("File .env: {}", path.display());
     if names.is_empty() && !has_default {
@@ -769,7 +928,11 @@ fn cmd_list(path: &Path, lines: &[String]) -> Result<()> {
         println!("{} default", mark);
     }
     for name in names {
-        let mark = if active.as_deref() == Some(name.as_str()) { "*" } else { " " };
+        let mark = if active.as_deref() == Some(name.as_str()) {
+            "*"
+        } else {
+            " "
+        };
         let host = map
             .get(&key_for(Some(&name), "HOST"))
             .cloned()
@@ -790,10 +953,14 @@ fn cmd_show(lines: &[String], name: &str, reveal: bool) -> Result<()> {
     let map = values_map(lines);
     let label = name_opt.clone().unwrap_or_else(|| "default".to_string());
     let active = selector_value(lines).map(|v| v.to_uppercase());
-    let is_active = active.as_deref() == name_opt.as_deref()
-        || (active.is_none() && name_opt.is_none());
+    let is_active =
+        active.as_deref() == name_opt.as_deref() || (active.is_none() && name_opt.is_none());
 
-    println!("Ambiente: {}{}", label, if is_active { " (attivo)" } else { "" });
+    println!(
+        "Ambiente: {}{}",
+        label,
+        if is_active { " (attivo)" } else { "" }
+    );
     for field in FIELD_ORDER {
         let specific = name_opt
             .as_ref()
@@ -801,10 +968,7 @@ fn cmd_show(lines: &[String], name: &str, reveal: bool) -> Result<()> {
         let fallback = map.get(&key_for(None, field));
         let (value, note) = match (specific, fallback) {
             (Some(v), _) => (v.clone(), String::new()),
-            (None, Some(v)) => (
-                v.clone(),
-                format!("(fallback {})", key_for(None, field)),
-            ),
+            (None, Some(v)) => (v.clone(), format!("(fallback {})", key_for(None, field))),
             (None, None) => ("-".to_string(), "(non impostato)".to_string()),
         };
         // Password e segreti (PASS, SSH_PASS, AUTH_TOKEN, TLS_KEY=chiave
@@ -906,11 +1070,17 @@ fn cmd_remove(lines: &mut Vec<String>, name: &str) -> Result<()> {
     if let (Some(a), Some(n)) = (active, &name_opt) {
         if a == *n {
             upsert_selector(lines, None);
-            println!("Nota: '{}' era l'ambiente attivo: CROSSPILOT_ENV rimosso.", label);
+            println!(
+                "Nota: '{}' era l'ambiente attivo: CROSSPILOT_ENV rimosso.",
+                label
+            );
         }
     }
 
-    println!("Ambiente '{}' eliminato ({} righe rimosse).", label, removed);
+    println!(
+        "Ambiente '{}' eliminato ({} righe rimosse).",
+        label, removed
+    );
     Ok(())
 }
 
@@ -938,6 +1108,109 @@ fn cmd_use(lines: &mut Vec<String>, name: &str) -> Result<()> {
     Ok(())
 }
 
+// --- doctor ---------------------------------------------------------------
+
+/// Valori risolti di un campo per un env, dalla mappa del file (stessa
+/// semantica di var_for: chiave specifica poi globale). Puro.
+fn field_from_map(
+    map: &BTreeMap<String, String>,
+    name: Option<&str>,
+    field: &str,
+) -> Option<String> {
+    if let Some(n) = name {
+        let specific = key_for(Some(n), field);
+        if let Some(v) = map.get(&specific) {
+            if !v.is_empty() {
+                return Some(v.clone());
+            }
+        }
+    }
+    map.get(&key_for(None, field))
+        .filter(|v| !v.is_empty())
+        .cloned()
+}
+
+/// Diagnosi offline (spec §P2): per OGNI ambiente definito (default
+/// incluso se ha chiavi) verifica coerenza OS<->EXE_PATH e presenza
+/// dei campi critici. Exit 0 sempre: e' un report, non un gate.
+fn cmd_doctor(lines: &[String]) -> Result<()> {
+    let map = values_map(lines);
+    let mut names: Vec<Option<String>> = Vec::new();
+    if env_exists(lines, None) {
+        names.push(None);
+    }
+    for n in collect_names(lines) {
+        names.push(Some(n));
+    }
+    if names.is_empty() {
+        println!("Nessun ambiente definito: niente da diagnosticare.");
+        return Ok(());
+    }
+
+    let mut problems = 0usize;
+    for name in &names {
+        let label = name.clone().unwrap_or_else(|| "default".to_string());
+        let os = field_from_map(&map, name.as_deref(), "OS");
+        let exe = field_from_map(&map, name.as_deref(), "EXE_PATH");
+        let host = field_from_map(&map, name.as_deref(), "HOST");
+
+        if host.is_none() {
+            println!(
+                "env {}: WARNING - HOST non impostato (usera' 127.0.0.1)",
+                label
+            );
+        }
+        if exe.is_none() {
+            println!(
+                "env {}: WARNING - EXE_PATH non impostato: bootstrap/update impossibili",
+                label
+            );
+            problems += 1;
+        }
+        if let Some(p) = coherence_problem(os.as_deref(), exe.as_deref()) {
+            problems += 1;
+            // Se l'env non ha EXE_PATH proprio, la contraddizione viene
+            // dalla chiave globale ereditata: dirlo esplicitamente.
+            let own = name
+                .as_deref()
+                .map(|n| map.contains_key(&key_for(Some(n), "EXE_PATH")))
+                .unwrap_or(true);
+            println!("env {}: INCOERENZA - {}", label, p);
+            if !own {
+                println!(
+                    "          {} non definito: il valore e' ereditato da {}",
+                    key_for(name.as_deref(), "EXE_PATH"),
+                    key_for(None, "EXE_PATH")
+                );
+            }
+            println!(
+                "          suggerimento: crosspilot env set {} --exe-path <path-remoto> [--os linux|windows]",
+                label
+            );
+        }
+        // Path ambiguo: OS assente e path senza forma riconoscibile.
+        if os.is_none() {
+            if let Some(e) = &exe {
+                let win = crate::path::is_windows_path(e);
+                if !win && !e.starts_with('/') {
+                    println!(
+                        "env {}: WARNING - EXE_PATH='{}' ambiguo e OS assente: \
+                         impostare --os esplicito",
+                        label, e
+                    );
+                    problems += 1;
+                }
+            }
+        }
+    }
+    if problems == 0 {
+        println!("env doctor: nessuna incoerenza trovata.");
+    } else {
+        println!("env doctor: {} problemi.", problems);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Test
 // ---------------------------------------------------------------------------
@@ -950,9 +1223,18 @@ mod tests {
     fn parse_key_campi_non_prefissati() {
         assert_eq!(parse_key("CROSSPILOT_HOST"), ParsedKey::Field(None, "HOST"));
         assert_eq!(parse_key("CROSSPILOT_PORT"), ParsedKey::Field(None, "PORT"));
-        assert_eq!(parse_key("CROSSPILOT_EXE_PATH"), ParsedKey::Field(None, "EXE_PATH"));
-        assert_eq!(parse_key("CROSSPILOT_CLIENT_PORT"), ParsedKey::Field(None, "CLIENT_PORT"));
-        assert_eq!(parse_key("CROSSPILOT_SERVER_PORT"), ParsedKey::Field(None, "SERVER_PORT"));
+        assert_eq!(
+            parse_key("CROSSPILOT_EXE_PATH"),
+            ParsedKey::Field(None, "EXE_PATH")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_CLIENT_PORT"),
+            ParsedKey::Field(None, "CLIENT_PORT")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_SERVER_PORT"),
+            ParsedKey::Field(None, "SERVER_PORT")
+        );
     }
 
     #[test]
@@ -1089,7 +1371,10 @@ mod tests {
         // Double-quoted: escape \\ -> \ come dotenvy.
         assert_eq!(
             parse_line("CROSSPILOT_EXE_PATH=\"C:\\\\Users\\\\x\""),
-            Some(("CROSSPILOT_EXE_PATH".to_string(), "C:\\Users\\x".to_string()))
+            Some((
+                "CROSSPILOT_EXE_PATH".to_string(),
+                "C:\\Users\\x".to_string()
+            ))
         );
         // Single-quoted: letterale.
         assert_eq!(
@@ -1193,5 +1478,76 @@ mod tests {
         assert!(!env_exists(&lines, Some("PROD")));
         assert!(env_exists(&lines, Some("DEV")));
         assert!(env_exists(&lines, None));
+    }
+
+    // --- Gate di coerenza OS<->EXE_PATH (spec §5 + test plan §11) ------
+
+    #[test]
+    fn coherence_problem_gate_casi() {
+        // OS=linux + path Windows -> problema (il caso del brick reale).
+        assert!(
+            coherence_problem(Some("linux"), Some("C:\\Users\\gianca\\crosspilot.exe")).is_some()
+        );
+        assert!(coherence_problem(Some("unix"), Some("\\\\host\\share\\cp.exe")).is_some());
+        // OS=linux + path unix -> ok.
+        assert!(coherence_problem(Some("linux"), Some("/opt/crosspilot")).is_none());
+        // OS assente: la forma del path decide da sola -> ok (windows
+        // implicito su C:\, unix su /...).
+        assert!(coherence_problem(None, Some("C:\\ci\\crosspilot.exe")).is_none());
+        assert!(coherence_problem(None, Some("/opt/crosspilot")).is_none());
+        // OS=windows + path unix -> problema.
+        assert!(coherence_problem(Some("windows"), Some("/opt/crosspilot")).is_some());
+        assert!(coherence_problem(Some("windows"), Some("C:\\ci\\crosspilot.exe")).is_none());
+        // EXE_PATH assente -> niente da confrontare.
+        assert!(coherence_problem(Some("linux"), None).is_none());
+        // OS sconosciuto -> tollerato (non e' compito del gate).
+        assert!(coherence_problem(Some("haiku"), Some("/opt/cp")).is_none());
+    }
+
+    #[test]
+    fn doctor_riporta_incoerenza_ereditata() {
+        // Env senza EXE_PATH proprio + OS=linux proprio + globale
+        // incoerente: il report deve nominare la chiave mancante.
+        let lines: Vec<String> = vec![
+            "CROSSPILOT_HOST=1.2.3.4".to_string(),
+            "CROSSPILOT_EXE_PATH=C:\\ci\\crosspilot.exe".to_string(),
+            "# env: PROD".to_string(),
+            "CROSSPILOT_PROD_HOST=10.0.0.1".to_string(),
+            "CROSSPILOT_PROD_OS=linux".to_string(),
+        ];
+        let map = values_map(&lines);
+        let os = field_from_map(&map, Some("PROD"), "OS");
+        let exe = field_from_map(&map, Some("PROD"), "EXE_PATH");
+        // EXE_PATH e' ereditato globale -> conflitto con OS proprio.
+        assert_eq!(exe.as_deref(), Some("C:\\ci\\crosspilot.exe"));
+        assert!(coherence_problem(os.as_deref(), exe.as_deref()).is_some());
+        // Il default (OS assente) non e' incoerente: windows implicito.
+        let os_def = field_from_map(&map, None, "OS");
+        let exe_def = field_from_map(&map, None, "EXE_PATH");
+        assert!(coherence_problem(os_def.as_deref(), exe_def.as_deref()).is_none());
+    }
+
+    #[test]
+    fn fix_env_formato_chiavi_divergenti() {
+        // Spec §4: il write-back usa CROSSPILOT_<ENV>_<FIELD>. Simulo
+        // cmd_set come farebbe --fix-env: solo le chiavi divergenti.
+        let mut lines: Vec<String> = vec![
+            "# env: PROD".to_string(),
+            "CROSSPILOT_PROD_HOST=10.0.0.1".to_string(),
+        ];
+        upsert_field(
+            &mut lines,
+            Some("PROD"),
+            "EXE_PATH",
+            "/home/rocky/crosspilot",
+        );
+        upsert_field(&mut lines, Some("PROD"), "OS", "linux");
+        assert!(lines
+            .iter()
+            .any(|l| l == "CROSSPILOT_PROD_EXE_PATH=/home/rocky/crosspilot"));
+        assert!(lines.iter().any(|l| l == "CROSSPILOT_PROD_OS=linux"));
+        // Le altre chiavi non sono toccate.
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1], "CROSSPILOT_PROD_HOST=10.0.0.1");
     }
 }

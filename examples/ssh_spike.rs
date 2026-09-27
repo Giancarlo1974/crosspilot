@@ -31,8 +31,7 @@ impl Handler for Client {
         // confronto manuale con `ssh-keyscan dock2 | ssh-keygen -lf -`.
         eprintln!(
             "[hostkey] {:?}",
-            key.public_key()
-                .fingerprint(russh::keys::HashAlg::Sha256)
+            key.public_key().fingerprint(russh::keys::HashAlg::Sha256)
         );
         Ok(true)
     }
@@ -41,7 +40,9 @@ impl Handler for Client {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let host = std::env::args().nth(1).unwrap_or_else(|| "dock2".into());
-    let user = std::env::args().nth(2).unwrap_or_else(|| "webmaster".into());
+    let user = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "webmaster".into());
     let key_path = std::env::args()
         .nth(3)
         .unwrap_or_else(|| format!("{}/.ssh/id_rsa", std::env::var("HOME").unwrap()));
@@ -114,7 +115,11 @@ async fn main() -> Result<()> {
     let back = sftp.read(path).await.context("sftp read")?;
     eprintln!("    read ok ({} byte)", back.len());
     if back != payload {
-        bail!("SFTP read-back mismatch ({} vs {} byte)", back.len(), payload.len());
+        bail!(
+            "SFTP read-back mismatch ({} vs {} byte)",
+            back.len(),
+            payload.len()
+        );
     }
     let meta = sftp.metadata(path).await?;
     sftp.remove_file(path).await?;

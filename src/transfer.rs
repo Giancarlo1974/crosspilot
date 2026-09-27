@@ -14,16 +14,15 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::tls::Link;
 use anyhow::{anyhow, bail, Context, Result};
 use fast_rsync::{Signature, SignatureOptions};
 use sha2::{Digest, Sha256};
-use crate::tls::Link;
 
 use crate::path;
 use crate::proto::{
     self, Ack, Delta, ErrMsg, GetReq, Meta, PutReq, Signature as SigMsg, TransferError,
-    MSG_ACK, MSG_DELTA, MSG_ERR, MSG_META, MSG_SIGNATURE,
-    ERR_CHECKSUM_MISMATCH, ERR_IO, ERR_PROTO,
+    ERR_CHECKSUM_MISMATCH, ERR_IO, ERR_PROTO, MSG_ACK, MSG_DELTA, MSG_ERR, MSG_META, MSG_SIGNATURE,
 };
 use crate::verify::{sha256_bytes, sha256_file_handle};
 
@@ -64,9 +63,9 @@ pub fn read_segment_size_env() -> Result<u64> {
     let raw = crate::envs::var("SEGMENT_SIZE");
     let value = match raw {
         Some(s) => {
-            let parsed = s
-                .parse::<u64>()
-                .with_context(|| format!("CROSSPILOT_SEGMENT_SIZE non è un numero valido: {}", s))?;
+            let parsed = s.parse::<u64>().with_context(|| {
+                format!("CROSSPILOT_SEGMENT_SIZE non è un numero valido: {}", s)
+            })?;
             crate::qprintln!(
                 "[DEBUG] transfer: CROSSPILOT_SEGMENT_SIZE override = {} byte",
                 parsed
@@ -189,12 +188,8 @@ fn create_part_file(part_path: &Path, total_new_size: u64) -> Result<File> {
         .open(part_path)
         .with_context(|| format!("impossibile creare il file .part: {}", part_path.display()))?;
     if total_new_size > 0 {
-        file.set_len(total_new_size).with_context(|| {
-            format!(
-                "pre-allocazione .part a {} byte fallita",
-                total_new_size
-            )
-        })?;
+        file.set_len(total_new_size)
+            .with_context(|| format!("pre-allocazione .part a {} byte fallita", total_new_size))?;
     }
     Ok(file)
 }
@@ -262,11 +257,7 @@ fn cleanup_part_file(part_path: &Path) {
 /// Lato sender: dopo aver ricevuto l'ACK del receiver, confronta l'hash del file
 /// nuovo (calcolato localmente) con l'hash del .part (inviato dal receiver).
 /// Se coincidono, invia ACK(status 0) come conferma. Se mismatch, invia ERR 4.
-async fn send_confirmation(
-    stream: &mut Link,
-    source_hash: [u8; 32],
-    ack: &Ack,
-) -> Result<()> {
+async fn send_confirmation(stream: &mut Link, source_hash: [u8; 32], ack: &Ack) -> Result<()> {
     if ack.sha256_whole_file == source_hash {
         // Hash coincidono: il transfer è integro. Conferma al receiver.
         let confirm = Ack {
@@ -307,10 +298,7 @@ async fn wait_for_confirmation(stream: &mut Link) -> Result<()> {
         let err = proto::decode_err(&payload)?;
         bail!("il sender ha segnalato ERR {}: {}", err.code, err.message);
     } else {
-        bail!(
-            "messaggio inatteso in attesa conferma: tipo {}",
-            msg_type
-        );
+        bail!("messaggio inatteso in attesa conferma: tipo {}", msg_type);
     }
 }
 
@@ -377,8 +365,8 @@ async fn sender_segment_loop(
         // 2. Legge il segmento nuovo [start, end).
         let start = i * segment_size;
         let end = std::cmp::min((i + 1) * segment_size, total_new_size);
-        let new_segment = read_segment(new_file, start, end)
-            .context("sender: lettura segmento nuovo fallita")?;
+        let new_segment =
+            read_segment(new_file, start, end).context("sender: lettura segmento nuovo fallita")?;
         // Aggiorna l'hash whole-file in streaming (un solo passaggio sul file).
         hasher.update(&new_segment);
 
@@ -578,7 +566,11 @@ pub async fn put_client(stream: &mut Link, local_src: &str, remote_dst: &str) ->
 
     crate::qprintln!(
         "[DEBUG] transfer put_client: src={} ({} byte), dst={}, block_size={}, segment_size={}",
-        local_src, total_new_size, remote_dst, block_size, segment_size
+        local_src,
+        total_new_size,
+        remote_dst,
+        block_size,
+        segment_size
     );
 
     // Invia PUT_REQ.
@@ -591,8 +583,14 @@ pub async fn put_client(stream: &mut Link, local_src: &str, remote_dst: &str) ->
     proto::send_put_req(stream, &req).await?;
 
     // Loop segmenti lato sender; ritorna l'hash whole-file del file nuovo.
-    let source_hash = sender_segment_loop(stream, &mut new_file, block_size, segment_size, total_new_size)
-        .await?;
+    let source_hash = sender_segment_loop(
+        stream,
+        &mut new_file,
+        block_size,
+        segment_size,
+        total_new_size,
+    )
+    .await?;
 
     // Riceve ACK dal receiver (server).
     let (msg_type, payload) = proto::read_msg(stream).await?;
@@ -601,7 +599,11 @@ pub async fn put_client(stream: &mut Link, local_src: &str, remote_dst: &str) ->
         bail!("server ha segnalato ERR {}: {}", err.code, err.message);
     }
     if msg_type != MSG_ACK {
-        bail!("put_client: atteso ACK (tipo {}), ricevuto tipo {}", MSG_ACK, msg_type);
+        bail!(
+            "put_client: atteso ACK (tipo {}), ricevuto tipo {}",
+            MSG_ACK,
+            msg_type
+        );
     }
     let ack = proto::decode_ack(&payload)?;
 
@@ -650,7 +652,10 @@ pub async fn put_server(stream: &mut Link, req: PutReq) -> Result<()> {
 
     crate::qprintln!(
         "[DEBUG] transfer put_server: dst={} ({} byte), block_size={}, segment_size={}",
-        req.path, req.total_new_size, req.block_size, req.segment_size
+        req.path,
+        req.total_new_size,
+        req.block_size,
+        req.segment_size
     );
 
     // Crea e pre-alloca il file .part.
@@ -694,7 +699,10 @@ pub async fn put_server(stream: &mut Link, req: PutReq) -> Result<()> {
                     message: format!("errore transfer: {}", e),
                 },
             };
-            eprintln!("[ERROR] transfer put_server: loop fallito - {}", err_msg.message);
+            eprintln!(
+                "[ERROR] transfer put_server: loop fallito - {}",
+                err_msg.message
+            );
             let _ = proto::send_err(stream, &err_msg).await;
             cleanup_part_file(&part_path);
             return Err(e);
@@ -737,18 +745,16 @@ pub async fn put_server(stream: &mut Link, req: PutReq) -> Result<()> {
 /// Lato client GET (download): client = receiver del file remote_src verso local_dst.
 ///
 /// Flusso: GET_REQ -> riceve META -> loop segmenti (receiver) -> ACK -> attende conferma -> rename.
-pub async fn get_client(
-    stream: &mut Link,
-    remote_src: &str,
-    local_dst: &str,
-) -> Result<()> {
+pub async fn get_client(stream: &mut Link, remote_src: &str, local_dst: &str) -> Result<()> {
     let segment_size = read_segment_size_env()?;
     // block_size nel GET_REQ: placeholder valido (il client ricalcola dopo META).
     let placeholder_block_size: u32 = 8192;
 
     crate::qprintln!(
         "[DEBUG] transfer get_client: src={}, dst={}, segment_size={}",
-        remote_src, local_dst, segment_size
+        remote_src,
+        local_dst,
+        segment_size
     );
 
     // Invia GET_REQ.
@@ -766,7 +772,11 @@ pub async fn get_client(
         bail!("server ha segnalato ERR {}: {}", err.code, err.message);
     }
     if msg_type != MSG_META {
-        bail!("get_client: atteso META (tipo {}), ricevuto tipo {}", MSG_META, msg_type);
+        bail!(
+            "get_client: atteso META (tipo {}), ricevuto tipo {}",
+            MSG_META,
+            msg_type
+        );
     }
     let meta = proto::decode_meta(&payload)?;
     let total_new_size = meta.total_new_size;
@@ -776,7 +786,8 @@ pub async fn get_client(
 
     crate::qprintln!(
         "[DEBUG] transfer get_client: total_new_size={} byte, block_size={}",
-        total_new_size, block_size
+        total_new_size,
+        block_size
     );
 
     // Crea e pre-alloca il file .part locale.
@@ -812,7 +823,10 @@ pub async fn get_client(
                     message: format!("errore transfer: {}", e),
                 },
             };
-            eprintln!("[ERROR] transfer get_client: loop fallito - {}", err_msg.message);
+            eprintln!(
+                "[ERROR] transfer get_client: loop fallito - {}",
+                err_msg.message
+            );
             let _ = proto::send_err(stream, &err_msg).await;
             cleanup_part_file(&part_path);
             return Err(e);
@@ -842,7 +856,8 @@ pub async fn get_client(
 
     crate::qprintln!(
         "[DEBUG] transfer get_client: completato. {} byte scritti in {}",
-        total_bytes, local_dst
+        total_bytes,
+        local_dst
     );
     Ok(())
 }
@@ -936,7 +951,9 @@ pub async fn get_server(stream: &mut Link, req: GetReq, grace_only: bool) -> Res
 
     crate::qprintln!(
         "[DEBUG] transfer get_server: src={} ({} byte), segment_size={}",
-        req.path, total_new_size, req.segment_size
+        req.path,
+        total_new_size,
+        req.segment_size
     );
 
     // Invia META con la dimensione del file remoto.
@@ -968,7 +985,11 @@ pub async fn get_server(stream: &mut Link, req: GetReq, grace_only: bool) -> Res
         bail!("client ha segnalato ERR {}: {}", err.code, err.message);
     }
     if msg_type != MSG_ACK {
-        bail!("get_server: atteso ACK (tipo {}), ricevuto tipo {}", MSG_ACK, msg_type);
+        bail!(
+            "get_server: atteso ACK (tipo {}), ricevuto tipo {}",
+            MSG_ACK,
+            msg_type
+        );
     }
     let ack = proto::decode_ack(&payload)?;
 
@@ -1018,7 +1039,10 @@ mod tests {
         fast_rsync::apply_limited(&data, &delta, &mut output, data.len()).unwrap();
         assert_eq!(output, data);
         // File identici: delta deve essere piccolo (mostly copy).
-        assert!(delta.len() < data.len() / 10, "delta troppo grande per file identici");
+        assert!(
+            delta.len() < data.len() / 10,
+            "delta troppo grande per file identici"
+        );
     }
 
     /// Prepend 1 byte: il rolling checksum deve trovare i match shiftati (mostly copy).

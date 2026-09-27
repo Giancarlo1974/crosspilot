@@ -15,6 +15,8 @@
 // Il .ver viene letto via WinRM senza eseguire l'exe remoto: funziona
 // anche se l'exe e' locked o sotto scansione AV.
 
+use crate::proto;
+
 /// Timestamp unix del build (condiviso tra artefatti via build-release.sh).
 /// Parsato a compile-time con un parser const (str::parse non e' const):
 /// accetta solo cifre decimali; input malformato -> 0 (build "ignota",
@@ -66,10 +68,12 @@ pub const VERSION_STR: &str = concat!(
     ")"
 );
 
-/// OS del server remoto come dichiarato nell'handshake
-/// "READY <ts> <L|W>" (terzo token opzionale).
-/// I server attuali non lo inviano ancora: in quel caso il client
-/// ricade sull'euristica EXE_PATH per decidere il payload di update.
+/// OS del server remoto. NOTA: non viene piu' dall'handshake
+/// (READY porta solo il ts — spec selfdescribe-guardrail §1.1: un
+/// terzo token L|W forzerebbe un update spurio sui client attuali,
+/// che lo leggerebbero come ts=0). L'OS reale arriva da INFO_RES
+/// (chiave OS=) o dalla discovery RUNNING_EXE; `from_tag` mappa il
+/// tag grezzo del payload INFO_RES.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteOs {
     /// Server su host Linux/Unix (payload update: binario linux staged).
@@ -79,9 +83,9 @@ pub enum RemoteOs {
 }
 
 impl RemoteOs {
-    /// Parsa il tag OS del terzo token dell'handshake:
-    /// "L" -> Linux, "W" -> Windows. Token assenti o sconosciuti -> None
-    /// (server che non dichiara il proprio OS).
+    /// Parsa il tag OS di un payload INFO_RES (chiave `OS=`):
+    /// "L" -> Linux, "W" -> Windows. Tag assenti o sconosciuti -> None
+    /// (tolleranza forward-compat).
     pub fn from_tag(tag: &str) -> Option<RemoteOs> {
         match tag {
             "L" => Some(RemoteOs::Linux),
@@ -91,16 +95,15 @@ impl RemoteOs {
     }
 }
 
-/// Saluto del server nell'handshake TCP: "READY [<ts> [<os>]]".
-/// - ts=None: server legacy pre auto-update ("READY" secco);
-/// - os=None: server che non dichiara ancora il proprio OS — il client
-///   usa l'euristica EXE_PATH per la scelta del payload di update.
+/// Saluto del server nell'handshake TCP: "READY [<ts> [<extra...>]]".
+/// ts=None: server legacy pre auto-update ("READY" secco).
+/// I token oltre il ts sono IGNORATI (parsing token-aware):
+/// l'identita' del server (OS, exe_path) arriva SOLO da INFO_RES —
+/// spec selfdescribe-guardrail §1.1.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServerHello {
     /// BUILD_TS dichiarato dal server (None = server legacy).
     pub ts: Option<u64>,
-    /// OS del server (None = non dichiarato, handshake "READY <ts>").
-    pub os: Option<RemoteOs>,
 }
 
 /// Stato della build deployata sul remote, ricostruito da remote_build_info()
@@ -122,6 +125,12 @@ pub struct RemoteBuildInfo {
     pub linux_present: bool,
     /// SHA-256 del sidecar linux dichiarato nel .ver remoto.
     pub linux_sha256: Option<String>,
+    /// Path REALE del processo crosspilot in esecuzione sul remote
+    /// (chiave RUNNING_EXE di remote_build_info — discovery §6 della
+    /// spec selfdescribe-guardrail): None se nessun processo trovato
+    /// o canale senza discovery. E' la fonte di identita' quando
+    /// INFO_RES non e' disponibile (server pre-selfdescribe).
+    pub running_exe: Option<String>,
 }
 
 impl RemoteBuildInfo {
@@ -188,10 +197,50 @@ pub fn parse_remote_info(stdout: &str) -> RemoteBuildInfo {
             "BUILD_TS" => {
                 info.build_ts = value.parse::<u64>().ok();
             }
+            // Path del processo crosspilot VIVO (pgrep+/proc/exe su
+            // unix, Get-Process.Path su Windows): la discovery §6 —
+            // vince su EXE_PATH d'env quando diverge.
+            "RUNNING_EXE" if !value.is_empty() => {
+                info.running_exe = Some(value.to_string());
+            }
             _ => {}
         }
     }
     info
+}
+
+/// Identita' del server remoto da INFO_RES (spec §2.3): il consumer del
+/// payload proto::InfoRes — il tag OS grezzo e' mappato qui (non nel
+/// trasporto) via RemoteOs::from_tag.
+#[derive(Debug, Clone)]
+pub struct ServerInfo {
+    /// OS reale del server.
+    pub os: RemoteOs,
+    /// Path canonico dell'exe in esecuzione.
+    pub exe_path: String,
+    /// BUILD_TS del binario in esecuzione.
+    pub build_ts: u64,
+    /// SHA-256 hex dell'exe in esecuzione.
+    pub exe_sha256: String,
+}
+
+impl ServerInfo {
+    /// Converte il payload grezzo di INFO_RES in identita' tipizzata.
+    /// Ritorna None se il tag OS e' ignoto/vuoto o il path e' vuoto:
+    /// un'identita' parziale e' peggio di nessuna (il chiamante cade
+    /// sulla discovery/env senza mezze verita').
+    pub fn from_info_res(res: &proto::InfoRes) -> Option<ServerInfo> {
+        let os = RemoteOs::from_tag(&res.os_tag)?;
+        if res.exe_path.is_empty() {
+            return None;
+        }
+        Some(ServerInfo {
+            os,
+            exe_path: res.exe_path.clone(),
+            build_ts: res.build_ts,
+            exe_sha256: res.exe_sha256.clone(),
+        })
+    }
 }
 
 /// Estrae il build timestamp dall'output di `crosspilot --version`.
@@ -264,6 +313,54 @@ mod tests {
         let out = "DEBUG noise\nEXE=True\n\n  \nBUILD_TS=42\n";
         let info = parse_remote_info(out);
         assert_eq!(info.build_ts, Some(42));
+    }
+
+    #[test]
+    fn parse_remote_info_running_exe() {
+        // Discovery §6: la chiave RUNNING_EXE riporta il path REALE del
+        // processo vivo; righe vuote ignorate.
+        let out =
+            "EXE=True\nEXE_HASH=AB12\nRUNNING_EXE=/home/rocky/crosspilot\nLINUX_PRESENT=False\n";
+        let info = parse_remote_info(out);
+        assert_eq!(info.running_exe.as_deref(), Some("/home/rocky/crosspilot"));
+
+        // Windows: path con backslash nel valore (split sul primo '=').
+        let out = "EXE=True\nRUNNING_EXE=C:\\ci\\crosspilot.exe\n";
+        let info = parse_remote_info(out);
+        assert_eq!(info.running_exe.as_deref(), Some("C:\\ci\\crosspilot.exe"));
+
+        // Processo assente -> nessuna riga -> None.
+        let out = "EXE=False\nLINUX_PRESENT=False\n";
+        let info = parse_remote_info(out);
+        assert!(info.running_exe.is_none());
+    }
+
+    #[test]
+    fn server_info_from_info_res() {
+        // Tag OS mappati nel consumer; tag ignoto -> None (il chiamante
+        // cade sulla discovery/env, mai mezza identita').
+        let res = proto::InfoRes {
+            os_tag: "L".to_string(),
+            exe_path: "/opt/cp/crosspilot".to_string(),
+            build_ts: 42,
+            exe_sha256: "ab".repeat(32),
+        };
+        let info = ServerInfo::from_info_res(&res).unwrap();
+        assert_eq!(info.os, RemoteOs::Linux);
+        assert_eq!(info.exe_path, "/opt/cp/crosspilot");
+        assert_eq!(info.build_ts, 42);
+
+        let res_unknown = proto::InfoRes {
+            os_tag: "X".to_string(),
+            ..res.clone()
+        };
+        assert!(ServerInfo::from_info_res(&res_unknown).is_none());
+
+        let res_nopath = proto::InfoRes {
+            exe_path: String::new(),
+            ..res.clone()
+        };
+        assert!(ServerInfo::from_info_res(&res_nopath).is_none());
     }
 
     #[test]

@@ -7,9 +7,9 @@
 // pagando il timeout del protocollo.
 
 use anyhow::{Context, Result};
-use tokio::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::net::TcpStream;
 use winrm_rs::WinrmError;
 
 use crate::bootstrap_prescan::{self, BootstrapChannel};
@@ -103,7 +103,10 @@ async fn print_psremoting_hint(host: &str, port: u16) {
     let evidence = p.render();
     let diagnosis = p.diagnosis();
     if remote_is_unix() {
-        eprintln!("[HINT] Bootstrap SSH fallito verso {} (porta WinRM {} non applicabile).", host, port);
+        eprintln!(
+            "[HINT] Bootstrap SSH fallito verso {} (porta WinRM {} non applicabile).",
+            host, port
+        );
     } else {
         eprintln!("[HINT] Bootstrap Windows fallito su {}.", host);
     }
@@ -131,8 +134,13 @@ async fn report_winrm_error(ctx: &str, e: &WinrmError, host: &str, port: u16) ->
         WinrmError::AuthFailed(_) => {
             if !HINT_PRINTED.swap(true, Ordering::Relaxed) {
                 eprintln!();
-                eprintln!("[HINT] Autenticazione WinRM rifiutata da {}:{}.", host, port);
-                eprintln!("       Verificare USER/PASS dell'ambiente attivo: crosspilot env show <nome>");
+                eprintln!(
+                    "[HINT] Autenticazione WinRM rifiutata da {}:{}.",
+                    host, port
+                );
+                eprintln!(
+                    "       Verificare USER/PASS dell'ambiente attivo: crosspilot env show <nome>"
+                );
                 eprintln!();
             }
             true
@@ -179,12 +187,20 @@ pub(crate) fn split_domain_user(raw: &str) -> (String, String) {
     if let Some(pos) = raw.rfind('@') {
         let user_part = raw[..pos].to_string();
         let domain_dns = raw[pos + 1..].to_string();
-        crate::qprintln!("[DEBUG] split credenziali: UPN user={} domain_dns={}", user_part, domain_dns);
+        crate::qprintln!(
+            "[DEBUG] split credenziali: UPN user={} domain_dns={}",
+            user_part,
+            domain_dns
+        );
         (user_part, String::new())
     } else if let Some(pos) = raw.rfind('\\') {
         let domain_part = raw[..pos].to_string();
         let user_part = raw[pos + 1..].to_string();
-        crate::qprintln!("[DEBUG] split credenziali: DOMAIN\\user user={} domain={}", user_part, domain_part);
+        crate::qprintln!(
+            "[DEBUG] split credenziali: DOMAIN\\user user={} domain={}",
+            user_part,
+            domain_part
+        );
         (user_part, domain_part)
     } else {
         (raw.to_string(), String::new())
@@ -206,7 +222,11 @@ fn winrm_context() -> Result<WinrmCtx> {
 
     // Parsing della porta WinRM (default 5985 per HTTP).
     let port = winrm_port_str.parse::<u16>().unwrap_or(5985);
-    crate::qprintln!("[DEBUG] winrm_context: endpoint WinRM = {}:{} (HTTP, NTLMv2)", host, port);
+    crate::qprintln!(
+        "[DEBUG] winrm_context: endpoint WinRM = {}:{} (HTTP, NTLMv2)",
+        host,
+        port
+    );
 
     // --- Costruzione client WinRM ---
     // HTTP (use_tls = false), NTLMv2 (default). Il dominio è lasciato vuoto:
@@ -273,14 +293,19 @@ pub(crate) fn report_runas_mode(stdout: &str, schtasks_user: &str) {
             println!("Remote server scheduled as SYSTEM (elevated, hidden).");
         }
         "USER_S4U" => {
-            println!("Remote server scheduled as {} (elevated if admin, hidden).", schtasks_user);
+            println!(
+                "Remote server scheduled as {} (elevated if admin, hidden).",
+                schtasks_user
+            );
         }
         "INTERACTIVE" => {
             eprintln!("[WARNING] Server avviato in sessione interattiva: finestra cmd visibile e privilegi non elevati.");
             eprintln!("          Per privilegi admin + esecuzione nascosta servono diritti admin sull'account remoto.");
         }
         "FAILED" => {
-            eprintln!("[ERROR] bootstrap: creazione task schedulato fallita in tutte le modalita'.");
+            eprintln!(
+                "[ERROR] bootstrap: creazione task schedulato fallita in tutte le modalita'."
+            );
         }
         _ => {}
     }
@@ -293,7 +318,10 @@ pub(crate) async fn winrm_probe(exe_path: &str) -> Option<version::RemoteBuildIn
     let ctx = match winrm_context() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[update-fallback] preflight: configurazione WinRM non valida: {}", e);
+            eprintln!(
+                "[update-fallback] preflight: configurazione WinRM non valida: {}",
+                e
+            );
             return None;
         }
     };
@@ -301,7 +329,9 @@ pub(crate) async fn winrm_probe(exe_path: &str) -> Option<version::RemoteBuildIn
         Ok(info) => {
             eprintln!(
                 "[update-fallback] preflight WinRM OK: ts remoto={:?} locale={} exe_present={}",
-                info.build_ts, version::BUILD_TS, info.exe_present
+                info.build_ts,
+                version::BUILD_TS,
+                info.exe_present
             );
             Some(info)
         }
@@ -332,13 +362,11 @@ pub(crate) async fn winrm_probe(exe_path: &str) -> Option<version::RemoteBuildIn
 /// Ritorna Some(info) se un remote_build_info risponde (deploy
 /// possibile), None se nessun canale e' utilizzabile.
 pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
-    let exe_path = match envs::var("EXE_PATH") {
-        Some(p) => p,
-        None => {
-            eprintln!("[update-fallback] preflight: EXE_PATH non configurato");
-            return None;
-        }
-    };
+    // EXE_PATH assente/errato NON e' bloccante: remote_build_info emette
+    // comunque RUNNING_EXE (discovery §6) — e' il path del PROCESSO vivo
+    // a contare, non il guess dell'env. Stringa vuota = probe del solo
+    // stato processo.
+    let exe_path = envs::var("EXE_PATH").unwrap_or_default();
     let p = bootstrap_prescan::prescan().await;
     let order = bootstrap_prescan::candidates(p);
     for ch in order {
@@ -349,6 +377,105 @@ pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
         }
     }
     None
+}
+
+/// Canale bootstrap per il fallback §7: quello che ha risposto al
+/// preflight (channel_probe) se coerente con l'OS RISOLTO dalla
+/// identita' remota, altrimenti il primo candidato della famiglia
+/// giusta (SSH-posix su unix, WinRM/SSH-win/SMB su Windows).
+/// L'identita' vince sull'env: un env che dichiara Windows su un remote
+/// Linux non puo' convogliare il deploy verso WinRM.
+pub(crate) async fn fallback_channel(remote_os: version::RemoteOs) -> Result<BootstrapChannel> {
+    let unix = remote_os == version::RemoteOs::Linux;
+    let coherent = |ch: BootstrapChannel| unix == matches!(ch, BootstrapChannel::SshPosix);
+    if let Some(ch) = bootstrap_prescan::probed_channel() {
+        if coherent(ch) {
+            return Ok(ch);
+        }
+        eprintln!(
+            "[update-fallback] WARNING: canale probed {:?} incoerente con l'OS \
+             risolto ({:?}): riordino sui candidati corretti",
+            ch, remote_os
+        );
+    }
+    let p = bootstrap_prescan::prescan().await;
+    let bootstrap_override = envs::var("BOOTSTRAP");
+    let order = bootstrap_prescan::candidates_for(unix, p, bootstrap_override.as_deref());
+    for ch in &order {
+        if coherent(*ch) {
+            return Ok(*ch);
+        }
+    }
+    anyhow::bail!(
+        "nessun canale bootstrap coerente con l'OS risolto {:?}",
+        remote_os
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Fallback di update via canale WinRM (spec selfdescribe-guardrail §7):
+// il canale fa SOLO trasporto file + exec — mai quit prima che il deploy
+// sia verificato (staged+functional check, poi UPDATE_REQ o swap §7.2).
+// ---------------------------------------------------------------------------
+
+/// §7.1: upload staged + hash + functional check via WinRM, SENZA swap.
+pub(crate) async fn channel_deploy_staged_winrm(staged: &str, payload: &[u8]) -> Result<()> {
+    let ctx = winrm_context()?;
+    deploy::deploy_staged_winrm(&ctx.client, &ctx.host, staged, payload).await
+}
+
+/// §7.2: swap exe -> exe.old, staged -> exe + verifica hash finale.
+pub(crate) async fn channel_swap_winrm(
+    exe_path: &str,
+    staged: &str,
+    expected_hash: &str,
+) -> Result<()> {
+    let ctx = winrm_context()?;
+    deploy::winrm_swap_and_verify(&ctx.client, &ctx.host, exe_path, staged, expected_hash).await
+}
+
+/// §7.2: avvio detached via catena schtasks (stesso script del bootstrap).
+pub(crate) async fn channel_start_winrm(exe_path: &str) -> Result<()> {
+    let ctx = winrm_context()?;
+    let script = schtasks_start_script(exe_path, &ctx.schtasks_user);
+    let out = ctx
+        .client
+        .run_powershell(&ctx.host, &script)
+        .await
+        .map_err(|e| anyhow::anyhow!("avvio schtasks via WinRM: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    report_runas_mode(&stdout, &ctx.schtasks_user);
+    if out.exit_code != 0 || stdout.contains("RUNAS=FAILED") {
+        anyhow::bail!(
+            "avvio server via WinRM/schtasks fallito (exit {}): {}",
+            out.exit_code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// §7.2 rescue: ripristino `exe.old` -> exe.
+pub(crate) async fn channel_restore_old_winrm(exe_path: &str) -> Result<()> {
+    let ctx = winrm_context()?;
+    let escaped = exe_path.replace('\'', "''");
+    let script = format!(
+        "if (Test-Path '{0}.old') {{ Move-Item -Force '{0}.old' '{0}' }}",
+        escaped
+    );
+    let out = ctx
+        .client
+        .run_powershell(&ctx.host, &script)
+        .await
+        .map_err(|e| anyhow::anyhow!("restore .old via WinRM: {}", e))?;
+    if out.exit_code != 0 {
+        anyhow::bail!(
+            "ripristino {}.old fallito via WinRM: {}",
+            exe_path,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Orchestratore del bootstrap (spec ssh-unified §2.4): prescan TCP
@@ -369,8 +496,9 @@ pub async fn channel_probe() -> Option<version::RemoteBuildInfo> {
 pub async fn bootstrap_server() -> Result<()> {
     // --- Path del server remoto (da .env) ---
     // Risoluzione via envs: CROSSPILOT_<ENV>_EXE_PATH -> fallback CROSSPILOT_EXE_PATH.
-    let exe_path = envs::var("EXE_PATH")
-        .context("CROSSPILOT_EXE_PATH (o CROSSPILOT_<ENV>_EXE_PATH) must be set in the .env file")?;
+    let exe_path = envs::var("EXE_PATH").context(
+        "CROSSPILOT_EXE_PATH (o CROSSPILOT_<ENV>_EXE_PATH) must be set in the .env file",
+    )?;
 
     // Prescan una-tantum (OnceCell) + lista candidati ordinata per stato
     // probe: Open prima, Refused dopo, Filtered ultimi (spec §2.3).
@@ -399,14 +527,8 @@ pub async fn bootstrap_server() -> Result<()> {
             Err(e) => {
                 // Mismatch host key SSH: FATALE — mai proseguire su altri
                 // canali verso lo stesso host (possibile MITM, spec §2.8).
-                if e
-                    .downcast_ref::<ssh_transport::HostKeyMismatch>()
-                    .is_some()
-                {
-                    bootstrap_prescan::set_last_bootstrap_error(format!(
-                        "{:?}: {:#}",
-                        ch, e
-                    ));
+                if e.downcast_ref::<ssh_transport::HostKeyMismatch>().is_some() {
+                    bootstrap_prescan::set_last_bootstrap_error(format!("{:?}: {:#}", ch, e));
                     return Err(e);
                 }
                 eprintln!("[bootstrap] canale {:?} fallito: {:#}", ch, e);
@@ -470,11 +592,13 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
 
             if !info.exe_present {
                 // Exe mancante (bug 3.6): deploy completo.
+                // §7.3 onesta': exe MANCANTE + deploy fallito = niente
+                // puo' partire -> propagare Err, mai warning+finger-
+                // crossed polling (il server non puo' essere gia' in
+                // esecuzione: non c'e' il binario).
                 eprintln!("[bootstrap] Exe remoto mancante. Avvio auto-deploy...");
                 if let Err(e) = deploy::deploy_exe(&client, &host, exe_path, &info).await {
-                    eprintln!("[ERROR] bootstrap_server: auto-deploy fallito: {}", e);
-                    // Non ritorniamo errore: il server potrebbe essere già in
-                    // esecuzione da un bootstrap precedente. Il polling deciderà.
+                    return Err(e.context("bootstrap: auto-deploy fallito con exe remoto mancante"));
                 }
             } else if info.is_newer_than_local() {
                 // Remote PIU' NUOVO del client: il "piu' vecchio" siamo noi.
@@ -509,7 +633,9 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
                         Ok(()) => {
                             // Iraggiungibile su Unix (exec sostituisce il
                             // processo); il log copre piattaforme senza exec.
-                            eprintln!("[self-update] re-exec completato senza sostituzione processo?");
+                            eprintln!(
+                                "[self-update] re-exec completato senza sostituzione processo?"
+                            );
                         }
                         Err(e) => {
                             eprintln!(
@@ -590,46 +716,47 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
         eprintln!("Bootstrapping server via WinRM...");
         let ps_result = client.run_powershell(&host, &ps_script).await;
 
-    // Verifica del risultato: il bug precedente ignorava completamente
-    // l'output del comando remoto. Ora controlliamo exit_code e stderr.
-    match ps_result {
-        Ok(output) => {
-            crate::qprintln!("[DEBUG] bootstrap_server: exit_code={}", output.exit_code);
+        // Verifica del risultato: il bug precedente ignorava completamente
+        // l'output del comando remoto. Ora controlliamo exit_code e stderr.
+        match ps_result {
+            Ok(output) => {
+                crate::qprintln!("[DEBUG] bootstrap_server: exit_code={}", output.exit_code);
 
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-            if !stdout_str.trim().is_empty() {
-                crate::qprintln!("[DEBUG] bootstrap_server: stdout={}", stdout_str.trim());
+                if !stdout_str.trim().is_empty() {
+                    crate::qprintln!("[DEBUG] bootstrap_server: stdout={}", stdout_str.trim());
+                }
+                if !stderr_str.trim().is_empty() {
+                    crate::qprintln!("[DEBUG] bootstrap_server: stderr={}", stderr_str.trim());
+                }
+
+                // Modalita' di avvio scelta dalla catena di fallback nello
+                // script (RUNAS=SYSTEM|USER_S4U|INTERACTIVE|FAILED) — parser
+                // condiviso col canale SSH-win (bootstrap_ssh::start_server).
+                report_runas_mode(&stdout_str, &schtasks_user);
+
+                if output.exit_code != 0 {
+                    // Start-Process fallito (es. exe inesistente, permessi).
+                    // Non ritorniamo errore: il server potrebbe essere già in
+                    // esecuzione da un bootstrap precedente. Il polling deciderà.
+                    eprintln!(
+                        "[ERROR] bootstrap_server: Start-Process fallito (exit_code={}): {}",
+                        output.exit_code,
+                        stderr_str.trim()
+                    );
+                } else {
+                    println!("Bootstrap command executed successfully.");
+                }
             }
-            if !stderr_str.trim().is_empty() {
-                crate::qprintln!("[DEBUG] bootstrap_server: stderr={}", stderr_str.trim());
-            }
-
-            // Modalita' di avvio scelta dalla catena di fallback nello
-            // script (RUNAS=SYSTEM|USER_S4U|INTERACTIVE|FAILED) — parser
-            // condiviso col canale SSH-win (bootstrap_ssh::start_server).
-            report_runas_mode(&stdout_str, &schtasks_user);
-
-            if output.exit_code != 0 {
-                // Start-Process fallito (es. exe inesistente, permessi).
-                // Non ritorniamo errore: il server potrebbe essere già in
-                // esecuzione da un bootstrap precedente. Il polling deciderà.
-                eprintln!(
-                    "[ERROR] bootstrap_server: Start-Process fallito (exit_code={}): {}",
-                    output.exit_code, stderr_str.trim()
-                );
-            } else {
-                println!("Bootstrap command executed successfully.");
+            Err(e) => {
+                // Connessione WinRM fallita (rete, credenziali, servizio non attivo).
+                // Non ritorniamo errore: il server potrebbe essere già in esecuzione.
+                // Il chiamante ritenterà la connessione TCP fino a max_attempts.
+                report_winrm_error("comando WinRM", &e, &host, winrm_port).await;
             }
         }
-        Err(e) => {
-            // Connessione WinRM fallita (rete, credenziali, servizio non attivo).
-            // Non ritorniamo errore: il server potrebbe essere già in esecuzione.
-            // Il chiamante ritenterà la connessione TCP fino a max_attempts.
-            report_winrm_error("comando WinRM", &e, &host, winrm_port).await;
-        }
-    }
     }
 
     // --- Fail-fast su canale morto (bug B1) ---
@@ -659,6 +786,13 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
         // ascolto, ma SYN droppato => "connect timeout" indistinguibile
         // dal "server spento" visto da fuori).
         remote_startup_diag(&client, &host).await;
+        // §7.3 onesta': il bootstrap NON e' riuscito — un Ok qui farebbe
+        // credere al chiamante "deploy ok, proseguo" su porta morta.
+        return Err(anyhow::anyhow!(
+            "server NON tornato in ascolto entro 30s dopo il bootstrap WinRM \
+             (verificare {} via RDP/schtasks, log remoto)",
+            host
+        ));
     }
 
     Ok(())
@@ -780,9 +914,7 @@ pub(crate) fn interpret_windows_diag(port: u16, stdout: &str) {
 /// script+interpretazione condivisi col canale SSH-win.
 async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
     let port = server_tcp_port();
-    eprintln!(
-        "[bootstrap] server non in ascolto dopo 30s: diagnostica remota via WinRM..."
-    );
+    eprintln!("[bootstrap] server non in ascolto dopo 30s: diagnostica remota via WinRM...");
     let script = windows_diag_script(port);
     match client.run_powershell(host, &script).await {
         Ok(out) => {
@@ -799,10 +931,8 @@ async fn remote_startup_diag(client: &winrm_rs::WinrmClient, host: &str) {
 /// pub(crate): riusata da bootstrap_ssh (stessa attesa post-avvio).
 pub(crate) async fn poll_server_startup() -> bool {
     println!("Waiting for server to start...");
-    let host = envs::var("HOST")
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let client_port = envs::var("CLIENT_PORT")
-        .unwrap_or_else(|| "47330".to_string());
+    let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
 
     for i in 1..=15 {
@@ -817,10 +947,8 @@ pub(crate) async fn poll_server_startup() -> bool {
         // avvio. Stesso motivo dei listener zombie (BUG-13): connect OK ma
         // nessuno risponde READY. La connessione extra e' innocua: il
         // server manda READY e ripulisce al primo peek (EOF).
-        let conn = tokio::time::timeout(
-            Duration::from_secs(2),
-            TcpStream::connect(addr.as_str())
-        ).await;
+        let conn =
+            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr.as_str())).await;
         let up = match conn {
             Ok(Ok(mut s)) => matches!(
                 tokio::time::timeout(Duration::from_secs(2), crate::read_ready_line(&mut s)).await,

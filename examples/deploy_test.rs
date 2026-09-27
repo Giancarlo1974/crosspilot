@@ -37,8 +37,9 @@ fn load_env() -> (String, String, String, String, String) {
     let port = env::var("CROSSPILOT_PORT").unwrap_or_else(|_| "5985".to_string());
     let user = env::var("CROSSPILOT_USER").unwrap_or_else(|_| "gianca".to_string());
     let pass = env::var("CROSSPILOT_PASS").unwrap_or_else(|_| "gianca".to_string());
-    let exe_path = env::var("CROSSPILOT_EXE_PATH")
-        .unwrap_or_else(|_| r"C:\Users\giancarloalbanese\repos\crosspilot\target\release\crosspilot.exe".to_string());
+    let exe_path = env::var("CROSSPILOT_EXE_PATH").unwrap_or_else(|_| {
+        r"C:\Users\giancarloalbanese\repos\crosspilot\target\release\crosspilot.exe".to_string()
+    });
     (host, port, user, pass, exe_path)
 }
 
@@ -73,8 +74,7 @@ async fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -89,14 +89,24 @@ async fn main() {
         .join("target/x86_64-pc-windows-gnu/release/crosspilot.exe");
 
     if !local_exe.exists() {
-        eprintln!("ERRORE: binario locale non trovato: {}", local_exe.display());
-        eprintln!("Esegui prima: cargo build --release --target x86_64-pc-windows-gnu --bin crosspilot");
+        eprintln!(
+            "ERRORE: binario locale non trovato: {}",
+            local_exe.display()
+        );
+        eprintln!(
+            "Esegui prima: cargo build --release --target x86_64-pc-windows-gnu --bin crosspilot"
+        );
         std::process::exit(1);
     }
 
     let local_size = fs::metadata(&local_exe).unwrap().len();
     let local_hash = sha256_file(&local_exe).expect("sha256 locale");
-    println!("Binario locale: {} ({} byte, sha256={})", local_exe.display(), local_size, &local_hash[..16]);
+    println!(
+        "Binario locale: {} ({} byte, sha256={})",
+        local_exe.display(),
+        local_size,
+        &local_hash[..16]
+    );
     println!("Target remoto: {}:{} -> {}", host, port, remote_exe_path);
 
     // --- Crea client WinRM ---
@@ -114,10 +124,20 @@ async fn main() {
         "if (Test-Path '{}') {{ (Get-FileHash '{}' -Algorithm SHA256).Hash }} else {{ 'MISSING' }}",
         remote_exe_path, remote_exe_path
     );
-    let out = client.run_powershell(&host, &check_script).await.expect("check");
+    let out = client
+        .run_powershell(&host, &check_script)
+        .await
+        .expect("check");
     let remote_hash = String::from_utf8_lossy(&out.stdout).trim().to_uppercase();
     let local_hash_upper = local_hash.to_uppercase();
-    println!("  hash remoto: {}", if remote_hash.is_empty() { "(vuoto)" } else { &remote_hash[..16.min(remote_hash.len())] });
+    println!(
+        "  hash remoto: {}",
+        if remote_hash.is_empty() {
+            "(vuoto)"
+        } else {
+            &remote_hash[..16.min(remote_hash.len())]
+        }
+    );
     println!("  hash locale: {}", &local_hash_upper[..16]);
 
     if remote_hash == local_hash_upper {
@@ -125,25 +145,45 @@ async fn main() {
     } else {
         // --- Step 2: crea directory target se non esiste ---
         println!("\n[2/5] Creazione directory target...");
-        let remote_dir = remote_exe_path.rfind('\\').map(|i| &remote_exe_path[..i]).unwrap_or("C:\\");
+        let remote_dir = remote_exe_path
+            .rfind('\\')
+            .map(|i| &remote_exe_path[..i])
+            .unwrap_or("C:\\");
         let mkdir_script = format!(
             "New-Item -ItemType Directory -Force -Path '{}' | Out-Null; Test-Path '{}'",
             remote_dir, remote_dir
         );
-        let out = client.run_powershell(&host, &mkdir_script).await.expect("mkdir");
-        println!("  dir creata: {}", String::from_utf8_lossy(&out.stdout).trim());
+        let out = client
+            .run_powershell(&host, &mkdir_script)
+            .await
+            .expect("mkdir");
+        println!(
+            "  dir creata: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
 
         // --- Step 3: upload chunked via send_input (stdin) ---
-        println!("\n[3/5] Upload chunked via send_input (chunk={} byte base64)...", CHUNK_B64_SIZE);
+        println!(
+            "\n[3/5] Upload chunked via send_input (chunk={} byte base64)...",
+            CHUNK_B64_SIZE
+        );
         let exe_data = fs::read(&local_exe).expect("read exe");
         let b64 = base64_encode(&exe_data);
         let total_chunks = (b64.len() + CHUNK_B64_SIZE - 1) / CHUNK_B64_SIZE;
-        println!("  totale: {} byte → {} base64 → {} chunk", exe_data.len(), b64.len(), total_chunks);
+        println!(
+            "  totale: {} byte → {} base64 → {} chunk",
+            exe_data.len(),
+            b64.len(),
+            total_chunks
+        );
 
         let temp_b64 = format!("{}.b64", remote_exe_path);
 
         // Pulisce file temp esistente
-        let cleanup_script = format!("if (Test-Path '{}') {{ Remove-Item '{}' -Force }}", temp_b64, temp_b64);
+        let cleanup_script = format!(
+            "if (Test-Path '{}') {{ Remove-Item '{}' -Force }}",
+            temp_b64, temp_b64
+        );
         let _ = client.run_powershell(&host, &cleanup_script).await;
 
         // Crea shell remota (Shell API: start_command + send_input + receive_next)
@@ -156,20 +196,32 @@ async fn main() {
             "$in = [Console]::In.ReadToEnd(); [IO.File]::AppendAllText('{}', $in)",
             temp_b64
         );
-        let cmd_id = shell.start_command(
-            "powershell.exe",
-            &["-NoProfile", "-NonInteractive", "-Command", &ps_command],
-        ).await.expect("start_command");
+        let cmd_id = shell
+            .start_command(
+                "powershell.exe",
+                &["-NoProfile", "-NonInteractive", "-Command", &ps_command],
+            )
+            .await
+            .expect("start_command");
         println!("  command_id={}", cmd_id);
 
         // Invia i chunk base64 via send_input (stdin)
         let b64_bytes = b64.as_bytes();
         for (i, chunk) in b64_bytes.chunks(CHUNK_B64_SIZE).enumerate() {
             let is_last = i + 1 == total_chunks;
-            shell.send_input(&cmd_id, chunk, is_last).await
-                .unwrap_or_else(|e| panic!("send_input chunk {}/{} failed: {e}", i + 1, total_chunks));
+            shell
+                .send_input(&cmd_id, chunk, is_last)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("send_input chunk {}/{} failed: {e}", i + 1, total_chunks)
+                });
             if (i + 1) % 10 == 0 || is_last {
-                println!("  chunk {}/{} ({}%)", i + 1, total_chunks, (i + 1) * 100 / total_chunks);
+                println!(
+                    "  chunk {}/{} ({}%)",
+                    i + 1,
+                    total_chunks,
+                    (i + 1) * 100 / total_chunks
+                );
             }
         }
 
@@ -204,9 +256,15 @@ async fn main() {
              (Get-FileHash '{}' -Algorithm SHA256).Hash",
             temp_b64, remote_exe_path, temp_b64, remote_exe_path
         );
-        let out = client.run_powershell(&host, &decode_script).await.expect("decode");
+        let out = client
+            .run_powershell(&host, &decode_script)
+            .await
+            .expect("decode");
         let remote_hash_after = String::from_utf8_lossy(&out.stdout).trim().to_uppercase();
-        println!("  hash remoto dopo upload: {}", &remote_hash_after[..16.min(remote_hash_after.len())]);
+        println!(
+            "  hash remoto dopo upload: {}",
+            &remote_hash_after[..16.min(remote_hash_after.len())]
+        );
         println!("  hash locale:              {}", &local_hash_upper[..16]);
         if remote_hash_after == local_hash_upper {
             println!("  → SHA-256 match! Upload riuscito.");
@@ -222,17 +280,26 @@ async fn main() {
     let env_content = "CROSSPILOT_SERVER_PORT=5330\n";
     let env_remote = format!(
         "{}\\.env",
-        remote_exe_path.rfind('\\').map(|i| &remote_exe_path[..i]).unwrap_or("C:\\")
+        remote_exe_path
+            .rfind('\\')
+            .map(|i| &remote_exe_path[..i])
+            .unwrap_or("C:\\")
     );
     let env_script = format!(
         "[IO.File]::WriteAllText('{}', '{}')",
         env_remote, env_content
     );
-    let out = client.run_powershell(&host, &env_script).await.expect("write .env");
+    let out = client
+        .run_powershell(&host, &env_script)
+        .await
+        .expect("write .env");
     if out.exit_code == 0 {
         println!("  .env scritto: {}", env_remote);
     } else {
-        eprintln!("  ERRORE scrittura .env: {}", String::from_utf8_lossy(&out.stderr).trim());
+        eprintln!(
+            "  ERRORE scrittura .env: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
 
     // --- Step 6: test esecuzione remota (--help) ---

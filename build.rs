@@ -91,7 +91,10 @@ fn main() {
         }
         stub
     };
-    println!("cargo:rustc-env=CROSSPILOT_WINDOWS_ASSET={}", win_embed_path.display());
+    println!(
+        "cargo:rustc-env=CROSSPILOT_WINDOWS_ASSET={}",
+        win_embed_path.display()
+    );
 
     // --- Asset linux (musl) opzionale ---
     // assets/crosspilot.linux e' prodotto da build-release.sh.
@@ -116,7 +119,10 @@ fn main() {
         stub
     };
 
-    println!("cargo:rustc-env=CROSSPILOT_LINUX_ASSET={}", embed_path.display());
+    println!(
+        "cargo:rustc-env=CROSSPILOT_LINUX_ASSET={}",
+        embed_path.display()
+    );
 
     // Rebuild se gli asset cambiano (l'exe Windows ha gia' include_bytes!
     // diretto su assets/crosspilot.exe, che fa da trigger implicito).

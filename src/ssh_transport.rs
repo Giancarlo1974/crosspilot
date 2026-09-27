@@ -203,13 +203,7 @@ impl Handler for SshHandler {
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let pubkey = server_public_key.public_key();
-        let decision = check_tofu(
-            &self.kh_path,
-            &self.host,
-            self.port,
-            &pubkey,
-            self.insecure,
-        );
+        let decision = check_tofu(&self.kh_path, &self.host, self.port, &pubkey, self.insecure);
         match decision {
             Ok(()) => Ok(true),
             Err(msg) => {
@@ -276,7 +270,10 @@ async fn agent_impl() -> Option<DynAgent> {
     match agent {
         Ok(a) => Some(a.dynamic()),
         Err(e) => {
-            crate::qprintln!("[DEBUG] ssh auth: agent SSH_AUTH_SOCK non raggiungibile: {}", e);
+            crate::qprintln!(
+                "[DEBUG] ssh auth: agent SSH_AUTH_SOCK non raggiungibile: {}",
+                e
+            );
             None
         }
     }
@@ -290,7 +287,10 @@ async fn agent_impl() -> Option<DynAgent> {
     match pipe {
         Ok(a) => return Some(a.dynamic()),
         Err(e) => {
-            crate::qprintln!("[DEBUG] ssh auth: named pipe openssh-agent non raggiungibile: {}", e);
+            crate::qprintln!(
+                "[DEBUG] ssh auth: named pipe openssh-agent non raggiungibile: {}",
+                e
+            );
         }
     }
     let pageant = AgentClient::connect_pageant().await;
@@ -372,10 +372,7 @@ impl SshSession {
                 }
                 crate::qprintln!("[DEBUG] ssh handshake fallito: {}", e);
                 let err = anyhow::Error::from(bootstrap::ChannelUnreachable("SSH"));
-                return Err(err.context(format!(
-                    "handshake SSH verso {}:{}",
-                    ctx.host, ctx.port
-                )));
+                return Err(err.context(format!("handshake SSH verso {}:{}", ctx.host, ctx.port)));
             }
             Err(_) => {
                 crate::qprintln!(
@@ -492,11 +489,7 @@ impl SshSession {
             Some(s) => s,
             None => bail!("sftp non inizializzato"),
         };
-        eprintln!(
-            "[deploy-ssh] upload SFTP {} byte -> {}",
-            data.len(),
-            path
-        );
+        eprintln!("[deploy-ssh] upload SFTP {} byte -> {}", data.len(), path);
         let mut file = sftp
             .create(path)
             .await

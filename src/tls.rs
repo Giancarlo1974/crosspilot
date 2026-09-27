@@ -30,12 +30,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::Engine;
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, ServerConfig, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, ServerConfig, SignatureScheme,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -334,8 +334,8 @@ fn server_cert_paths() -> Result<(PathBuf, PathBuf)> {
             .ok_or_else(|| anyhow!("CROSSPILOT_TLS_KEY impostato ma manca CROSSPILOT_TLS_CERT"))?;
         return Ok((PathBuf::from(key), PathBuf::from(crt)));
     }
-    let exe = std::env::current_exe()
-        .context("impossibile determinare il path dell'exe corrente")?;
+    let exe =
+        std::env::current_exe().context("impossibile determinare il path dell'exe corrente")?;
     let dir = match exe.parent() {
         Some(d) => d.to_path_buf(),
         None => PathBuf::from("."),
@@ -369,8 +369,8 @@ pub fn ensure_server_cert() -> Result<()> {
         TLS_SERVER_NAME.to_string(),
         Ipv4Addr::UNSPECIFIED.to_string(),
     ];
-    let mut params = rcgen::CertificateParams::new(sans)
-        .map_err(|e| anyhow!("SAN invalido: {}", e))?;
+    let mut params =
+        rcgen::CertificateParams::new(sans).map_err(|e| anyhow!("SAN invalido: {}", e))?;
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "crosspilot-agent");
@@ -382,8 +382,7 @@ pub fn ensure_server_cert() -> Result<()> {
 
     // Persiste: chiave PEM (0600 unix), cert PEM (644).
     let key_pem = key_pair.serialize_pem();
-    fs::write(&key_path, key_pem)
-        .with_context(|| format!("scrittura {}", key_path.display()))?;
+    fs::write(&key_path, key_pem).with_context(|| format!("scrittura {}", key_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -392,8 +391,7 @@ pub fn ensure_server_cert() -> Result<()> {
             .with_context(|| format!("chmod 600 {}", key_path.display()))?;
     }
     let crt_pem = cert.pem();
-    fs::write(&crt_path, crt_pem)
-        .with_context(|| format!("scrittura {}", crt_path.display()))?;
+    fs::write(&crt_path, crt_pem).with_context(|| format!("scrittura {}", crt_path.display()))?;
 
     eprintln!(
         "[server] TLS: generata coppia self-signed {} + {}",
@@ -406,15 +404,13 @@ pub fn ensure_server_cert() -> Result<()> {
 /// Costruisce la ServerConfig TLS dal materiale su disco.
 fn build_server_config() -> Result<ServerConfig> {
     let (key_path, crt_path) = server_cert_paths()?;
-    let key_pem = fs::read(&key_path)
-        .with_context(|| format!("lettura {}", key_path.display()))?;
+    let key_pem = fs::read(&key_path).with_context(|| format!("lettura {}", key_path.display()))?;
     let mut key_cursor = std::io::Cursor::new(key_pem);
     let key_der = rustls_pemfile::private_key(&mut key_cursor)
         .with_context(|| format!("parsing chiave {}", key_path.display()))?
         .ok_or_else(|| anyhow!("{} non contiene una chiave privata", key_path.display()))?;
 
-    let crt_pem = fs::read(&crt_path)
-        .with_context(|| format!("lettura {}", crt_path.display()))?;
+    let crt_pem = fs::read(&crt_path).with_context(|| format!("lettura {}", crt_path.display()))?;
     let mut crt_cursor = std::io::Cursor::new(crt_pem);
     let mut certs = Vec::new();
     let cert_iter = rustls_pemfile::certs(&mut crt_cursor);
@@ -706,8 +702,7 @@ where
             bail!("riga troppo lunga (> {} byte)", cap);
         }
     }
-    let text = String::from_utf8(line)
-        .map_err(|_| anyhow!("riga non UTF-8"))?;
+    let text = String::from_utf8(line).map_err(|_| anyhow!("riga non UTF-8"))?;
     Ok(text)
 }
 
@@ -826,19 +821,9 @@ pub async fn client_wrap(
     let stream = match result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return Err(TlsFatal(format!(
-                "handshake TLS fallito verso {}: {}",
-                addr, e
-            ))
-            .into())
+            return Err(TlsFatal(format!("handshake TLS fallito verso {}: {}", addr, e)).into())
         }
-        Err(_) => {
-            return Err(TlsFatal(format!(
-                "timeout handshake TLS verso {}",
-                addr
-            ))
-            .into())
-        }
+        Err(_) => return Err(TlsFatal(format!("timeout handshake TLS verso {}", addr)).into()),
     };
 
     // Pin check sull'end-entity cert PRIMA di inviare qualsiasi cosa
@@ -848,11 +833,9 @@ pub async fn client_wrap(
     let cert = match certs.and_then(|c| c.first()) {
         Some(c) => c,
         None => {
-            return Err(TlsFatal(format!(
-                "server {} non ha presentato certificati TLS",
-                addr
-            ))
-            .into())
+            return Err(
+                TlsFatal(format!("server {} non ha presentato certificati TLS", addr)).into(),
+            )
         }
     };
     check_cert_pin(addr, cert.as_ref())?;
@@ -864,7 +847,10 @@ pub async fn client_wrap(
     link.write_all(auth_line.as_bytes())
         .await
         .context("invio riga AUTH")?;
-    crate::qprintln!("[DEBUG] tls: handshake+AUTH ok verso {} (pin verificato)", addr);
+    crate::qprintln!(
+        "[DEBUG] tls: handshake+AUTH ok verso {} (pin verificato)",
+        addr
+    );
     Ok(link)
 }
 
@@ -894,15 +880,13 @@ mod tests {
         // ts >= TLS_MIN_TS -> TLS; ts minore o None -> plaintext.
         let hello = version::ServerHello {
             ts: Some(TLS_MIN_TS),
-            os: None,
         };
         assert!(server_tls_capable(&hello));
         let old = version::ServerHello {
             ts: Some(TLS_MIN_TS - 1),
-            os: None,
         };
         assert!(!server_tls_capable(&old));
-        let legacy = version::ServerHello { ts: None, os: None };
+        let legacy = version::ServerHello { ts: None };
         assert!(!server_tls_capable(&legacy));
     }
 

@@ -3,9 +3,10 @@
 // best-practice < 1000 righe.
 //
 // ARCHITETTURA ("il piu' vecchio si aggiorna da solo", over TCP):
-// l'handshake del server e' "READY <BUILD_TS> [<os>]\n" — il tag OS
-// (L|W) e' opzionale e non ancora inviato; i server legacy mandano
-// "READY\n" secco -> ts=None -> trattati come i piu' vecchi di tutti.
+// l'handshake del server e' "READY <BUILD_TS>\n" — READY porta SOLO
+// il ts (§1.1: l'OS remoto arriva da INFO_RES/discovery, mai da un
+// tag del saluto ne' dall'euristica su EXE_PATH); i server legacy
+// mandano "READY\n" secco -> ts=None -> i piu' vecchi di tutti.
 //
 //   remote_ts == locale  -> niente da fare
 //   remote_ts >  locale  -> SELF-UPDATE del client: GET del sidecar
@@ -86,7 +87,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::{bootstrap, deploy, envs, path, proto, transfer, verify, version};
+use crate::bootstrap_prescan::BootstrapChannel;
+use crate::{bootstrap, deploy, envs, path, proto, server_info, transfer, verify, version};
 // self_update e' usato solo nel path unix (install_staged_file);
 // su Windows il self-update passa dall'updater (cfg-specific).
 #[cfg(not(target_os = "windows"))]
@@ -201,7 +203,10 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
                 eprintln!("[update] self-update gia' tentato: proseguo col binario locale.");
                 return Reconcile::Proceed;
             }
-            eprintln!("[update] remote piu' nuovo (ts={} > {}): self-update via TCP...", t, local);
+            eprintln!(
+                "[update] remote piu' nuovo (ts={} > {}): self-update via TCP...",
+                t, local
+            );
             match self_update_tcp(t).await {
                 // Su unix non ritorna (exec); su errore: warning e si prosegue.
                 Ok(()) => Reconcile::Proceed,
@@ -225,14 +230,11 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
                 "[update] remote {:?} piu' vecchio del locale (ts={}): update via TCP...",
                 remote_ts, local
             );
-            match update_remote(remote_ts, hello.os).await {
+            match update_remote(remote_ts).await {
                 Ok(()) => Reconcile::Reconnect,
                 Err(e) => {
-                    eprintln!(
-                        "[update] WARNING update remoto via TCP fallito: {:#}",
-                        e
-                    );
-                    // --- FALLBACK canale bootstrap (WinRM | SSH) ---
+                    eprintln!("[update] WARNING update remoto via TCP fallito: {:#}", e);
+                    // --- FALLBACK canale bootstrap (spec §7) ---
                     // Il transfer TCP puo' essere rotto SUL REMOTE (caso
                     // reale H101: server di una build intermedia con
                     // VERSION=2 del protocollo che rifiuta i messaggi framed
@@ -241,48 +243,26 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
                     // handshake continuano pero' a funzionare, quindi il
                     // server e' vivo ma non aggiornabile via TCP.
                     //
-                    // Il canale di bootstrap (WinRM su remote Windows, SSH
-                    // su remote Linux/Unix — dispatch interno di
-                    // channel_probe/bootstrap_server) e' indipendente dal
-                    // framing TCP. Sequenza SICURA:
-                    //   1. preflight del canale (channel_probe): se non
-                    //      risponde NON si tocca il server corrente
-                    //      (fermarlo senza via di ripristino = brick);
-                    //   2. `quit` in shell-mode (raw: funziona anche con
-                    //      framing rotto) -> il vecchio server esce pulito,
-                    //      niente race col comando client;
-                    //   3. bootstrap_server(): deploy staged sul canale
-                    //      (functional check `--version` + swap .old)
-                    //      + riavvio detached + attesa;
-                    //   4. Reconnect: riconnesione e verifica del ts nuovo.
-                    if let Some(_info) = bootstrap::channel_probe().await {
-                        eprintln!(
-                            "[update] fallback bootstrap: fermo il vecchio server via shell-mode (`quit`)..."
-                        );
-                        let _ = send_shell_and_drain("quit").await;
-                        eprintln!("[update] fallback bootstrap: vecchio server fermato, deploy + riavvio sul canale dedicato...");
-                        match bootstrap::bootstrap_server().await {
-                            Ok(()) => {
-                                eprintln!(
-                                    "[update] fallback bootstrap completato: riconnessione al server aggiornato..."
-                                );
-                                // Il vecchio server e' gia' uscito (quit) e
-                                // bootstrap_server ha atteso il nuovo in
-                                // ascolto: niente attesa caduta porta.
-                                return Reconcile::ReconnectNoWait;
-                            }
-                            Err(e2) => {
-                                eprintln!(
-                                    "[update] WARNING fallback bootstrap fallito: {:#} — proseguo col server corrente",
-                                    e2
-                                );
-                            }
+                    // Sequenza SICURA (§7.3: MAI `quit` prima che il
+                    // deploy sia verificato — il fallback storico faceva
+                    // quit-then-bootstrap e un deploy fallito lasciava
+                    // il remote morto):
+                    //   1. preflight canale (channel_probe): se non
+                    //      risponde NON si tocca il server corrente;
+                    //      il probe riporta anche RUNNING_EXE (§6);
+                    //   2. identita' risolta (INFO_RES > discovery > env)
+                    //      e drift env<->remoto segnalato (§4);
+                    //   3. deploy SOLO-staged sul canale + hash +
+                    //      functional check;
+                    //   4. server nuovo: UPDATE_REQ (l'updater remoto fa
+                    //      swap+relaunch+rollback); legacy/framing rotto:
+                    //      swap via canale -> quit -> avvio -> poll ->
+                    //      rescue .old se non torna su.
+                    match fallback_channel_update(remote_ts).await {
+                        Ok(r) => return r,
+                        Err(e2) => {
+                            eprintln!("[update] FALLBACK CANALE FALLITO: {:#}", e2);
                         }
-                    } else {
-                        eprintln!(
-                            "[update] canale bootstrap (WinRM/SSH) non raggiungibile: nessun fallback \
-                             disponibile, proseguo col server corrente (TCP non aggiornabile da questo client)."
-                        );
                     }
                     Reconcile::Proceed
                 }
@@ -307,19 +287,22 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
 ///   BLOCCO 4 — regola firewall inbound TCP/<porta> (netsh | ufw/firewalld/iptables/nft)
 ///   BLOCCO 5 — trigger swap: UPDATE_REQ (server nuovi) | spawn schtasks/setsid (legacy)
 ///
-/// `remote_os_hint` e' l'OS dichiarato dal server nell'handshake (tag L|W):
-/// se presente sostituisce l'euristica su EXE_PATH, che resta il fallback
-/// per i server che non lo inviano ancora.
-async fn update_remote(remote_ts: Option<u64>, remote_os_hint: Option<version::RemoteOs>) -> Result<()> {
-    let exe_path =
-        envs::var("EXE_PATH").context("CROSSPILOT_EXE_PATH necessario per l'update remoto")?;
-
-    // Risoluzione OS del remote (blocco preliminare a tutti gli altri).
-    let remote_os = resolve_remote_os(remote_os_hint, &exe_path);
+/// L'identita' remota e' risolta qui (spec §3): INFO_RES del server
+/// vivo > discovery RUNNING_EXE del preflight > env (con gate di
+/// coerenza §5). Mai piu' l'euristica cieca su EXE_PATH: un path
+/// Windows ereditato su remote Linux deployava su `C:\...` (brick).
+async fn update_remote(remote_ts: Option<u64>) -> Result<()> {
+    let identity = server_info::remote_identity(None).await?;
+    // §4: segnala il drift env<->remoto (una volta; --fix-env riscrive).
+    server_info::reconcile_config(&identity);
+    let exe_path = identity.exe_path.clone();
+    let remote_os = identity.os;
     let remote_windows = remote_os == version::RemoteOs::Windows;
     crate::qprintln!(
-        "[DEBUG] update_remote: os_dichiarato={:?} exe_path='{}' -> remote_os={:?}",
-        remote_os_hint, exe_path, remote_os
+        "[DEBUG] update_remote: identita' remota fonte={:?} os={:?} exe_path='{}'",
+        identity.source,
+        remote_os,
+        exe_path
     );
 
     // Payload disponibili: servono sia allo staged (BLOCCO 1) sia agli
@@ -350,10 +333,7 @@ async fn update_remote(remote_ts: Option<u64>, remote_os_hint: Option<version::R
     }
     let dir = remote_parent(&exe_path).to_string();
     let staged_remote = remote_join(&dir, &staged_name);
-    eprintln!(
-        "[update] dir remota: {} -> staged: {}",
-        dir, staged_remote
-    );
+    eprintln!("[update] dir remota: {} -> staged: {}", dir, staged_remote);
 
     // --- BLOCCO 0: marker anti retry-storm ---
     // Il rollback dell'updater lascia `crosspilot-<ts>.bad` nella dir del
@@ -459,7 +439,10 @@ async fn update_remote(remote_ts: Option<u64>, remote_os_hint: Option<version::R
     let put_res = put_with_retry(&tmp_env_s, &env_remote, ".env").await;
     let _ = std::fs::remove_file(&tmp_env);
     match put_res {
-        Ok(()) => eprintln!("[update] .env remoto aggiornato (SERVER_PORT={}, merge)", port),
+        Ok(()) => eprintln!(
+            "[update] .env remoto aggiornato (SERVER_PORT={}, merge)",
+            port
+        ),
         Err(e) => eprintln!("[update] WARNING upload .env: {}", e),
     }
 
@@ -480,28 +463,10 @@ async fn update_remote(remote_ts: Option<u64>, remote_os_hint: Option<version::R
     match remote_ts {
         Some(_) => {
             // Server nuovo (ha mandato "READY <ts>"): capisce MSG_UPDATE_REQ.
-            // Va su connessione FRESCA, non su quella dell'handshake: il peek
-            // del server ha timeout 2s e dopo i PUT (anche minuti) il socket
-            // dell'handshake e' gia' caduto in shell-mode — il frame verrebbe
-            // eseguito come comando shell ("early eof" sul client).
-            let mut s = open_conn().await?;
-            let req = proto::UpdateReq {
-                staged_path: staged_remote.clone(),
-            };
-            proto::send_update_req(&mut s, &req).await?;
-            let (msg_type, payload) = proto::read_msg(&mut s).await?;
-            if msg_type == proto::MSG_ERR {
-                let err = proto::decode_err(&payload)?;
-                bail!("UPDATE_REQ rifiutato: ERR {} {}", err.code, err.message);
-            }
-            if msg_type != proto::MSG_UPDATE_RES {
-                bail!("risposta inattesa a UPDATE_REQ (tipo {})", msg_type);
-            }
-            let res = proto::decode_update_res(&payload)?;
-            if res.status != 0 {
-                bail!("spawn updater fallito sul remote: {}", res.message);
-            }
-            eprintln!("[update] updater avviato sul remote: {}", res.message);
+            // Va su connessione FRESCA (helper condiviso col fallback §7.1):
+            // il peek del server ha timeout 2s e dopo i PUT il socket
+            // dell'handshake e' gia' caduto in shell-mode.
+            send_update_req(&staged_remote).await?;
         }
         None => {
             // Server legacy ("READY\n"): niente UPDATE_REQ. Si spawnano
@@ -524,6 +489,245 @@ async fn update_remote(remote_ts: Option<u64>, remote_os_hint: Option<version::R
         }
     }
     Ok(())
+}
+
+/// Invia MSG_UPDATE_REQ su connessione fresca e verifica UPDATE_RES
+/// status=0 (condiviso da update_remote BLOCCO 5 e dal fallback §7.1 —
+/// in entrambi i casi e' l'UPDATER remoto a fare swap/relaunch/
+/// rollback: il client non chiude MAI un server prima del trigger).
+async fn send_update_req(staged_remote: &str) -> Result<()> {
+    let mut s = open_conn().await?;
+    let req = proto::UpdateReq {
+        staged_path: staged_remote.to_string(),
+    };
+    proto::send_update_req(&mut s, &req).await?;
+    let (msg_type, payload) = proto::read_msg(&mut s).await?;
+    if msg_type == proto::MSG_ERR {
+        let err = proto::decode_err(&payload)?;
+        bail!("UPDATE_REQ rifiutato: ERR {} {}", err.code, err.message);
+    }
+    if msg_type != proto::MSG_UPDATE_RES {
+        bail!("risposta inattesa a UPDATE_REQ (tipo {})", msg_type);
+    }
+    let res = proto::decode_update_res(&payload)?;
+    if res.status != 0 {
+        bail!("spawn updater fallito sul remote: {}", res.message);
+    }
+    eprintln!("[update] updater avviato sul remote: {}", res.message);
+    Ok(())
+}
+
+/// FALLBACK via canale bootstrap quando l'update TCP e' fallito
+/// (spec selfdescribe-guardrail §7). Differenze rispetto al vecchio
+/// quit-then-bootstrap:
+///   - preflight del canale PRIMA di toccare il server (§7.3: mai
+///     fermare un server sano senza via di ripristino);
+///   - identita' remota risolta (RUNNING_EXE del probe corregge un
+///     EXE_PATH env errato — il caso del brick reale);
+///   - il canale fa SOLO trasporto file: deploy staged + hash +
+///     functional check, MAI `quit` pre-verifica;
+///   - server nuovo: UPDATE_REQ su TCP (§7.1) — l'updater remoto fa
+///     wait-pid -> swap -> relaunch -> rollback;
+///   - server legacy o UPDATE_REQ rifiutato: §7.2 — swap via canale,
+///     POI quit, POI avvio, poll stretto, rescue .old.
+///
+/// Err onesto se il server non torna su (mai "proseguo col corrente"
+/// quando il corrente e' morto).
+async fn fallback_channel_update(remote_ts: Option<u64>) -> Result<Reconcile> {
+    // 0. Marker anti-concorrenza locale (P2): due processi client sulla
+    //    stessa macchina NON devono innescare due fallback canale sullo
+    //    stesso remote — due swap/rescue concorrenti possono incastrarsi
+    //    (.old sovrascritto dal nuovo, exe perso). Stale dopo 15min,
+    //    rilasciato a fine operazione.
+    let lock = acquire_fallback_lock()?;
+    let result = fallback_channel_update_inner(remote_ts).await;
+    release_fallback_lock(&lock);
+    result
+}
+
+/// Corpo del fallback §7 (v. fallback_channel_update).
+async fn fallback_channel_update_inner(remote_ts: Option<u64>) -> Result<Reconcile> {
+    // 1. Preflight del canale (WinRM | SSH | SMB — l'ordine e' del
+    //    prescan): un canale morto -> non si tocca nulla.
+    let info = match bootstrap::channel_probe().await {
+        Some(i) => i,
+        None => anyhow::bail!("preflight: nessun canale bootstrap raggiungibile (WinRM/SSH/SMB)"),
+    };
+    // 2. Identita' remota: INFO_RES e' gia' stata tentata in
+    //    update_remote (nessuna — i server vecchi non la conoscono);
+    //    qui pesa la discovery RUNNING_EXE del probe, poi env + gate §5.
+    let identity = server_info::remote_identity(Some(&info)).await?;
+    server_info::reconcile_config(&identity);
+    let exe_path = identity.exe_path.clone();
+    let remote_os = identity.os;
+    let dir = remote_parent(&exe_path).to_string();
+
+    // 3. Payload staged per l'OS del REMOTE (nome compatibile con la
+    //    validazione is_staged_name dell'updater: crosspilot-<ts>[.exe]).
+    let (staged_name, payload) = match remote_os {
+        version::RemoteOs::Windows => (
+            format!("crosspilot-{}.exe", version::BUILD_TS),
+            deploy::windows_exe_bytes()?,
+        ),
+        version::RemoteOs::Linux => (
+            format!("crosspilot-{}", version::BUILD_TS),
+            deploy::linux_bin_bytes()?,
+        ),
+    };
+    if payload.is_empty() {
+        anyhow::bail!("artefatto staged vuoto (build senza build-release.sh)");
+    }
+    let staged = remote_join(&dir, &staged_name);
+    let expected_hash = deploy::sha256_bytes(&payload).to_uppercase();
+
+    // 4. Canale coerente con l'OS RISOLTO (identita' > env: un env che
+    //    dichiara Windows su remote Linux non puo' convogliare il
+    //    deploy verso WinRM).
+    let ch = bootstrap::fallback_channel(remote_os).await?;
+    crate::qprintln!(
+        "[DEBUG] fallback §7: canale={:?} os={:?} staged={}",
+        ch,
+        remote_os,
+        staged
+    );
+
+    // 5. Deploy SOLO-staged + verifica via canale: da qui in poi lo
+    //    staged e' integro ed eseguibile — qualunque trigger e' sicuro.
+    ch.deploy_staged(remote_os, &staged, &payload).await?;
+
+    match remote_ts {
+        Some(_) => {
+            // §7.1: server nuovo — trigger UPDATE_REQ sul canale TCP
+            // (il server e' ANCORA vivo e il suo updater fa swap+
+            // relaunch+rollback). Mai `quit` da qui.
+            match send_update_req(&staged).await {
+                Ok(()) => {
+                    eprintln!(
+                        "[update] UPDATE_REQ accettato dopo deploy via canale; \
+                         l'updater remoto completa swap+relaunch."
+                    );
+                    Ok(Reconcile::Reconnect)
+                }
+                Err(e) => {
+                    // UPDATE_REQ rifiutato (framing rotto anche lui — build
+                    // intermedia): lo staged e' GIA' verificato, lo swap via
+                    // canale e' sicuro -> path legacy §7.2.
+                    eprintln!(
+                        "[update] UPDATE_REQ rifiutato ({:#}) — fallback §7.2: swap via canale.",
+                        e
+                    );
+                    legacy_channel_restart(ch, remote_os, &exe_path, &staged, &expected_hash).await
+                }
+            }
+        }
+        None => legacy_channel_restart(ch, remote_os, &exe_path, &staged, &expected_hash).await,
+    }
+}
+
+/// Lock anti-concorrenza LOCALE (P2): `<tmpdir>/crosspilot-fallback-<host>-<port>.lock`.
+/// Impedisce a due client dello stesso host di correre fallback canale
+/// concorrenti sullo stesso remote (swap doppi = .old sovrascritto).
+/// Create-new + staleness via mtime (15min): un client crashato non
+/// lascia il lock eterno. Restituisce il path del marker — il rilascio
+/// e' esplicito (release_fallback_lock) a fine operazione.
+fn acquire_fallback_lock() -> Result<PathBuf> {
+    let host = envs::var("HOST").unwrap_or_else(|| "unknown".to_string());
+    let port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
+    let safe_host: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path =
+        std::env::temp_dir().join(format!("crosspilot-fallback-{}-{}.lock", safe_host, port));
+    // Stale check: un lock piu' vecchio di 15min appartiene a un
+    // processo morto (o a un fallback lunghissimo gia' concluso).
+    if let Ok(meta) = std::fs::metadata(&path) {
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .unwrap_or(Duration::ZERO);
+        if age > Duration::from_secs(15 * 60) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = writeln!(f, "pid={} ts={}", std::process::id(), version::BUILD_TS);
+            Ok(path)
+        }
+        Err(_) => anyhow::bail!(
+            "fallback canale gia' in corso (marker {} presente): \
+             attesa o rimozione manuale del marker se il processo e' morto",
+            path.display()
+        ),
+    }
+}
+
+/// Rilascio esplicito del marker anti-concorrenza (best-effort).
+fn release_fallback_lock(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// §7.2: server legacy (nessun UPDATE_REQ) o framing rotto. Sequenza
+/// OBBLIGATA: swap via canale (exe -> exe.old, staged -> exe + hash),
+/// POI `quit`, POI avvio detached via canale, poll ~30s. Se il nuovo
+/// server non torna su: rescue `exe.old` -> exe + riavvio + poll —
+/// mai lasciare il remote sull'exe fallito (§7.3). Err onesto se
+/// anche il rescue fallisce: il remote e' probabilmente brickato e lo
+/// si DICE, invece di proseguire col server morto.
+async fn legacy_channel_restart(
+    ch: BootstrapChannel,
+    remote_os: version::RemoteOs,
+    exe_path: &str,
+    staged: &str,
+    expected_hash: &str,
+) -> Result<Reconcile> {
+    // Swap via canale (rename-first: legale anche a server in esecuzione).
+    ch.swap_exe(remote_os, exe_path, staged, expected_hash)
+        .await?;
+    eprintln!(
+        "[update] swap via canale completato: {} (backup in .old); fermo il vecchio server.",
+        exe_path
+    );
+    // ORA il quit: il nuovo exe e' gia' in posizione e verificato —
+    // mai prima (quit su deploy non verificato = il brick originario).
+    let _ = send_shell_and_drain("quit").await;
+    // Avvio via canale: se fallisce si passa comunque al rescue .old
+    // (un errore di start non deve fermare il ripristino).
+    if let Err(e) = ch.start_remote(remote_os, exe_path).await {
+        eprintln!("[update] WARNING avvio server via canale fallito: {}", e);
+    }
+
+    // Poll stretto (~30s, il server swappato deve risalire da solo).
+    if bootstrap::poll_server_startup().await {
+        return Ok(Reconcile::ReconnectNoWait);
+    }
+    // Rescue: .old -> exe + riavvio + poll breve.
+    eprintln!("[update] nuovo server non in ascolto: rescue exe.old via canale...");
+    if let Err(e) = ch.restore_old(remote_os, exe_path).await {
+        eprintln!("[update] WARNING rescue .old fallito: {}", e);
+    }
+    let _ = ch.start_remote(remote_os, exe_path).await;
+    if !bootstrap::poll_server_startup().await {
+        let user = envs::var("USER").unwrap_or_else(|| "<user>".to_string());
+        let host = envs::var("HOST").unwrap_or_else(|| "<host>".to_string());
+        anyhow::bail!(
+            "server NON tornato in ascolto dopo swap via canale e rescue .old — \
+             remote probabilmente BRICKATO: intervento manuale necessario \
+             (ssh {}@{} — verificare {} e .old accanto ad esso)",
+            user,
+            host,
+            exe_path
+        );
+    }
+    eprintln!("[update] rescue .old riuscito: server pre-update di nuovo in ascolto.");
+    Ok(Reconcile::ReconnectNoWait)
 }
 
 /// Self-update del client (remote piu' nuovo): GET .ver + GET del binario
@@ -589,11 +793,7 @@ async fn fetch_remote_ver(dir: &str) -> Option<version::RemoteBuildInfo> {
 /// Self-update su client Unix: GET sidecar -> install_staged_file
 /// (hash + --version check + rename atomico + re-exec).
 #[cfg(not(target_os = "windows"))]
-async fn self_update_unix(
-    remote_ts: u64,
-    dir: &str,
-    expected_sha: Option<String>,
-) -> Result<()> {
+async fn self_update_unix(remote_ts: u64, dir: &str, expected_sha: Option<String>) -> Result<()> {
     let self_path = std::env::current_exe().context("current_exe")?;
     let staged = self_update::staged_path(&self_path);
     let staged_s = staged.to_string_lossy().to_string();
@@ -606,7 +806,8 @@ async fn self_update_unix(
     }
 
     // Installa (verifica, chmod, --version check, swap, re-exec).
-    let result = self_update::install_staged_file(&staged, remote_ts, expected_sha.as_deref()).await;
+    let result =
+        self_update::install_staged_file(&staged, remote_ts, expected_sha.as_deref()).await;
     if result.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
@@ -736,22 +937,10 @@ async fn send_shell_and_drain(cmd: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).to_string())
 }
 
-/// Risolve l'OS del REMOTE: preferenza al tag dichiarato nell'handshake
-/// ("READY <ts> L|W"), altrimenti euristica storica su EXE_PATH
-/// (drive letter/UNC -> Windows, '/' -> unix). E' il blocco preliminare
-/// da cui dipende il dispatch per-OS di tutti i macro-blocchi successivi.
-fn resolve_remote_os(declared: Option<version::RemoteOs>, exe_path: &str) -> version::RemoteOs {
-    match declared {
-        Some(os) => os,
-        None => {
-            if is_windows_path(exe_path) {
-                version::RemoteOs::Windows
-            } else {
-                version::RemoteOs::Linux
-            }
-        }
-    }
-}
+// NB (spec §1.1): il blocco "risoluzione OS del remote" storico
+// (euristica su EXE_PATH + tag handshake) e' stato rimosso — l'OS
+// remoto arriva dall'identita' risolta in server_info (INFO_RES >
+// discovery > env), mai dall'inferenza su una stringa di path.
 
 /// MACRO-BLOCCO firewall: assicura l'inbound TCP/<porta> usando lo
 /// shell-mode del server ANCORA in esecuzione (testo raw: funziona
@@ -895,7 +1084,9 @@ pub async fn ensure_inbound_allow_local(port: u16) {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 let trimmed = stdout.trim();
                 if trimmed.is_empty() {
-                    eprintln!("[server] firewall self-ensure: regola applicata (netsh, nessun output)");
+                    eprintln!(
+                        "[server] firewall self-ensure: regola applicata (netsh, nessun output)"
+                    );
                 } else {
                     eprintln!("[server] firewall self-ensure: {}", trimmed);
                 }
@@ -1090,7 +1281,10 @@ async fn check_staged_runnable(staged: &str, remote_os: version::RemoteOs) -> Re
             version::BUILD_TS
         );
     }
-    eprintln!("[update] staged verificato eseguibile sul remote (ts={})", staged_ts);
+    eprintln!(
+        "[update] staged verificato eseguibile sul remote (ts={})",
+        staged_ts
+    );
     Ok(())
 }
 
@@ -1141,7 +1335,10 @@ fn task_spawn_cmd(staged: &str, port: u16, target: &str) -> String {
 /// nome crosspilot-*, esistente), lo spawnza detached con
 /// `update --target <self> --wait-pid <pid> --port <porta>`, risponde
 /// UPDATE_RES e termina il processo server per consentire lo swap.
-pub async fn server_apply_update(socket: &mut crate::tls::Link, req: &proto::UpdateReq) -> Result<()> {
+pub async fn server_apply_update(
+    socket: &mut crate::tls::Link,
+    req: &proto::UpdateReq,
+) -> Result<()> {
     let staged = PathBuf::from(&req.staged_path);
     let self_exe = std::env::current_exe().context("current_exe")?;
 
@@ -1169,7 +1366,36 @@ pub async fn server_apply_update(socket: &mut crate::tls::Link, req: &proto::Upd
             message: format!("staged path non valido: {}", req.staged_path),
         };
         let _ = proto::send_update_res(socket, &res).await;
-        bail!("UPDATE_REQ rifiutato: staged non valido ({})", req.staged_path);
+        bail!(
+            "UPDATE_REQ rifiutato: staged non valido ({})",
+            req.staged_path
+        );
+    }
+
+    // Anti-downgrade (spec §9): il ts nel NOME dello staged
+    // (crosspilot-<ts>[.exe]) non puo' essere piu' vecchio del BUILD_TS
+    // del server in esecuzione — un client/fallback stale non deve MAI
+    // sovrascrivere un server piu' nuovo. Confronto gratis sul nome,
+    // prima di qualunque spawn. ts non parsabile -> consenti (i nomi
+    // validati sopra hanno stem numerico; il caso anomalo non e' un
+    // downgrade dimostrabile).
+    if let Some(staged_ts) = staged_build_ts(&req.staged_path) {
+        if staged_ts < version::BUILD_TS {
+            let res = proto::UpdateRes {
+                status: 3,
+                message: format!(
+                    "anti-downgrade: staged ts {} < server {} — rifiutato",
+                    staged_ts,
+                    version::BUILD_TS
+                ),
+            };
+            let _ = proto::send_update_res(socket, &res).await;
+            bail!(
+                "UPDATE_REQ rifiutato (anti-downgrade): staged {} piu' vecchio del server {}",
+                staged_ts,
+                version::BUILD_TS
+            );
+        }
     }
 
     // Su Unix il file arrivato via PUT ha permessi 644: serve +x per eseguirlo
@@ -1262,7 +1488,8 @@ pub async fn server_apply_update(socket: &mut crate::tls::Link, req: &proto::Upd
 async fn spawn_updater(staged: &Path, args: &[String], log: &UpdaterLog) -> Result<Option<u32>> {
     #[cfg(target_os = "windows")]
     {
-        match schtasks_spawn_local(staged, args, "crosspilot-updater", UPDATER_LOG_NAME, log).await {
+        match schtasks_spawn_local(staged, args, "crosspilot-updater", UPDATER_LOG_NAME, log).await
+        {
             Ok(()) => return Ok(None),
             Err(e) => {
                 log.line(&format!(
@@ -1402,7 +1629,10 @@ pub async fn run_updater(
         None => default_target(&self_exe)?,
     };
     if target_path == self_exe {
-        bail!("target == exe corrente ({}): niente da fare", target_path.display());
+        bail!(
+            "target == exe corrente ({}): niente da fare",
+            target_path.display()
+        );
     }
     let port = port
         .or_else(|| envs::var("SERVER_PORT").and_then(|p| p.parse().ok()))
@@ -1456,12 +1686,19 @@ pub async fn run_updater(
     if target_path.exists() {
         let _ = std::fs::remove_file(&old_path);
         match retry_rename(&target_path, &old_path, 60).await {
-            Ok(()) => log.line(&format!("backup: {} -> {}", target_path.display(), old_path.display())),
+            Ok(()) => log.line(&format!(
+                "backup: {} -> {}",
+                target_path.display(),
+                old_path.display()
+            )),
             Err(e) => {
                 // Senza backup non si puo' fare rollback: abortire e'
                 // piu' sicuro che proseguire allo swap senza paracadute
                 // (il vecchio server e' morto ma il suo exe e' intatto).
-                log.line(&format!("FATAL rename target -> .old: {} — abort senza swap", e));
+                log.line(&format!(
+                    "FATAL rename target -> .old: {} — abort senza swap",
+                    e
+                ));
                 // Il target e' ANCORA il vecchio binario funzionante (lo
                 // swap non e' avvenuto): invece di lasciare il remote
                 // morto, si tenta il rilancio di emergenza del vecchio
@@ -1473,15 +1710,18 @@ pub async fn run_updater(
                     // (socket zombie del server appena morto) prima del
                     // rilancio — il vecchio build esce subito su AddrInUse.
                     wait_port_free(port, PORT_RELEASE_WAIT_SECS, &log).await;
-                    match relaunch_server(&target_path, &["--server".to_string()], false, &log).await {
+                    match relaunch_server(&target_path, &["--server".to_string()], false, &log)
+                        .await
+                    {
                         Ok(old_pid) => {
                             // Wait-and-see anche qui (BUG-13): un bind
                             // seguito da morte immediata non e' "operativo".
                             let up = wait_port_up(port, 30, &log).await;
-                            let stable = up
-                                && confirm_server_stable(old_pid, port, &log).await;
+                            let stable = up && confirm_server_stable(old_pid, port, &log).await;
                             if stable {
-                                log.line("vecchio server ripartito: update fallito ma remote operativo");
+                                log.line(
+                                    "vecchio server ripartito: update fallito ma remote operativo",
+                                );
                             } else {
                                 log.line("WARNING: vecchio server non in ascolto/stabile dopo il rilancio di emergenza");
                             }
@@ -1592,7 +1832,16 @@ pub async fn run_updater(
             // Windows --arg sarebbero gli argv originali, non --server!).
             log.line(&format!("FATAL spawn rilancio: {} — rollback", e));
             let verify_port = if server_mode { Some(port) } else { None };
-            rollback_to_old(&dir, &target_path, &old_path, verify_port, &relaunch, console, &log).await;
+            rollback_to_old(
+                &dir,
+                &target_path,
+                &old_path,
+                verify_port,
+                &relaunch,
+                console,
+                &log,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -1641,7 +1890,16 @@ pub async fn run_updater(
             old_path.display()
         ));
     }
-    rollback_to_old(&dir, &target_path, &old_path, Some(port), &["--server".to_string()], false, &log).await;
+    rollback_to_old(
+        &dir,
+        &target_path,
+        &old_path,
+        Some(port),
+        &["--server".to_string()],
+        false,
+        &log,
+    )
+    .await;
     Ok(())
 }
 
@@ -1846,7 +2104,8 @@ async fn probe_server_ready(port: u16) -> bool {
         Ok(Ok(s)) => s,
         _ => return false,
     };
-    let hello = tokio::time::timeout(Duration::from_secs(2), crate::read_ready_line(&mut stream)).await;
+    let hello =
+        tokio::time::timeout(Duration::from_secs(2), crate::read_ready_line(&mut stream)).await;
     matches!(hello, Ok(Ok(_)))
 }
 
@@ -1909,7 +2168,10 @@ async fn wait_port_up(port: u16, secs: u64, log: &UpdaterLog) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    log.line(&format!("porta {} MAI in ascolto (READY) entro {}s", port, secs));
+    log.line(&format!(
+        "porta {} MAI in ascolto (READY) entro {}s",
+        port, secs
+    ));
     false
 }
 
@@ -2069,7 +2331,11 @@ async fn rollback_to_old(
         return;
     }
     match retry_rename(old, target, 60).await {
-        Ok(()) => log.line(&format!("ripristinato {} -> {}", old.display(), target.display())),
+        Ok(()) => log.line(&format!(
+            "ripristinato {} -> {}",
+            old.display(),
+            target.display()
+        )),
         Err(e) => {
             log.line(&format!("FATAL rollback rename .old -> target: {}", e));
             return;
@@ -2156,7 +2422,10 @@ async fn wait_server_down(wait_pid: Option<u32>, port: u16, wait_secs: u64, log:
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        log.line(&format!("WARNING: pid {} ancora vivo dopo {}s", pid, wait_secs));
+        log.line(&format!(
+            "WARNING: pid {} ancora vivo dopo {}s",
+            pid, wait_secs
+        ));
     }
     // Porta: attesa che il listener muoia (complementare al pid, o unico
     // segnale quando il pid non e' noto — es. spawn via task scheduler).
@@ -2300,6 +2569,20 @@ fn is_staged_name(name: &str) -> bool {
     !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Estrae il build ts dal NOME dello staged `crosspilot-<digits>[.exe]`
+/// (anti-downgrade §9): None se il nome non e' un staged numerico.
+/// Basename sep-aware ('\\' e '/'): il path remoto puo' essere Windows
+/// mentre il binario che decide e' Linux.
+fn staged_build_ts(path: &str) -> Option<u64> {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let rest = name.strip_prefix("crosspilot-")?;
+    let stem = rest.strip_suffix(".exe").unwrap_or(rest);
+    if stem.is_empty() || !stem.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    stem.parse::<u64>().ok()
+}
+
 /// Scrive `crosspilot.ver` in `dir`: BUILD_TS + EXE_SHA256 + LINUX_SHA256.
 /// EXE_SHA256 descrive l'artefatto WINDOWS scaricabile (`crosspilot.exe`):
 /// su un server Windows e' l'exe corrente stesso; su un server Linux e'
@@ -2323,14 +2606,19 @@ fn write_ver_file(dir: &Path, self_exe: &Path) -> Result<()> {
     let ver_path = dir.join(version::VER_FILE_NAME);
     std::fs::write(&ver_path, content)
         .with_context(|| format!("scrittura {}", ver_path.display()))?;
-    eprintln!("[update] .ver scritto: {} (ts={})", ver_path.display(), version::BUILD_TS);
+    eprintln!(
+        "[update] .ver scritto: {} (ts={})",
+        ver_path.display(),
+        version::BUILD_TS
+    );
     Ok(())
 }
 
 /// SHA-256 hex uppercase di un file.
-fn sha256_file_hex(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("apertura {}", path.display()))?;
+/// pub(crate): riusato da server_info per l'EXE_SHA256 di INFO_RES.
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("apertura {}", path.display()))?;
     let digest = verify::sha256_file_handle(&mut f)?;
     Ok(digest
         .iter()
@@ -2490,9 +2778,7 @@ pub fn sweep_staged(dir: &Path) {
         if name == self_name {
             continue;
         }
-        let leftover = name.ends_with(".b64")
-            || name.ends_with(".new")
-            || name.ends_with(".part");
+        let leftover = name.ends_with(".b64") || name.ends_with(".new") || name.ends_with(".part");
         if is_staged_name(&name) || leftover {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => eprintln!("[update] sweep: rimosso {}", name),
@@ -2506,14 +2792,9 @@ pub fn sweep_staged(dir: &Path) {
 // Helper path remoti (separator-aware: Windows \ e Unix / per i test locali).
 // ---------------------------------------------------------------------------
 
-/// True se `p` sembra un path Windows: lettera di unita' (`C:\...`) o UNC
-/// (`\\server\share`). `/` iniziale => unix.
-/// pub(crate): riusata da bootstrap_ssh per l'euristica OS del remote.
-pub(crate) fn is_windows_path(p: &str) -> bool {
-    let b = p.as_bytes();
-    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
-        || (p.starts_with("\\\\") && !p.starts_with('/'))
-}
+// NOTA (spec §5): is_windows_path e' stata spostata in path.rs
+// (condivisa col gate envs::check_os_exe_coherence e con la
+// risoluzione dell'identita' remota in server_info::remote_identity).
 
 /// Directory parent di un path remoto, sep-aware (\' o '/').
 /// pub(crate): riusata da bootstrap_ssh per i path degli artefatti.
@@ -2573,8 +2854,14 @@ mod tests {
     fn remote_parent_and_join() {
         assert_eq!(remote_parent(r"C:\ci\crosspilot.exe"), r"C:\ci");
         assert_eq!(remote_parent("/tmp/remote/crosspilot"), "/tmp/remote");
-        assert_eq!(remote_join(r"C:\ci", "crosspilot-1.exe"), r"C:\ci\crosspilot-1.exe");
-        assert_eq!(remote_join("/tmp/remote", "crosspilot-1"), "/tmp/remote/crosspilot-1");
+        assert_eq!(
+            remote_join(r"C:\ci", "crosspilot-1.exe"),
+            r"C:\ci\crosspilot-1.exe"
+        );
+        assert_eq!(
+            remote_join("/tmp/remote", "crosspilot-1"),
+            "/tmp/remote/crosspilot-1"
+        );
         assert_eq!(remote_join(r"C:\ci\", "x"), r"C:\ci\x");
     }
 
@@ -2582,36 +2869,39 @@ mod tests {
     fn same_remote_path_normalizza_separatori_e_case() {
         // Bug H166: EXE_PATH="C:\crosspilot.exe" vs remote_join -> "C:/crosspilot.exe".
         assert!(same_remote_path(r"C:\crosspilot.exe", "C:/crosspilot.exe"));
-        assert!(same_remote_path(r"C:\CI\CrossPilot.EXE", r"c:\ci\crosspilot.exe"));
+        assert!(same_remote_path(
+            r"C:\CI\CrossPilot.EXE",
+            r"c:\ci\crosspilot.exe"
+        ));
         assert!(!same_remote_path(r"C:\crosspilot.exe", r"C:\other.exe"));
         assert!(!same_remote_path("/opt/crosspilot", "/opt/other"));
     }
 
     #[test]
     fn windows_path_detection() {
-        assert!(is_windows_path(r"C:\ci\crosspilot.exe"));
-        assert!(is_windows_path("D:\\x"));
-        assert!(!is_windows_path("/tmp/remote/crosspilot"));
-        assert!(!is_windows_path("relative\\path"));
+        // is_windows_path vive ora in path.rs (condivisa col gate §5).
+        assert!(path::is_windows_path(r"C:\ci\crosspilot.exe"));
+        assert!(path::is_windows_path("D:\\x"));
+        assert!(!path::is_windows_path("/tmp/remote/crosspilot"));
+        assert!(!path::is_windows_path("relative\\path"));
     }
 
     #[test]
-    fn resolve_remote_os_dichiarato_vince_su_euristica() {
-        // Tag handshake presente: vince sempre sull'euristica EXE_PATH
-        // (caso reale: path atipici, mount point, exe rinominati).
-        let os = resolve_remote_os(Some(version::RemoteOs::Linux), r"C:\ci\crosspilot.exe");
-        assert_eq!(os, version::RemoteOs::Linux);
-        let os = resolve_remote_os(Some(version::RemoteOs::Windows), "/srv/crosspilot");
-        assert_eq!(os, version::RemoteOs::Windows);
-    }
-
-    #[test]
-    fn resolve_remote_os_euristica_fallback() {
-        // Senza tag: drive letter/UNC -> Windows, '/' -> Linux.
-        let os = resolve_remote_os(None, r"C:\ci\crosspilot.exe");
-        assert_eq!(os, version::RemoteOs::Windows);
-        let os = resolve_remote_os(None, "/opt/crosspilot/crosspilot");
-        assert_eq!(os, version::RemoteOs::Linux);
+    fn staged_ts_dal_nome_per_anti_downgrade() {
+        // Spec §9: l'anti-downgrade confronta il ts nel NOME dello
+        // staged (crosspilot-<ts>[.exe]) con il BUILD_TS del server —
+        // gratis, niente hash necessario.
+        assert_eq!(
+            staged_build_ts("/srv/crosspilot-1758530400"),
+            Some(1758530400)
+        );
+        assert_eq!(
+            staged_build_ts(r"C:\ci\crosspilot-1758530400.exe"),
+            Some(1758530400)
+        );
+        assert_eq!(staged_build_ts("/srv/crosspilot-abc"), None);
+        assert_eq!(staged_build_ts("/srv/crosspilot"), None);
+        assert_eq!(staged_build_ts(""), None);
     }
 
     #[test]
@@ -2638,7 +2928,11 @@ mod tests {
         let win = windows_inbound_allow_cmd(65535);
         let lin = linux_inbound_allow_script(65535);
         assert!(win.len() <= 1024, "netsh cmd troppo lungo: {}", win.len());
-        assert!(lin.len() <= 1024, "posix script troppo lungo: {}", lin.len());
+        assert!(
+            lin.len() <= 1024,
+            "posix script troppo lungo: {}",
+            lin.len()
+        );
     }
 
     #[test]
@@ -2646,15 +2940,27 @@ mod tests {
         // BLOCCO 5 legacy: task scheduler su Windows (i figli WMI
         // muoiono ~3s dopo il bind su alcune macchine — H166), setsid
         // su Linux; entrambi con --target esplicito (mai default_target()).
-        let win = legacy_spawn_cmd(version::RemoteOs::Windows, r"C:\ci\crosspilot-1.exe", 5330, r"C:\ci\crosspilot.exe");
+        let win = legacy_spawn_cmd(
+            version::RemoteOs::Windows,
+            r"C:\ci\crosspilot-1.exe",
+            5330,
+            r"C:\ci\crosspilot.exe",
+        );
         assert!(win.contains("schtasks /Create /TN crosspilot-upd-"));
         assert!(win.contains("/RU SYSTEM /RL HIGHEST"));
         assert!(win.contains("schtasks /Run"));
         assert!(win.contains("schtasks /Delete"));
         assert!(win.contains("--port 5330"));
         assert!(win.contains("crosspilot-1.exe"));
-        let lin = legacy_spawn_cmd(version::RemoteOs::Linux, "/opt/crosspilot-1", 5330, "/opt/crosspilot");
-        assert!(lin.contains("setsid \"/opt/crosspilot-1\" update --target \"/opt/crosspilot\" --port 5330"));
+        let lin = legacy_spawn_cmd(
+            version::RemoteOs::Linux,
+            "/opt/crosspilot-1",
+            5330,
+            "/opt/crosspilot",
+        );
+        assert!(lin.contains(
+            "setsid \"/opt/crosspilot-1\" update --target \"/opt/crosspilot\" --port 5330"
+        ));
     }
 
     #[test]

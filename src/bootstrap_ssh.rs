@@ -32,11 +32,11 @@
 use anyhow::{bail, Context, Result};
 
 use crate::bootstrap;
-use crate::bootstrap_ssh_cmds::{
-    copy_cmd, dialect, file_hash_cmd, mkdir_cmd, remote_build_info_cmd, rm_cmd, sftp_path,
-    staged_name, swap_cmd,
-};
 pub use crate::bootstrap_ssh_cmds::Dialect;
+use crate::bootstrap_ssh_cmds::{
+    copy_cmd, dialect, file_hash_cmd, mkdir_cmd, remote_build_info_cmd, restore_old_cmd, rm_cmd,
+    set_dialect_detected, sftp_path, staged_name, swap_cmd,
+};
 use crate::bootstrap_ssh_cmds::{
     diag_cmd, firewall_cmd, functional_check_cmd, start_server_cmd, sudo_wrap_posix,
 };
@@ -117,12 +117,7 @@ async fn ssh_run(sess: &SshSession, cmd: &str, what: &str) -> Result<ExecOut> {
 /// Scrive `data` su `remote_path` via SFTP (shell-independent: funziona
 /// identico su posix e Windows). La directory parent viene creata prima
 /// via exec nel dialetto giusto (SFTP non crea i livelli intermedi).
-async fn ssh_write(
-    sess: &SshSession,
-    d: Dialect,
-    remote_path: &str,
-    data: &[u8],
-) -> Result<()> {
+async fn ssh_write(sess: &SshSession, d: Dialect, remote_path: &str, data: &[u8]) -> Result<()> {
     let dir = update::remote_parent(remote_path).to_string();
     let mk = ssh_run(sess, &mkdir_cmd(d, &dir), "mkdir remoto").await;
     if let Err(e) = mk {
@@ -169,31 +164,54 @@ async fn ssh_file_hash(sess: &SshSession, d: Dialect, remote_path: &str) -> Opti
     }
 }
 
-/// Equivalente SSH di deploy::remote_build_info: UNA sola chiamata exec
-/// (nel dialetto giusto) che riporta presenza exe + hash + sidecar +
-/// contenuto .ver, parsata col medesimo version::parse_remote_info.
-/// Un remote senza .ver = deploy legacy -> ts effettivo 0 -> upgrade.
-async fn remote_build_info(
-    sess: &SshSession,
-    d: Dialect,
-    exe_path: &str,
-) -> Result<RemoteBuildInfo> {
+/// Exec di remote_build_info nel dialetto dato, ritorna lo stdout grezzo.
+async fn remote_build_info_raw(sess: &SshSession, d: Dialect, exe_path: &str) -> Result<String> {
     let dir = update::remote_parent(exe_path);
     let cmd = remote_build_info_cmd(d, exe_path, dir);
     let out = ssh_run(sess, &cmd, "remote_build_info").await?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let info = version::parse_remote_info(&stdout);
-    crate::qprintln!(
-        "[DEBUG] remote_build_info (ssh/{:?}): exe_present={} ts={:?} linux_present={}",
-        d, info.exe_present, info.build_ts, info.linux_present
-    );
-    if let Some(h) = &info.exe_sha256 {
-        crate::qprintln!(
-            "[DEBUG] remote_build_info (ssh): exe_sha256={}",
-            &h[..16.min(h.len())]
-        );
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// remote_build_info con auto-detect del dialetto (guardrail §6): se il
+/// dialetto preferito non produce la riga `EXE=` — remote che non parla
+/// quel dialetto (env OS mentito o assente) — si ritenta con l'altro e
+/// il verdetto e' memorizzato: il remote sa chi e', l'env no.
+/// Ritorna (info, dialetto effettivo).
+async fn remote_build_info_auto(
+    sess: &SshSession,
+    exe_path: &str,
+) -> Result<(RemoteBuildInfo, Dialect)> {
+    let d0 = dialect();
+    if let Ok(raw) = remote_build_info_raw(sess, d0, exe_path).await {
+        if raw.contains("EXE=") {
+            let info = version::parse_remote_info(&raw);
+            crate::qprintln!(
+                "[DEBUG] remote_build_info (ssh/{:?}): exe_present={} ts={:?} running_exe={:?}",
+                d0,
+                info.exe_present,
+                info.build_ts,
+                info.running_exe
+            );
+            return Ok((info, d0));
+        }
     }
-    Ok(info)
+    // Dialetto errato: ritenta con l'altro prima di arrendersi.
+    let d1 = match d0 {
+        Dialect::Posix => Dialect::PowerShell,
+        Dialect::PowerShell => Dialect::Posix,
+    };
+    let raw = remote_build_info_raw(sess, d1, exe_path).await?;
+    if !raw.contains("EXE=") {
+        bail!("remote_build_info: nessun dialetto produce output valido");
+    }
+    eprintln!(
+        "[bootstrap-ssh] dialetto rilevato {:?} (l'env suggeriva {:?}): \
+         config OS probabilmente errata/mancante — vedi 'crosspilot env doctor'",
+        d1, d0
+    );
+    set_dialect_detected(d1);
+    let info = version::parse_remote_info(&raw);
+    Ok((info, d1))
 }
 
 /// Preflight SSH (analogo di bootstrap::channel_probe) per il fallback
@@ -202,7 +220,6 @@ async fn remote_build_info(
 /// sarebbe un brick volontario.
 pub async fn probe(exe_path: &str) -> Option<RemoteBuildInfo> {
     let ctx = ssh_context();
-    let d = dialect();
     let sess = match SshSession::connect(&ctx).await {
         Ok(s) => s,
         Err(e) => {
@@ -210,13 +227,17 @@ pub async fn probe(exe_path: &str) -> Option<RemoteBuildInfo> {
             return None;
         }
     };
-    match remote_build_info(&sess, d, exe_path).await {
-        Ok(info) => {
+    // Auto-detect: se l'env dichiara l'OS sbagliato il primo dialetto
+    // fallisce e si ritenta con l'altro — il remote corregge l'env.
+    match remote_build_info_auto(&sess, exe_path).await {
+        Ok((info, d)) => {
             eprintln!(
-                "[update-fallback] preflight SSH OK: ts remoto={:?} locale={} exe_present={}",
+                "[update-fallback] preflight SSH OK ({:?}): ts remoto={:?} locale={} exe_present={} running_exe={:?}",
+                d,
                 info.build_ts,
                 version::BUILD_TS,
-                info.exe_present
+                info.exe_present,
+                info.running_exe
             );
             Some(info)
         }
@@ -276,16 +297,18 @@ async fn deploy_exe(
         let staged = staged_name(d, exe_path);
         eprintln!(
             "[deploy-ssh] exe remoto {}: upload staged di {} byte -> {} ...",
-            if info.exe_present { "obsoleto" } else { "mancante" },
+            if info.exe_present {
+                "obsoleto"
+            } else {
+                "mancante"
+            },
             payload.len(),
             staged
         );
         ssh_write(sess, d, &staged, &payload).await?;
 
         // Hash dello staged PRIMA di toccare l'exe corrente.
-        let staged_hash = ssh_file_hash(sess, d, &staged)
-            .await
-            .unwrap_or_default();
+        let staged_hash = ssh_file_hash(sess, d, &staged).await.unwrap_or_default();
         if !staged_hash.eq_ignore_ascii_case(&local_hash) {
             let _ = ssh_run(sess, &rm_cmd(d, &staged), "cleanup staged").await;
             bail!(
@@ -444,8 +467,7 @@ async fn deploy_exe(
                 // falliva -> Copy-Item del file su se stesso (bug H166).
                 eprintln!("[deploy-ssh] exe e' gia' l'artefatto crosspilot.exe. Skip copia.");
             } else {
-                let out =
-                    ssh_run(sess, &copy_cmd(d, exe_path, &win_path), "artefatto exe").await;
+                let out = ssh_run(sess, &copy_cmd(d, exe_path, &win_path), "artefatto exe").await;
                 match out {
                     Ok(o) if o.code == Some(0) => {
                         eprintln!("[deploy-ssh] artefatto {} allineato all'exe.", win_path)
@@ -486,7 +508,11 @@ async fn deploy_exe(
     );
     let ver_path = update::remote_join(&dir, version::VER_FILE_NAME);
     match ssh_write(sess, d, &ver_path, ver_content.as_bytes()).await {
-        Ok(()) => eprintln!("[deploy-ssh] .ver scritto: {} (ts={})", ver_path, version::BUILD_TS),
+        Ok(()) => eprintln!(
+            "[deploy-ssh] .ver scritto: {} (ts={})",
+            ver_path,
+            version::BUILD_TS
+        ),
         Err(e) => eprintln!("[deploy-ssh] WARNING scrittura .ver: {}", e),
     }
 
@@ -563,8 +589,7 @@ async fn self_update_ssh(
 
     let self_path = std::env::current_exe().context("current_exe")?;
     let staged = self_update::staged_path(&self_path);
-    std::fs::write(&staged, &data)
-        .with_context(|| format!("scrittura {}", staged.display()))?;
+    std::fs::write(&staged, &data).with_context(|| format!("scrittura {}", staged.display()))?;
     // install_staged_file: verifica hash + functional check locale +
     // rename atomico + re-exec (non ritorna su successo).
     let result = self_update::install_staged_file(&staged, remote_ts, expected_sha256).await;
@@ -762,30 +787,33 @@ async fn remote_startup_diag(sess: &SshSession, d: Dialect) {
 /// retry loop del chiamante (bug B1). HostKeyMismatch -> fatale.
 pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
     let ctx = ssh_context();
-    let d = dialect();
     eprintln!(
-        "[bootstrap-ssh] bootstrap via SSH ({:?}) verso {}@{}:{} (exe={})",
-        d, ctx.user, ctx.host, ctx.port, exe_path
+        "[bootstrap-ssh] bootstrap via SSH verso {}@{}:{} (exe={})",
+        ctx.user, ctx.host, ctx.port, exe_path
     );
 
     // Connect: errori di trasporto -> ChannelUnreachable("SSH");
     // host key mismatch -> HostKeyMismatch (fatale, propagato).
     let sess = SshSession::connect(&ctx).await?;
 
-    match remote_build_info(&sess, d, exe_path).await {
-        Ok(info) => {
+    // Dialetto auto-rilevato dal probe interno (env mentito -> il
+    // remote corregge). d effettivo restituito assieme a info.
+    let detected = remote_build_info_auto(&sess, exe_path).await;
+    let d = dialect();
+
+    match detected {
+        Ok((info, _)) => {
             if !info.exe_present {
                 eprintln!("[bootstrap-ssh] exe remoto mancante. Avvio deploy via SSH...");
                 match deploy_exe(&sess, d, exe_path, &info).await {
                     Ok(()) => {}
                     Err(e) => {
-                        // Trasporto morto -> fail-fast; altri errori ->
-                        // warning: il server potrebbe essere gia' attivo
-                        // (il polling decide).
-                        if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some() {
-                            return Err(e);
-                        }
-                        eprintln!("[ERROR] bootstrap-ssh: deploy fallito: {}", e);
+                        // §7.3 onesta': exe MANCANTE + deploy fallito =
+                        // niente puo' partire -> propagare l'errore,
+                        // mai proseguire fingendo.
+                        return Err(
+                            e.context("bootstrap-ssh: deploy fallito con exe remoto mancante")
+                        );
                     }
                 }
             } else if info.is_newer_than_local() {
@@ -815,7 +843,9 @@ pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
                     match update_result {
                         Ok(()) => {
                             // Irraggiungibile su unix (exec sostituisce il processo).
-                            eprintln!("[self-update] re-exec completato senza sostituzione processo?");
+                            eprintln!(
+                                "[self-update] re-exec completato senza sostituzione processo?"
+                            );
                         }
                         Err(e) => {
                             // Trasporto morto -> fail-fast (il remote non
@@ -842,7 +872,13 @@ pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
                 match deploy_exe(&sess, d, exe_path, &info).await {
                     Ok(()) => {}
                     Err(e) => {
-                        if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some() {
+                        // §7.3 onesta': exe MANCANTE + deploy fallito =
+                        // niente puo' partire -> propagare Err (come il
+                        // path WinRM). Exe PRESENTE: il vecchio binario
+                        // puo' ancora avviarsi -> warning, poll decide.
+                        if e.downcast_ref::<bootstrap::ChannelUnreachable>().is_some()
+                            || !info.exe_present
+                        {
                             return Err(e);
                         }
                         eprintln!("[ERROR] bootstrap-ssh: deploy fallito: {}", e);
@@ -876,6 +912,132 @@ pub async fn bootstrap_server(exe_path: &str) -> Result<()> {
     let up = bootstrap::poll_server_startup().await;
     if !up {
         remote_startup_diag(&sess, d).await;
+        // §7.3 onesta': il bootstrap NON e' riuscito — mai Ok su un
+        // server che non risponde (altrimenti il chiamante logga
+        // "completato" e il retry loop incontra una porta morta).
+        return Err(anyhow::anyhow!(
+            "server NON tornato in ascolto entro 30s dopo il bootstrap SSH \
+             (ssh {}@{} per la diagnosi, vedi log remoto)",
+            ctx.user,
+            ctx.host
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fallback di update via canale (spec selfdescribe-guardrail §7): il
+// canale SSH fa SOLO trasporto file + exec — mai `quit` prima che il
+// deploy sia verificato (swap o UPDATE_REQ). `d` viene dall'identita'
+// risolta dal chiamante (INFO_RES/discovery), mai dall'euristica env.
+// ---------------------------------------------------------------------------
+
+/// §7.1: upload staged via SFTP + verifica hash + functional check,
+/// SENZA swap ne' quit (il trigger resta UPDATE_REQ sul canale TCP
+/// verso il server ancora vivo — l'updater remoto fa swap+rollback).
+pub async fn channel_deploy_staged(d: Dialect, staged_path: &str, payload: &[u8]) -> Result<()> {
+    let ctx = ssh_context();
+    let sess = SshSession::connect(&ctx).await?;
+    let local_hash = deploy::sha256_bytes(payload);
+    ssh_write(&sess, d, staged_path, payload).await?;
+
+    // Hash dello staged caricato: niente verifica -> niente trigger.
+    let remote_hash = ssh_file_hash(&sess, d, staged_path)
+        .await
+        .unwrap_or_default();
+    if !remote_hash.eq_ignore_ascii_case(&local_hash) {
+        let _ = ssh_run(&sess, &rm_cmd(d, staged_path), "cleanup staged").await;
+        bail!(
+            "SHA-256 MISMATCH staged '{}' via SSH: atteso {} remoto {}",
+            staged_path,
+            &local_hash[..16.min(local_hash.len())],
+            &remote_hash[..16.min(remote_hash.len())]
+        );
+    }
+
+    // Functional check: '<staged>' --version (chmod incluso su posix)
+    // deve uscire 0 e riportare il build_ts atteso.
+    let out = ssh_run(
+        &sess,
+        &functional_check_cmd(d, staged_path),
+        "functional check staged",
+    )
+    .await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut staged_ts: Option<u64> = None;
+    for line in stdout.lines() {
+        if let Some(ts) = version::parse_version_ts(line) {
+            staged_ts = Some(ts);
+        }
+    }
+    if out.code != Some(0) || staged_ts != Some(version::BUILD_TS) {
+        let _ = ssh_run(&sess, &rm_cmd(d, staged_path), "cleanup staged").await;
+        bail!(
+            "functional check staged '{}' fallito via SSH: exit={:?} ts={:?} (atteso {})",
+            staged_path,
+            out.code,
+            staged_ts,
+            version::BUILD_TS
+        );
+    }
+    eprintln!(
+        "[update-fallback] staged {} verificato via SSH (hash + --version).",
+        staged_path
+    );
+    Ok(())
+}
+
+/// §7.2: swap via canale (exe -> exe.old, staged -> exe) + hash finale.
+/// Ordine obbligato: SOLO dopo la verifica dello staged, PRIMA di quit.
+pub async fn channel_swap_exe(
+    d: Dialect,
+    exe_path: &str,
+    staged: &str,
+    expected_hash: &str,
+) -> Result<()> {
+    let ctx = ssh_context();
+    let sess = SshSession::connect(&ctx).await?;
+    let out = ssh_run(&sess, &swap_cmd(d, exe_path, staged), "swap exe").await?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if out.code != Some(0) {
+        bail!(
+            "swap staged -> {} fallito via SSH (exit {:?}): {}",
+            exe_path,
+            out.code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let final_hash = stdout.trim().to_string();
+    if !final_hash.eq_ignore_ascii_case(expected_hash) {
+        bail!(
+            "SHA-256 MISMATCH post-swap '{}': atteso {} remoto {}",
+            exe_path,
+            &expected_hash[..16.min(expected_hash.len())],
+            &final_hash[..16.min(final_hash.len())]
+        );
+    }
+    Ok(())
+}
+
+/// §7.2: avvio detached del server via canale (setsid | schtasks).
+pub async fn channel_start_server(d: Dialect, exe_path: &str) -> Result<()> {
+    let ctx = ssh_context();
+    let sess = SshSession::connect(&ctx).await?;
+    start_server(&sess, d, exe_path, &ctx.user).await
+}
+
+/// §7.2 rescue: ripristino `exe.old` -> exe (il riavvio e' a carico del
+/// chiamante con channel_start_server).
+pub async fn channel_restore_old(d: Dialect, exe_path: &str) -> Result<()> {
+    let ctx = ssh_context();
+    let sess = SshSession::connect(&ctx).await?;
+    let out = ssh_run(&sess, &restore_old_cmd(d, exe_path), "restore .old").await?;
+    if out.code != Some(0) {
+        bail!(
+            "ripristino {}.old fallito via SSH: {}",
+            exe_path,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }

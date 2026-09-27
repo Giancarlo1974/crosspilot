@@ -1,20 +1,20 @@
-use clap::{Parser, Subcommand};
 use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use std::io::ErrorKind;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use std::process::Stdio;
-use std::sync::Arc;
 use tokio::sync::Notify;
-use std::io::ErrorKind;
-use std::time::Duration;
 // Solo nel path Windows (retry loop AddrInUse in server_mode).
 #[cfg(target_os = "windows")]
 use std::time::Instant;
 
 // Moduli del transfer file (vedi docs/transfer-spec.md).
-mod proto;
 mod path;
+mod proto;
 mod verify;
 // transfer.rs resta invariato rispetto alla spec (§12): i warning clippy
 // di stile si silenziano qui invece di toccare il file.
@@ -47,6 +47,9 @@ mod envs;
 mod version;
 // Self-update del client Linux quando il remote e' piu' nuovo.
 mod self_update;
+// Self-describe del server (INFO_REQ/RES) + identita' remota risolta
+// (spec selfdescribe-guardrail §2-§4).
+mod server_info;
 // Auto-update bidirezionale via TCP (READY <ts> + UPDATE_REQ + updater).
 mod update;
 // TLS 1.3 post-quantum sul canale TCP (spec docs/tls-pq-spec.md):
@@ -60,11 +63,16 @@ mod runcmd;
 
 #[cfg(target_os = "windows")]
 mod win_job {
-    use winapi::um::jobapi2::{CreateJobObjectW, AssignProcessToJobObject, SetInformationJobObject};
-    use winapi::um::winnt::{JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, HANDLE};
-    use std::ptr;
-    use std::mem;
     use anyhow::Result;
+    use std::mem;
+    use std::ptr;
+    use winapi::um::jobapi2::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    };
+    use winapi::um::winnt::{
+        JobObjectExtendedLimitInformation, HANDLE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
 
     // Returns the Job Handle. The Job Object is closed when the handle is dropped (if not leaked),
     // but we want it to persist until we drop it or the process ends.
@@ -72,14 +80,16 @@ mod win_job {
     // Yes, "If the job has the JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag, closing the last handle to the job object terminates all processes associated with the job."
     // So we need to keep this handle alive as long as the child is alive.
     pub struct JobHandle(HANDLE);
-    
+
     // Send/Sync for Arc? HANDLE is raw pointer basically.
     unsafe impl Send for JobHandle {}
     unsafe impl Sync for JobHandle {}
 
     impl Drop for JobHandle {
         fn drop(&mut self) {
-            unsafe { winapi::um::handleapi::CloseHandle(self.0); }
+            unsafe {
+                winapi::um::handleapi::CloseHandle(self.0);
+            }
         }
     }
 
@@ -87,9 +97,9 @@ mod win_job {
         unsafe {
             let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
             if job.is_null() {
-                 return Err(anyhow::anyhow!("Failed to create job object"));
+                return Err(anyhow::anyhow!("Failed to create job object"));
             }
-            
+
             let handle_wrapper = JobHandle(job);
 
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
@@ -101,16 +111,16 @@ mod win_job {
                 &mut info as *mut _ as *mut _,
                 mem::size_of_val(&info) as u32,
             );
-            
+
             if ret == 0 {
-                 return Err(anyhow::anyhow!("Failed to set job info"));
+                return Err(anyhow::anyhow!("Failed to set job info"));
             }
 
             let ret = AssignProcessToJobObject(job, process_handle as HANDLE);
-             if ret == 0 {
-                 return Err(anyhow::anyhow!("Failed to assign process to job"));
+            if ret == 0 {
+                return Err(anyhow::anyhow!("Failed to assign process to job"));
             }
-            
+
             Ok(handle_wrapper)
         }
     }
@@ -124,7 +134,8 @@ mod win_job {
 // (stampa "<semver>+<build_ts> (<target>)", usato come functional check
 // da deploy staged e self-update).
 #[command(about = "Bridge to execute commands on CrossPilot container via TCP")]
-#[command(long_about = "CrossPilot - Remote Command Executor for Windows Containers\n\n\
+#[command(
+    long_about = "CrossPilot - Remote Command Executor for Windows Containers\n\n\
     This tool allows you to execute commands on a Windows container from Linux.\n\
     It operates in two modes: Server (runs on Windows) and Client (runs on Linux).\n\n\
     Configuration via Environment Variables:\n\
@@ -154,13 +165,17 @@ mod win_job {
       crosspilot --ephemeral -- <CMD>  Run, then server self-shuts down (agentless)\n\n\
     The -- form passes everything after it literally to cmd.exe on the remote\n\
     Windows host, with no shell escaping. Use single quotes around paths with\n\
-    trailing backslashes: crosspilot -- dir 'c:\\'")]
+    trailing backslashes: crosspilot -- dir 'c:\\'"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
     /// Run as server (listens for incoming commands)
-    #[arg(long, help = "Run in server mode - listens for incoming command requests")]
+    #[arg(
+        long,
+        help = "Run in server mode - listens for incoming command requests"
+    )]
     server: bool,
 
     /// Esecuzione effimera ("agentless"): al termine dell'operazione il
@@ -209,6 +224,16 @@ struct Cli {
     )]
     verbose: bool,
 
+    /// Write-back nel .env delle chiavi divergenti dall'identita' remota
+    /// (spec selfdescribe-guardrail §4): senza questo flag il drift
+    /// OS/EXE_PATH e' solo segnalato. Equivalente a CROSSPILOT_FIX_ENV=1.
+    #[arg(
+        long,
+        global = true,
+        help = "Write remote-discovered OS/EXE_PATH back to .env when they drift (opt-in)"
+    )]
+    fix_env: bool,
+
     /// Comando da eseguire sul server remoto.
     ///
     /// Tutto ciò che segue `--` viene preso letteralmente. Su remote UNIX
@@ -236,7 +261,12 @@ enum Commands {
     /// Start the server (explicit subcommand)
     Server {
         /// Port to listen on (can also be set via CROSSPILOT_SERVER_PORT env var)
-        #[arg(short, long, default_value = "5330", help = "TCP port for server to listen on")]
+        #[arg(
+            short,
+            long,
+            default_value = "5330",
+            help = "TCP port for server to listen on"
+        )]
         port: u16,
     },
     /// Upload (put) di un file locale verso il server remoto (transfer delta stile rsync).
@@ -384,6 +414,10 @@ async fn main() -> Result<()> {
     // -q resta accettato per compat e forza quiet anche in presenza di -v.
     let cli = Cli::parse();
     log::set_quiet(cli.quiet || !cli.verbose);
+    // Write-back .env opt-in per il drift identita' remota (spec §4).
+    if cli.fix_env {
+        envs::set_fix_env(true);
+    }
 
     // Igiene d'avvio: se questo exe ha il nome canonico (crosspilot[.exe])
     // spazza gli artefatti staged/residui dell'auto-update nella sua dir.
@@ -405,7 +439,10 @@ async fn main() -> Result<()> {
     let env_client = envs::var("CLIENT_PORT").unwrap_or_else(|| "5330".to_string());
     crate::qprintln!(
         "[DEBUG] ambiente attivo: {} -> host={} winrm={} client={}",
-        env_label, env_host, env_winrm, env_client
+        env_label,
+        env_host,
+        env_winrm,
+        env_client
     );
 
     if cli.server || matches!(cli.command, Some(Commands::Server { .. })) {
@@ -424,23 +461,52 @@ async fn main() -> Result<()> {
     } else {
         match cli.command {
             // Transfer file: upload (put) lato client.
-            Some(Commands::Put { local_src, remote_dst, exec }) => {
+            Some(Commands::Put {
+                local_src,
+                remote_dst,
+                exec,
+            }) => {
                 client_transfer_put(&local_src, &remote_dst, exec, cli.ephemeral).await?;
             }
             // Transfer file: download (get) lato client.
-            Some(Commands::Get { remote_src, local_dst }) => {
+            Some(Commands::Get {
+                remote_src,
+                local_dst,
+            }) => {
                 client_transfer_get(&remote_src, &local_dst, cli.ephemeral).await?;
             }
             // Directory sync: status (diff read-only) lato client.
-            Some(Commands::Status { local_dir, remote_dir, checksum, quiet, exclude }) => {
+            Some(Commands::Status {
+                local_dir,
+                remote_dir,
+                checksum,
+                quiet,
+                exclude,
+            }) => {
                 // Il report minimale segue solo i flag ESPLICITI (subcommand
                 // --quiet o -q globale): il default quiet di log.rs NON deve
                 // collassare il report — righe per-entry restano il default.
-                client_sync_status(&local_dir, &remote_dir, checksum, quiet || cli.quiet, &exclude, cli.ephemeral).await?;
+                client_sync_status(
+                    &local_dir,
+                    &remote_dir,
+                    checksum,
+                    quiet || cli.quiet,
+                    &exclude,
+                    cli.ephemeral,
+                )
+                .await?;
             }
             // Directory sync: sync (mirror one-way upload) lato client.
             // I flag sono gia' raggruppati in SyncParams (clippy too_many_arguments).
-            Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet, exclude }) => {
+            Some(Commands::Sync {
+                local_dir,
+                remote_dir,
+                delete,
+                dry_run,
+                checksum,
+                quiet,
+                exclude,
+            }) => {
                 let params = sync::SyncParams {
                     local_dir,
                     remote_dir,
@@ -459,8 +525,16 @@ async fn main() -> Result<()> {
                 client_quit().await?;
             }
             // Updater staged (auto-update via TCP): uso interno.
-            Some(Commands::Update { target, wait_pid, port, wait_secs, relaunch_args, console }) => {
-                update::run_updater(target, wait_pid, port, wait_secs, relaunch_args, console).await?;
+            Some(Commands::Update {
+                target,
+                wait_pid,
+                port,
+                wait_secs,
+                relaunch_args,
+                console,
+            }) => {
+                update::run_updater(target, wait_pid, port, wait_secs, relaunch_args, console)
+                    .await?;
             }
             // CRUD ambienti host nel .env (nessuna connessione richiesta).
             Some(Commands::Env { action }) => {
@@ -477,9 +551,13 @@ async fn main() -> Result<()> {
                 println!("CrossPilot - Remote Command Executor for Windows Containers");
                 println!("---------------------------------------------------------------");
                 // Ambiente attivo ben visibile: e' il target di TUTTI i comandi.
-                println!("Ambiente attivo: {} -> host {} (winrm:{}, client:{})",
+                println!(
+                    "Ambiente attivo: {} -> host {} (winrm:{}, client:{})",
                     envs::active_name().unwrap_or_else(|| "default".to_string()),
-                    env_host, env_winrm, env_client);
+                    env_host,
+                    env_winrm,
+                    env_client
+                );
                 println!("Usage:");
                 println!("  crosspilot -- <COMMAND>   # Execute command remotely (Linux side)");
                 println!("  crosspilot --server       # Run in Server Mode (Windows side)");
@@ -559,13 +637,16 @@ async fn server_mode(port: u16) -> Result<()> {
     // Force UTF-8 code page on Windows
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd").args(["/C", "chcp 65001"]).output().await;
+        let _ = Command::new("cmd")
+            .args(["/C", "chcp 65001"])
+            .output()
+            .await;
     }
 
     let actual_port = envs::var("SERVER_PORT")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(port);
-    
+
     let addr = format!("0.0.0.0:{}", actual_port);
 
     // Bind with Windows-friendly recovery on AddrInUse (os error 10048)
@@ -689,23 +770,18 @@ async fn server_mode(port: u16) -> Result<()> {
                             // server self-describing per l'auto-update via TCP
                             // (i client legacy leggono 6 byte "READY " e
                             // falliscono -> bootstrap WinRM -> self-update).
-                            // TODO: in futuro inviare anche il tag OS del
-                            // server come terzo token — "READY <ts> L" su
-                            // unix, "READY <ts> W" su Windows. Il client
-                            // parsa gia' il token opzionale
-                            // (version::ServerHello.os) e lo usa per la
-                            // scelta del payload di update al posto
-                            // dell'euristica EXE_PATH. NON inviarlo finche'
-                            // circolano client attuali: "READY <ts> L"
-                            // verrebbe letto come ts non parsabile -> 0 ->
-                            // update forzato del server.
+                            // NOTA DEFINITIVA (spec selfdescribe §1.1): il tag
+                            // OS come terzo token NON verra' MAI inviato —
+                            // i client attuali lo leggerebbero come ts=0 ->
+                            // update forzato. L'identita' del server (OS,
+                            // exe_path, hash) viaggia su INFO_RES.
                             let hello = format!("READY {}\n", version::BUILD_TS);
                             if let Err(e) = socket.write_all(hello.as_bytes()).await {
                                 eprintln!("Failed to send handshake: {}", e);
                                 return;
                             }
                             let _ = socket.flush().await;
-            
+
                             if let Err(e) = handle_connection(socket, tls_acceptor, shutdown_signal).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -744,7 +820,11 @@ async fn listener_is_live_crosspilot(port: u16) -> bool {
     eprintln!(
         "[kill_listener] probe READY su {}: {}",
         addr,
-        if alive { "server crosspilot VIVO (niente kill)" } else { "nessuna risposta valida (reclaim)" }
+        if alive {
+            "server crosspilot VIVO (niente kill)"
+        } else {
+            "nessuna risposta valida (reclaim)"
+        }
     );
     alive
 }
@@ -754,10 +834,7 @@ async fn kill_listener_on_port_windows(port: u16) -> Result<()> {
     // Find PID(s) listening on a port and terminate them.
     // netstat output example:
     // TCP    0.0.0.0:5330   0.0.0.0:0   LISTENING   12345
-    let find_cmd = format!(
-        "netstat -a -n -o | findstr LISTENING | findstr :{}",
-        port
-    );
+    let find_cmd = format!("netstat -a -n -o | findstr LISTENING | findstr :{}", port);
 
     let out = Command::new("cmd")
         .args(["/C", &find_cmd])
@@ -767,7 +844,10 @@ async fn kill_listener_on_port_windows(port: u16) -> Result<()> {
 
     // If nothing found, maybe the port was released in the meantime.
     if out.stdout.is_empty() {
-        println!("[kill_listener] netstat returned no LISTENING lines for port {}", port);
+        println!(
+            "[kill_listener] netstat returned no LISTENING lines for port {}",
+            port
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         return Ok(());
     }
@@ -783,7 +863,10 @@ async fn kill_listener_on_port_windows(port: u16) -> Result<()> {
     pids.dedup();
 
     if pids.is_empty() {
-        println!("[kill_listener] No PIDs parsed from netstat output for port {}", port);
+        println!(
+            "[kill_listener] No PIDs parsed from netstat output for port {}",
+            port
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         return Ok(());
     }
@@ -799,10 +882,18 @@ async fn kill_listener_on_port_windows(port: u16) -> Result<()> {
         if !kill.status.success() {
             let stderr = String::from_utf8_lossy(&kill.stderr);
             // If it already exited between netstat and taskkill, treat as non-fatal.
-            eprintln!("[kill_listener] Warning: taskkill failed for PID {}: {}", pid, stderr.trim());
+            eprintln!(
+                "[kill_listener] Warning: taskkill failed for PID {}: {}",
+                pid,
+                stderr.trim()
+            );
         } else {
             let stdout_kill = String::from_utf8_lossy(&kill.stdout);
-            println!("[kill_listener] taskkill success for PID {}: {}", pid, stdout_kill.trim());
+            println!(
+                "[kill_listener] taskkill success for PID {}: {}",
+                pid,
+                stdout_kill.trim()
+            );
         }
     }
 
@@ -834,11 +925,9 @@ async fn handle_connection(
     let mut filled = 0;
     let mut timed_out = false;
     loop {
-        let peek_result = tokio::time::timeout(
-            Duration::from_secs(2),
-            socket.peek(&mut peek_buf[filled..]),
-        )
-        .await;
+        let peek_result =
+            tokio::time::timeout(Duration::from_secs(2), socket.peek(&mut peek_buf[filled..]))
+                .await;
         match peek_result {
             Ok(Ok(0)) => {
                 // Client disconnesso prima di inviare dati.
@@ -963,13 +1052,10 @@ async fn handle_tls_connection(
     let mut det = Vec::with_capacity(4);
     loop {
         let mut chunk = [0u8; 4];
-        let read_result = tokio::time::timeout(
-            tls::MODE_DETECT_TIMEOUT,
-            link.read(&mut chunk),
-        )
-        .await;
+        let read_result =
+            tokio::time::timeout(tls::MODE_DETECT_TIMEOUT, link.read(&mut chunk)).await;
         match read_result {
-            Ok(Ok(0)) => break,          // peer chiuso
+            Ok(Ok(0)) => break, // peer chiuso
             Ok(Ok(n)) => {
                 det.extend_from_slice(&chunk[..n]);
                 if det.len() >= 4 {
@@ -977,7 +1063,7 @@ async fn handle_tls_connection(
                 }
             }
             Ok(Err(e)) => return Err(e.into()),
-            Err(_) => break,             // timeout -> shell mode
+            Err(_) => break, // timeout -> shell mode
         }
     }
     if det.is_empty() {
@@ -1043,7 +1129,10 @@ async fn shell_flow(link: tls::Link, shutdown_signal: Arc<Notify>) -> Result<()>
             return Ok(());
         }
         quit_after = true;
-        crate::qprintln!("[DEBUG] ephemeral request: shutdown del server a fine comando ({})", command_line);
+        crate::qprintln!(
+            "[DEBUG] ephemeral request: shutdown del server a fine comando ({})",
+            command_line
+        );
     }
 
     // Prefisso-sentinel exit-code (EXIT_CODE_PREFIX): il client chiede
@@ -1089,7 +1178,10 @@ async fn shell_flow(link: tls::Link, shutdown_signal: Arc<Notify>) -> Result<()>
     // processo server esca.
     if quit_after {
         let outcome = if run_result.is_ok() { "ok" } else { "errore" };
-        println!("Ephemeral request terminata ({}). notifying shutdown.", outcome);
+        println!(
+            "Ephemeral request terminata ({}). notifying shutdown.",
+            outcome
+        );
         shutdown_signal.notify_one();
     }
     run_result
@@ -1110,7 +1202,11 @@ const QUIT_AFTER_PREFIX: &str = "crosspilot:quit-after ";
 /// (best-practice: unita' piccole): il caller decide il post-esecuzione —
 /// la modalita' effimera notifica lo shutdown del server a qualunque esito.
 /// `socket` e' un Link: funziona identico su plaintext e dentro TLS.
-async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code: bool) -> Result<()> {
+async fn run_shell_command(
+    socket: tls::Link,
+    command_line: &str,
+    want_exit_code: bool,
+) -> Result<()> {
     // 2. Spawn process
     // ... rest of implementation matches previous logic
     // Detect OS for shell execution
@@ -1148,10 +1244,10 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
     #[cfg(target_os = "windows")]
     let _job_handle = {
         if let Some(handle) = child.raw_handle() {
-             win_job::assign_to_new_job(handle)?
+            win_job::assign_to_new_job(handle)?
         } else {
-             // Should not happen on Windows unless process already exited
-             return Err(anyhow::anyhow!("Failed to get child process handle"));
+            // Should not happen on Windows unless process already exited
+            return Err(anyhow::anyhow!("Failed to get child process handle"));
         }
     };
 
@@ -1162,7 +1258,7 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
     // tokio::io::split funziona su qualunque AsyncRead+AsyncWrite: TcpStream
     // in chiaro e Link/TLS sono trattati allo stesso modo.
     let (mut socket_reader, mut socket_writer) = tokio::io::split(socket);
-    
+
     // Notification to kill child if socket drops
     let kill_notify = Arc::new(Notify::new());
     let kill_notify_clone_read = kill_notify.clone();
@@ -1178,7 +1274,7 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
                     kill_notify_clone_read.notify_one();
                     break;
                 }
-                Ok(_) => { } // Ignore extra data
+                Ok(_) => {} // Ignore extra data
                 Err(_) => {
                     kill_notify_clone_read.notify_one();
                     break;
@@ -1190,7 +1286,7 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
     // Stream stdout to socket
     let mut stdout_reader = tokio::io::BufReader::new(stdout);
     let mut stderr_reader = tokio::io::BufReader::new(stderr);
-    
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let tx_stderr = tx.clone();
     // Sender tenuto da parte per il marker di exit code (EXIT_CODE_PREFIX):
@@ -1204,7 +1300,9 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
             match stdout_reader.read(&mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).await.is_err() { break; }
+                    if tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -1217,7 +1315,9 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
             match stderr_reader.read(&mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    if tx_stderr.send(buf[..n].to_vec()).await.is_err() { break; }
+                    if tx_stderr.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -1288,9 +1388,11 @@ async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code
 /// Legge il primo messaggio framed (PUT_REQ o GET_REQ) e delega al modulo transfer.
 ///
 /// `grace_only` = connessione plaintext + CROSSPILOT_REQUIRE_TLS (spec
-/// tls-pq §5.1): passa SOLO una GET_REQ whitelisted (artefatti pubblici
-/// per l'auto-update dei client vecchi); qualunque altro msg framed —
-/// PUT, LIST/MKDIR/DELETE, UPDATE_REQ — riceve ERR_PROTO e chiude.
+/// tls-pq §5.1): passa SOLO GET_REQ whitelisted (artefatti pubblici per
+/// l'auto-update dei client vecchi) e INFO_REQ (self-describe — dati
+/// pubblici di identita', serve anche pre-TLS per il fallback §7);
+/// qualunque altro msg framed — PUT, LIST/MKDIR/DELETE, UPDATE_REQ —
+/// riceve ERR_PROTO e chiude.
 async fn handle_file_mode(mut socket: tls::Link, grace_only: bool) -> Result<()> {
     // LOOP di messaggi sulla STESSA connessione (sessione persistente):
     // prima il server chiudeva dopo UNA operazione — il sync apriva una
@@ -1341,10 +1443,13 @@ async fn handle_file_mode(mut socket: tls::Link, grace_only: bool) -> Result<()>
             }
         };
 
-        // Grace plaintext §5.1: tutto tranne GET_REQ e' vietato in chiaro
-        // quando REQUIRE_TLS e' attivo (la whitelist del basename sta in
-        // transfer::get_server).
-        if grace_only && msg_type != proto::MSG_GET_REQ {
+        // Grace plaintext §5.1: vietato tutto tranne GET_REQ e INFO_REQ
+        // in chiaro quando REQUIRE_TLS e' attivo (la whitelist del
+        // basename sta in transfer::get_server). INFO_REQ e' whitelisted
+        // perche' e' la fonte primaria dell'identita' remota (§2/§3):
+        // senza di essa il client su canale grace non saprebbe che il
+        // remote e' Windows vs Linux.
+        if grace_only && msg_type != proto::MSG_GET_REQ && msg_type != proto::MSG_INFO_REQ {
             let err = proto::ErrMsg {
                 code: proto::ERR_PROTO,
                 message: format!(
@@ -1353,42 +1458,89 @@ async fn handle_file_mode(mut socket: tls::Link, grace_only: bool) -> Result<()>
                 ),
             };
             let _ = proto::send_err(&mut socket, &err).await;
-            bail!("operazione framed {} rifiutata in chiaro (REQUIRE_TLS)", msg_type);
+            bail!(
+                "operazione framed {} rifiutata in chiaro (REQUIRE_TLS)",
+                msg_type
+            );
         }
 
         match msg_type {
             proto::MSG_PUT_REQ => {
                 let req = proto::decode_put_req(&payload)?;
-                crate::qprintln!("[DEBUG] handle_file_mode: PUT_REQ dst={} ({} byte)", req.path, req.total_new_size);
+                crate::qprintln!(
+                    "[DEBUG] handle_file_mode: PUT_REQ dst={} ({} byte)",
+                    req.path,
+                    req.total_new_size
+                );
                 transfer::put_server(&mut socket, req).await?;
             }
             proto::MSG_GET_REQ => {
                 let req = proto::decode_get_req(&payload)?;
-                crate::qprintln!("[DEBUG] handle_file_mode: GET_REQ src={} grace={}", req.path, grace_only);
+                crate::qprintln!(
+                    "[DEBUG] handle_file_mode: GET_REQ src={} grace={}",
+                    req.path,
+                    grace_only
+                );
                 transfer::get_server(&mut socket, req, grace_only).await?;
             }
             // Directory sync (sync-spec §5): messaggi LIST/MKDIR_BATCH/DELETE_BATCH.
             proto::MSG_LIST_REQ => {
                 let req = proto::decode_list_req(&payload)?;
-                crate::qprintln!("[DEBUG] handle_file_mode: LIST_REQ path={} recursive={} with_hash={}", req.path, req.recursive, req.with_hash);
+                crate::qprintln!(
+                    "[DEBUG] handle_file_mode: LIST_REQ path={} recursive={} with_hash={}",
+                    req.path,
+                    req.recursive,
+                    req.with_hash
+                );
                 sync_server::list_server(&mut socket, &req).await?;
             }
             proto::MSG_MKDIR_BATCH_REQ => {
                 let req = proto::decode_mkdir_batch_req(&payload)?;
-                crate::qprintln!("[DEBUG] handle_file_mode: MKDIR_BATCH_REQ count={}", req.paths.len());
+                crate::qprintln!(
+                    "[DEBUG] handle_file_mode: MKDIR_BATCH_REQ count={}",
+                    req.paths.len()
+                );
                 sync_server::mkdir_batch_server(&mut socket, &req).await?;
             }
             proto::MSG_DELETE_BATCH_REQ => {
                 let req = proto::decode_delete_batch_req(&payload)?;
-                crate::qprintln!("[DEBUG] handle_file_mode: DELETE_BATCH_REQ count={}", req.items.len());
+                crate::qprintln!(
+                    "[DEBUG] handle_file_mode: DELETE_BATCH_REQ count={}",
+                    req.items.len()
+                );
                 sync_server::delete_batch_server(&mut socket, &req).await?;
             }
             // Self-update via TCP (update-spec): spawn updater staged + uscita.
             proto::MSG_UPDATE_REQ => {
                 let req = proto::decode_update_req(&payload)?;
-                crate::qprintln!("[DEBUG] handle_file_mode: UPDATE_REQ staged={}", req.staged_path);
+                crate::qprintln!(
+                    "[DEBUG] handle_file_mode: UPDATE_REQ staged={}",
+                    req.staged_path
+                );
                 update::server_apply_update(&mut socket, &req).await?;
             }
+            // Self-describe (spec selfdescribe §2): il server dichiara
+            // la PROPRIA identita' (OS + exe canonico + ts + hash) — il
+            // client non deve mai dedurla dall'env.
+            proto::MSG_INFO_REQ => match server_info::info_res_payload() {
+                Ok(res) => {
+                    crate::qprintln!(
+                        "[DEBUG] handle_file_mode: INFO_REQ -> {} {} ts={}",
+                        res.os_tag,
+                        res.exe_path,
+                        res.build_ts
+                    );
+                    proto::send_info_res(&mut socket, &res).await?;
+                }
+                Err(e) => {
+                    let err = proto::ErrMsg {
+                        code: proto::ERR_IO,
+                        message: format!("info_res_payload fallito: {}", e),
+                    };
+                    let _ = proto::send_err(&mut socket, &err).await;
+                    return Err(e);
+                }
+            },
             _ => {
                 // Tipo di messaggio non riconosciuto: invia ERR protocollo.
                 let err = proto::ErrMsg {
@@ -1477,7 +1629,10 @@ fn final_connect_error(addr: &str) -> anyhow::Error {
 /// read_ready_line_grace di riprendere la lettura dopo un timeout senza
 /// perdere i byte parziali gia' arrivati (un "READY" spezzato in due
 /// segmenti TCP a cavallo delle due finestre non si corrompe).
-async fn read_ready_line_into(s: &mut TcpStream, line: &mut Vec<u8>) -> Result<version::ServerHello> {
+async fn read_ready_line_into(
+    s: &mut TcpStream,
+    line: &mut Vec<u8>,
+) -> Result<version::ServerHello> {
     let mut byte = [0u8; 1];
     loop {
         let n = s.read(&mut byte).await?;
@@ -1557,47 +1712,40 @@ async fn read_ready_line_grace(
 }
 
 /// Parsa la riga di handshake del server:
-///   "READY"          -> ServerHello { ts: None, os: None } (server legacy)
-///   "READY <ts>"     -> ServerHello { ts: Some(ts), os: None }
-///   "READY <ts> L"   -> os = Some(Linux)   (server futuri)
-///   "READY <ts> W"   -> os = Some(Windows) (server futuri)
+///   "READY"          -> ServerHello { ts: None } (server legacy)
+///   "READY <ts>"     -> ServerHello { ts: Some(ts) }
+///   "READY <ts> <extra...>" -> i token oltre il ts sono IGNORATI
 ///
-/// Il terzo token (tag OS) e' OPZIONALE e forward-compatible: i server
-/// attuali non lo inviano, quelli futuri dichiareranno il proprio OS e
-/// il client lo usera' al posto dell'euristica EXE_PATH per scegliere
-/// il payload dell'update (binario linux vs PE). Token sconosciuti sono
-/// tollerati come "non dichiarato" — mai rifiutare l'handshake per un
-/// tag che non capiamo.
-/// Funzione pura (separata dalla lettura socket per essere unit-testabile).
+/// Spec §1.1 (selfdescribe-guardrail): il terzo token (tag OS L|W)
+/// NON viene piu' parsato — READY porta solo il build ts, l'identita'
+/// del server (OS, exe_path) arriva da INFO_RES. Un server che mandasse
+/// il tag verrebbe comunque accettato (parsing token-aware), ma il tag
+/// non ha piu' effetto. Funzione pura (unit-testabile).
 fn parse_ready_line(text: &str) -> Result<version::ServerHello> {
     if text == "READY" {
         return Ok(version::ServerHello::default());
     }
     if let Some(rest) = text.strip_prefix("READY ") {
-        let mut tokens = rest.split_whitespace();
         // Primo token: BUILD_TS. Non numerico -> 0 (server "ignoto",
         // trattato come piu' vecchio di qualsiasi build versionato).
-        let ts = tokens
+        // I token oltre il primo sono ignorati (forward-compat).
+        let ts = rest
+            .split_whitespace()
             .next()
             .and_then(|t| t.parse::<u64>().ok())
             .unwrap_or(0);
-        // Secondo token (opzionale): tag OS "L"|"W".
-        let os = tokens.next().and_then(version::RemoteOs::from_tag);
-        return Ok(version::ServerHello {
-            ts: Some(ts),
-            os,
-        });
+        return Ok(version::ServerHello { ts: Some(ts) });
     }
     bail!("handshake sconosciuto: {:?}", text);
 }
 
-/// Una connessione TCP + lettura handshake "READY <ts> [<os>]" (singolo
+/// Una connessione TCP + lettura handshake "READY <ts>" (singolo
 /// tentativo, niente retry/bootstrap/update; attesa READY in due fasi
 /// fast+cold-start, v. read_ready_line_grace), poi il gate TLS §4/§5:
 /// server nuovo -> TLS 1.3+PQ con pinning e AUTH; server vecchio ->
 /// plaintext grace (o fatale con REQUIRE_TLS / pin preesistente).
 /// Ritorna il Link finale e il ServerHello remoto (ts None = server
-/// legacy; os None = OS non dichiarato). Usata da connect_and_handshake
+/// legacy; READY porta SOLO il ts — §1.1). Usata da connect_and_handshake
 /// e dall'interno dell'orchestrazione update (le connessioni di
 /// PUT/GET/shell non devono ri-triggerare il confronto di versione).
 pub(crate) async fn connect_raw(addr: &str) -> Result<(tls::Link, version::ServerHello)> {
@@ -1607,7 +1755,8 @@ pub(crate) async fn connect_raw(addr: &str) -> Result<(tls::Link, version::Serve
     // "fast" e riaccoglie i byte parziali nella finestra cold-start
     // (read_ready_line_grace) — niente perdita di segmenti a cavallo.
     let mut line = Vec::with_capacity(32);
-    let hello = read_ready_line_grace(&mut s, &mut line, READY_FAST, READY_COLD_START, addr).await?;
+    let hello =
+        read_ready_line_grace(&mut s, &mut line, READY_FAST, READY_COLD_START, addr).await?;
     let link = tls::client_wrap(s, &hello, addr).await?;
     Ok((link, hello))
 }
@@ -1625,8 +1774,8 @@ async fn connect_and_handshake() -> Result<tls::Link> {
 }
 
 /// Come connect_and_handshake ma ritorna anche il ServerHello remoto
-/// (ts + tag OS opzionale): serve a client_mode/run per decidere il
-/// quoting della command-line (POSIX su unix, join su Windows) e per
+/// (ts; l'OS remoto e' risolto via INFO_RES da remote_is_unix_resolved):
+/// serve a client_mode/run per l'exit-code marker e per
 /// attivare il marker exit-code SOLO su server dello stesso BUILD_TS
 /// (il prefisso-sentinel e' compreso solo da build uguali).
 async fn connect_and_handshake_hello() -> Result<(tls::Link, version::ServerHello)> {
@@ -1663,7 +1812,9 @@ async fn connect_and_handshake_hello() -> Result<(tls::Link, version::ServerHell
                     }
                     // L'updater non ha rialzato il server entro la deadline:
                     // caduta al bootstrap WinRM come ultima spiaggia.
-                    eprintln!("[update] nuovo server non salito entro la deadline; fallback bootstrap.");
+                    eprintln!(
+                        "[update] nuovo server non salito entro la deadline; fallback bootstrap."
+                    );
                     update_deadline = None;
                     attempt = 0;
                 }
@@ -1705,10 +1856,12 @@ async fn connect_and_handshake_hello() -> Result<(tls::Link, version::ServerHell
             }
         };
 
+        // §1.1: READY porta solo il ts — l'OS del remote non e' piu' nel
+        // saluto (mai fidarsi dell'inferenza su path/env): la fonte e'
+        // INFO_RES/discovery (server_info::remote_identity).
         crate::qprintln!(
-            "[DEBUG] handshake: remote_ts={:?} remote_os={:?} locale={}",
+            "[DEBUG] handshake: remote_ts={:?} locale={}",
             hello.ts,
-            hello.os,
             version::BUILD_TS
         );
         match update::reconcile(hello).await {
@@ -1744,7 +1897,9 @@ async fn connect_and_handshake_hello() -> Result<(tls::Link, version::ServerHell
                 // server e' gia' stato fermato (quit) e quello nuovo e'
                 // gia' in ascolto (atteso dal polling di bootstrap_server).
                 // Riconnessione immediata, con deadline di sicurezza.
-                crate::qprintln!("[update] server aggiornato via fallback bootstrap: riconnessione...");
+                crate::qprintln!(
+                    "[update] server aggiornato via fallback bootstrap: riconnessione..."
+                );
                 update_deadline = Some(std::time::Instant::now() + Duration::from_secs(90));
                 attempt = 0;
                 continue;
@@ -1758,7 +1913,12 @@ async fn connect_and_handshake_hello() -> Result<(tls::Link, version::ServerHell
 /// Con `exec` il file remoto riceve chmod a+x post-upload (solo remote
 /// unix — il PUT lascia 644; su Windows il flag e' un no-op con warning).
 /// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
-async fn client_transfer_put(local_src: &str, remote_dst: &str, exec: bool, quit_after: bool) -> Result<()> {
+async fn client_transfer_put(
+    local_src: &str,
+    remote_dst: &str,
+    exec: bool,
+    quit_after: bool,
+) -> Result<()> {
     // Valida il path sorgente locale prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_file_exists(local_src) {
         eprintln!("[ERROR] put: {}", e);
@@ -1780,7 +1940,11 @@ async fn client_transfer_put(local_src: &str, remote_dst: &str, exec: bool, quit
         ephemeral_quit_best_effort().await;
     }
     result?;
-    crate::qprintln!("put: trasferimento completato ({} -> {})", local_src, remote_dst);
+    crate::qprintln!(
+        "put: trasferimento completato ({} -> {})",
+        local_src,
+        remote_dst
+    );
     Ok(())
 }
 
@@ -1818,13 +1982,24 @@ async fn client_transfer_get(remote_src: &str, local_dst: &str, quit_after: bool
         ephemeral_quit_best_effort().await;
     }
     result?;
-    crate::qprintln!("get: trasferimento completato ({} -> {})", remote_src, local_dst);
+    crate::qprintln!(
+        "get: trasferimento completato ({} -> {})",
+        remote_src,
+        local_dst
+    );
     Ok(())
 }
 
 /// Lato client: status (diff read-only) tra directory locale e remota.
 /// sync-spec §6. Exit code: 0 ok (anche con differenze), 1 errore, 2 path invalido.
-async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, quiet: bool, exclude: &[String], quit_after: bool) -> Result<()> {
+async fn client_sync_status(
+    local_dir: &str,
+    remote_dir: &str,
+    checksum: bool,
+    quiet: bool,
+    exclude: &[String],
+    quit_after: bool,
+) -> Result<()> {
     // Valida local_dir prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_dir_exists(local_dir) {
         eprintln!("[ERROR] status: {}", e);
@@ -1843,7 +2018,12 @@ async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, q
     sync::apply_exclusions(&mut local_walk, &mut remote_entries, exclude);
 
     // Diff (con lowercase per case-insensitivity Windows, sync-spec §8.1).
-    let mut diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+    let mut diff = sync::compute_diff(
+        &local_walk,
+        &remote_entries,
+        checksum,
+        std::path::Path::new(local_dir),
+    );
     // Le dir remote illeggibili arrivano nel trailer LIST_RES: il contenuto
     // e' sconosciuto, va mostrato come warning (non come "identico").
     diff.skipped_remote = outcome.skipped;
@@ -1903,13 +2083,19 @@ async fn client_sync(
     sync::apply_exclusions(&mut local_walk, &mut remote_entries, exclude);
 
     // Diff + piano.
-    let mut diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+    let mut diff = sync::compute_diff(
+        &local_walk,
+        &remote_entries,
+        checksum,
+        std::path::Path::new(local_dir),
+    );
     diff.skipped_remote = outcome.skipped;
     let plan = sync::build_plan(&diff, params.delete);
 
     // Esecuzione: connect_and_handshake è la callback di connessione della
     // SyncSession (riusata; reconnect-on-drop). Niente parallele.
-    let report = sync::execute_sync(&plan, &params, || async { connect_and_handshake().await }).await?;
+    let report =
+        sync::execute_sync(&plan, &params, || async { connect_and_handshake().await }).await?;
 
     // Report finale.
     sync::print_sync_report(&report, params.quiet);
@@ -1928,16 +2114,17 @@ async fn client_sync(
     Ok(())
 }
 
-/// OS del remote: prima il tag dichiarato nell'handshake (`READY <ts> L|W`,
-/// non ancora inviato dai server attuali), poi l'euristica EXE_PATH/OS
-/// dell'ambiente (bootstrap::remote_is_unix — la stessa che sceglie il
-/// canale di bootstrap SSH vs WinRM).
-fn remote_is_unix_hello(hello: &version::ServerHello) -> bool {
-    match hello.os {
-        Some(version::RemoteOs::Linux) => true,
-        Some(version::RemoteOs::Windows) => false,
-        None => bootstrap::remote_is_unix(),
+/// OS del remote per il quoting dei comandi shell (`--` form): INFO_RES
+/// quando il server si descrive (spec §3 — il remote sa chi e'), poi
+/// l'euristica env bootstrap::remote_is_unix come fallback per i server
+/// pre-selfdescribe. Il fetch e' cacheato per processo: qui il server
+/// e' appena stato connesso, quindi la richiesta e' quasi sempre
+/// rispondibile e a costo nullo dopo reconcile.
+async fn remote_is_unix_resolved() -> bool {
+    if let Some(info) = server_info::fetch().await {
+        return info.os == version::RemoteOs::Linux;
     }
+    bootstrap::remote_is_unix()
 }
 
 /// Lato client, forma `--`: invia il comando shell-mode e streamma la
@@ -1954,9 +2141,9 @@ fn remote_is_unix_hello(hello: &version::ServerHello) -> bool {
 async fn client_mode(tokens: &[String], quit_after: bool) -> Result<()> {
     // Connessione + handshake + auto-update (stessa logica di put/get/sync:
     // connect_and_handshake orchestra retry, bootstrap e version skew).
-    // La variante _hello serve a leggere l'OS remoto dichiarato.
     let (mut socket, hello) = connect_and_handshake_hello().await?;
-    let remote_unix = remote_is_unix_hello(&hello);
+    // OS remoto per il quoting: identita' risolta (INFO_RES) poi env.
+    let remote_unix = remote_is_unix_resolved().await;
     let cmd = runcmd::rejoin_command(tokens, remote_unix);
 
     // Exit-code marker: il prefisso-sentinel e' compreso SOLO da server
@@ -1990,7 +2177,11 @@ async fn client_mode(tokens: &[String], quit_after: bool) -> Result<()> {
 /// coda termina col marker `CROSSPILOT_EXIT_CODE=<n>` lo estrae (e non lo
 /// stampa) e ne ritorna il valore; altrimenti stampa la coda e torna None
 /// (server senza marker = exit code ignoto -> trattato come 0).
-async fn stream_shell_output(socket: &mut tls::Link, want_exit_code: bool, echo: bool) -> Result<Option<i32>> {
+async fn stream_shell_output(
+    socket: &mut tls::Link,
+    want_exit_code: bool,
+    echo: bool,
+) -> Result<Option<i32>> {
     let mut stdout = tokio::io::stdout();
     let mut buf = [0; 1024];
     let mut tail: Vec<u8> = Vec::new();
@@ -2121,7 +2312,9 @@ async fn client_quit() -> Result<()> {
     let eof = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await;
     match eof {
         Ok(Ok(0)) => crate::qprintln!("[DEBUG] quit consegnato: server in shutdown."),
-        _ => eprintln!("[WARN] quit inviato ma nessun EOF entro 5s: il server potrebbe non spegnersi."),
+        _ => eprintln!(
+            "[WARN] quit inviato ma nessun EOF entro 5s: il server potrebbe non spegnersi."
+        ),
     }
     Ok(())
 }
@@ -2144,40 +2337,27 @@ mod tests {
 
     #[test]
     fn parse_ready_line_legacy() {
-        // "READY" secco: server pre auto-update -> ts/os assenti.
+        // "READY" secco: server pre auto-update -> ts assente.
         let hello = parse_ready_line("READY").unwrap();
         assert_eq!(hello.ts, None);
-        assert_eq!(hello.os, None);
     }
 
     #[test]
     fn parse_ready_line_ts_senza_os() {
-        // Formato attuale: "READY <ts>" senza tag OS.
+        // Formato attuale: "READY <ts>" (READY porta SOLO il ts — §1.1).
         let hello = parse_ready_line("READY 1758530400").unwrap();
         assert_eq!(hello.ts, Some(1758530400));
-        assert_eq!(hello.os, None);
     }
 
     #[test]
-    fn parse_ready_line_ts_con_os() {
-        // Formato futuro: "READY <ts> L|W" — il client deve capire il
-        // tag OS gia' oggi (i server lo invieranno piu' avanti).
+    fn parse_ready_line_tag_extra_ignorati() {
+        // §1.1: i token oltre il ts (il vecchio tag OS L|W o qualunque
+        // extra futuro) sono IGNORATI — l'handshake non fallisce mai
+        // per un tag non capito, ma il tag non ha piu' effetto.
         let hello = parse_ready_line("READY 1758530400 L").unwrap();
         assert_eq!(hello.ts, Some(1758530400));
-        assert_eq!(hello.os, Some(version::RemoteOs::Linux));
-
-        let hello = parse_ready_line("READY 1758530400 W").unwrap();
-        assert_eq!(hello.ts, Some(1758530400));
-        assert_eq!(hello.os, Some(version::RemoteOs::Windows));
-    }
-
-    #[test]
-    fn parse_ready_line_tag_sconosciuto_tollerato() {
-        // Tag OS non riconosciuto: tollerato come "non dichiarato",
-        // l'handshake NON deve fallire (forward-compat).
-        let hello = parse_ready_line("READY 7 X").unwrap();
+        let hello = parse_ready_line("READY 7 X y z").unwrap();
         assert_eq!(hello.ts, Some(7));
-        assert_eq!(hello.os, None);
     }
 
     #[test]
@@ -2223,8 +2403,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // Il tag OS (o qualunque token extra) e' ignorato (§1.1).
         assert_eq!(hello.ts, Some(1758530400));
-        assert_eq!(hello.os, Some(version::RemoteOs::Linux));
     }
 
     #[tokio::test]

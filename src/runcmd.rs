@@ -330,7 +330,10 @@ mod tests {
     fn posix_quote_groups_preserved() {
         // Il bug riportato: token con spazi/quote devono restare un gruppo.
         assert_eq!(posix_quote("sleep 8; docker ps"), "'sleep 8; docker ps'");
-        assert_eq!(posix_quote("{{.Names}} {{.Status}}"), "'{{.Names}} {{.Status}}'");
+        assert_eq!(
+            posix_quote("{{.Names}} {{.Status}}"),
+            "'{{.Names}} {{.Status}}'"
+        );
         assert_eq!(posix_quote("it's"), "'it'\\''s'");
         assert_eq!(posix_quote(""), "''");
         assert_eq!(posix_quote("a|b"), "'a|b'");
@@ -363,7 +366,11 @@ mod tests {
         // File "x.sh" non esiste -> niente shebang -> wait-loop + sh /tmp/x.sh
         // (il path non ha caratteri di raggruppamento -> niente quoting).
         assert!(cmd.ends_with("; sh /tmp/x.sh"), "cmd={}", cmd);
-        assert!(cmd.starts_with("i=0; while [ ! -f /tmp/x.sh ]"), "cmd={}", cmd);
+        assert!(
+            cmd.starts_with("i=0; while [ ! -f /tmp/x.sh ]"),
+            "cmd={}",
+            cmd
+        );
         let cmd_args = build_exec_command(
             "x.sh",
             "/tmp/x.sh",
@@ -371,7 +378,11 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(cmd_args.ends_with("; sh /tmp/x.sh --name 'a b'"), "cmd={}", cmd_args);
+        assert!(
+            cmd_args.ends_with("; sh /tmp/x.sh --name 'a b'"),
+            "cmd={}",
+            cmd_args
+        );
     }
 
     #[test]

@@ -19,15 +19,14 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
 use crate::tls::Link;
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::path;
 use crate::proto::{
-    self, BatchResult, DeleteBatchReq, DeleteBatchRes, DeleteItem, ListReq, ListRes,
-    MkdirBatchReq, MkdirBatchRes,
-    ERR_IO, ERR_PATH_FORBIDDEN, ERR_PROTO,
-    MSG_DELETE_BATCH_RES, MSG_LIST_RES, MSG_MKDIR_BATCH_RES,
+    self, BatchResult, DeleteBatchReq, DeleteBatchRes, DeleteItem, ListReq, ListRes, MkdirBatchReq,
+    MkdirBatchRes, ERR_IO, ERR_PATH_FORBIDDEN, ERR_PROTO, MSG_DELETE_BATCH_RES, MSG_LIST_RES,
+    MSG_MKDIR_BATCH_RES,
 };
 use crate::sync::Entry;
 use crate::verify::sha256_file_handle;
@@ -60,7 +59,9 @@ pub async fn list_server(stream: &mut Link, req: &ListReq) -> Result<()> {
 
     crate::qprintln!(
         "[DEBUG] list_server: path={} recursive={} with_hash={}",
-        req.path, req.recursive, req.with_hash
+        req.path,
+        req.recursive,
+        req.with_hash
     );
 
     // Directory non esistente -> LIST_RES con 0 entry (sync-spec §9 decisione:
@@ -131,7 +132,15 @@ fn walk_remote_dir(
     skipped: &mut Vec<String>,
 ) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    walk_remote_recursive(base, Path::new(""), recursive, with_hash, base_canon, &mut entries, skipped)?;
+    walk_remote_recursive(
+        base,
+        Path::new(""),
+        recursive,
+        with_hash,
+        base_canon,
+        &mut entries,
+        skipped,
+    )?;
     Ok(entries)
 }
 
@@ -158,7 +167,11 @@ fn walk_remote_recursive(
             // scendervi — il client la mostra come warning e, con --delete,
             // sospende la cancellazione (contenuto remoto sconosciuto).
             if rel.as_os_str().is_empty() {
-                return Err(anyhow!("impossibile leggere directory {}: {}", full.display(), e));
+                return Err(anyhow!(
+                    "impossibile leggere directory {}: {}",
+                    full.display(),
+                    e
+                ));
             }
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             eprintln!(
@@ -173,7 +186,11 @@ fn walk_remote_recursive(
         let dir_entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[WARN] walk_remote: skip entry non leggibile in {}: {}", full.display(), e);
+                eprintln!(
+                    "[WARN] walk_remote: skip entry non leggibile in {}: {}",
+                    full.display(),
+                    e
+                );
                 continue;
             }
         };
@@ -181,7 +198,10 @@ fn walk_remote_recursive(
         let name_str = match file_name.to_str() {
             Some(s) => s,
             None => {
-                eprintln!("[WARN] walk_remote: skip nome non-UTF-8 in {}", full.display());
+                eprintln!(
+                    "[WARN] walk_remote: skip nome non-UTF-8 in {}",
+                    full.display()
+                );
                 continue;
             }
         };
@@ -206,7 +226,10 @@ fn walk_remote_recursive(
         let metadata = match dir_entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[WARN] walk_remote: skip metadata non leggibile {}: {}", child_rel_str, e);
+                eprintln!(
+                    "[WARN] walk_remote: skip metadata non leggibile {}: {}",
+                    child_rel_str, e
+                );
                 continue;
             }
         };
@@ -218,7 +241,9 @@ fn walk_remote_recursive(
                 sha256: None,
             });
             if recursive {
-                walk_remote_recursive(base, &child_rel, recursive, with_hash, base_canon, out, skipped)?;
+                walk_remote_recursive(
+                    base, &child_rel, recursive, with_hash, base_canon, out, skipped,
+                )?;
             }
         } else {
             // File: calcola hash se with_hash (un solo passaggio, sync-spec §6.1).
@@ -227,7 +252,10 @@ fn walk_remote_recursive(
                 match hash_result {
                     Ok(h) => Some(h),
                     Err(e) => {
-                        eprintln!("[WARN] walk_remote: hash fallito per {}: {}", child_rel_str, e);
+                        eprintln!(
+                            "[WARN] walk_remote: hash fallito per {}: {}",
+                            child_rel_str, e
+                        );
                         None
                     }
                 }
@@ -362,7 +390,11 @@ fn delete_single(item: &DeleteItem) -> BatchResult {
     };
     match delete_result {
         Ok(()) => {
-            crate::qprintln!("[DEBUG] delete_batch_server: eliminato: {} (recursive={})", item.path, item.recursive);
+            crate::qprintln!(
+                "[DEBUG] delete_batch_server: eliminato: {} (recursive={})",
+                item.path,
+                item.recursive
+            );
             BatchResult::ok()
         }
         Err(e) => {
@@ -417,17 +449,26 @@ mod tests {
         fs::write(dir_path.join("inner.txt"), b"x").unwrap();
 
         // Delete file (recursive=0).
-        let r1 = delete_single(&DeleteItem { path: file_path.to_string_lossy().into_owned(), recursive: 0 });
+        let r1 = delete_single(&DeleteItem {
+            path: file_path.to_string_lossy().into_owned(),
+            recursive: 0,
+        });
         assert_eq!(r1.status, 0);
         assert!(!file_path.exists());
 
         // Delete dir recursive=1.
-        let r2 = delete_single(&DeleteItem { path: dir_path.to_string_lossy().into_owned(), recursive: 1 });
+        let r2 = delete_single(&DeleteItem {
+            path: dir_path.to_string_lossy().into_owned(),
+            recursive: 1,
+        });
         assert_eq!(r2.status, 0);
         assert!(!dir_path.exists());
 
         // Delete non esistente -> status=1 (not found).
-        let r3 = delete_single(&DeleteItem { path: file_path.to_string_lossy().into_owned(), recursive: 0 });
+        let r3 = delete_single(&DeleteItem {
+            path: file_path.to_string_lossy().into_owned(),
+            recursive: 0,
+        });
         assert_eq!(r3.status, 1);
 
         let _ = fs::remove_dir_all(&root);

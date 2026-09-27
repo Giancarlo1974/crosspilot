@@ -20,10 +20,17 @@ async fn main() {
     } else {
         (user_raw, String::new())
     };
-    let config = WinrmConfig { port, use_tls: false, ..Default::default() };
+    let config = WinrmConfig {
+        port,
+        use_tls: false,
+        ..Default::default()
+    };
     let creds = WinrmCredentials::new(user, pass, domain);
     let client = WinrmClient::new(config, creds).expect("winrm client");
-    let out = client.run_powershell(&host, &ps).await.expect("run_powershell");
+    let out = client
+        .run_powershell(&host, &ps)
+        .await
+        .expect("run_powershell");
     println!("{}", String::from_utf8_lossy(&out.stdout));
     eprintln!("{}", String::from_utf8_lossy(&out.stderr));
 }

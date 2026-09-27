@@ -19,10 +19,7 @@ use crate::proto::{TransferError, ERR_FILE_NOT_FOUND, ERR_PATH_FORBIDDEN};
 pub fn validate_server_path(path: &str) -> Result<(), TransferError> {
     // Rifiuta path vuoto.
     if path.is_empty() {
-        return Err(TransferError::new(
-            ERR_PATH_FORBIDDEN,
-            "path vuoto",
-        ));
+        return Err(TransferError::new(ERR_PATH_FORBIDDEN, "path vuoto"));
     }
 
     #[cfg(target_os = "windows")]
@@ -33,6 +30,20 @@ pub fn validate_server_path(path: &str) -> Result<(), TransferError> {
     {
         validate_server_path_linux(path)
     }
+}
+
+/// True se il path ha forma Windows: lettera di unita' (`C:\` o
+/// `D:/...`) oppure UNC (`\\host\share`). Condiviso dal gate di coerenza
+/// envs::check_os_exe_coherence e dalla risoluzione dell'identita'
+/// remota (spec selfdescribe-guardrail §5) — spostato da update.rs.
+/// N.B.: heuristici sul PATH A STRINGA, mai sufficente a decidere
+/// l'OS del remote (quello arriva da INFO_RES/RUNNING_EXE).
+pub(crate) fn is_windows_path(p: &str) -> bool {
+    let bytes = p.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    p.starts_with("\\\\")
 }
 
 /// Validazione path server su Windows.
@@ -245,9 +256,8 @@ pub fn is_windows_reserved_name(name: &str) -> Option<&'static str> {
     let upper = stem.to_ascii_uppercase();
     // Lista nomi riservati (sync-spec §8.3).
     let reserved = [
-        "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     for r in reserved {
         if upper == *r {
