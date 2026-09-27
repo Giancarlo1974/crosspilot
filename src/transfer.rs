@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use fast_rsync::{Signature, SignatureOptions};
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
+use crate::tls::Link;
 
 use crate::path;
 use crate::proto::{
@@ -263,7 +263,7 @@ fn cleanup_part_file(part_path: &Path) {
 /// nuovo (calcolato localmente) con l'hash del .part (inviato dal receiver).
 /// Se coincidono, invia ACK(status 0) come conferma. Se mismatch, invia ERR 4.
 async fn send_confirmation(
-    stream: &mut TcpStream,
+    stream: &mut Link,
     source_hash: [u8; 32],
     ack: &Ack,
 ) -> Result<()> {
@@ -294,7 +294,7 @@ async fn send_confirmation(
 
 /// Lato receiver: dopo aver inviato l'ACK, attende la conferma del sender.
 /// Ritorna Ok(()) se il sender conferma (ACK status 0), Err se il sender invia ERR.
-async fn wait_for_confirmation(stream: &mut TcpStream) -> Result<()> {
+async fn wait_for_confirmation(stream: &mut Link) -> Result<()> {
     let (msg_type, payload) = proto::read_msg(stream).await?;
     if msg_type == MSG_ACK {
         let ack = proto::decode_ack(&payload)?;
@@ -336,7 +336,7 @@ fn hex(bytes: &[u8]) -> String {
 /// Calcola anche SHA-256 whole-file del file nuovo in streaming (un solo passaggio).
 /// Ritorna l'hash whole-file del file nuovo.
 async fn sender_segment_loop(
-    stream: &mut TcpStream,
+    stream: &mut Link,
     new_file: &mut File,
     block_size: u32,
     segment_size: u64,
@@ -437,7 +437,7 @@ async fn sender_segment_loop(
 ///
 /// Ritorna (total_bytes_written, sha256_whole_file del .part).
 async fn receiver_segment_loop(
-    stream: &mut TcpStream,
+    stream: &mut Link,
     base_path: Option<&Path>,
     part_file: &mut File,
     block_size: u32,
@@ -559,7 +559,7 @@ async fn receiver_segment_loop(
 /// Lato client PUT (upload): client = sender del file local_src verso remote_dst.
 ///
 /// Flusso: PUT_REQ -> loop segmenti (sender) -> riceve ACK -> verifica -> conferma.
-pub async fn put_client(stream: &mut TcpStream, local_src: &str, remote_dst: &str) -> Result<()> {
+pub async fn put_client(stream: &mut Link, local_src: &str, remote_dst: &str) -> Result<()> {
     // Valida che il file sorgente locale esista.
     path::require_local_file_exists(local_src)?;
 
@@ -619,9 +619,11 @@ pub async fn put_client(stream: &mut TcpStream, local_src: &str, remote_dst: &st
 /// Lato server PUT (upload): server = receiver. Scrive su .part, poi rename atomico.
 ///
 /// Flusso: riceve PUT_REQ -> valida -> loop segmenti (receiver) -> ACK -> attende conferma -> rename.
-pub async fn put_server(stream: &mut TcpStream, req: PutReq) -> Result<()> {
-    // Valida il path di destinazione (server-side).
-    if let Err(e) = path::validate_server_path(&req.path) {
+pub async fn put_server(stream: &mut Link, req: PutReq) -> Result<()> {
+    // Valida il path di destinazione (server-side) + basename vietati
+    // (spec tls-pq §7.1: la chiave privata del server non e' sovrascrivibile
+    // via protocollo — il provisioning resta sui canali di bootstrap).
+    if let Err(e) = path::validate_servable_path(&req.path) {
         let err_msg = e.to_err_msg();
         eprintln!(
             "[ERROR] transfer put_server: path invalido - {} ({})",
@@ -736,7 +738,7 @@ pub async fn put_server(stream: &mut TcpStream, req: PutReq) -> Result<()> {
 ///
 /// Flusso: GET_REQ -> riceve META -> loop segmenti (receiver) -> ACK -> attende conferma -> rename.
 pub async fn get_client(
-    stream: &mut TcpStream,
+    stream: &mut Link,
     remote_src: &str,
     local_dst: &str,
 ) -> Result<()> {
@@ -845,12 +847,55 @@ pub async fn get_client(
     Ok(())
 }
 
+/// Basename dei soli artefatti pubblici servibili in plaintext quando
+/// CROSSPILOT_REQUIRE_TLS=1 (grace window §5.1): servono a un client
+/// vecchio per scaricare .ver+binario e auto-aggiornarsi. Match ESATTO
+/// sul basename — `crosspilot-1.exe`, `..`, `.env` e qualunque altro
+/// nome sono rifiutati.
+const GRACE_GET_BASENAMES: &[&str] = &["crosspilot.ver", "crosspilot.linux", "crosspilot.exe"];
+
+/// True se il path e' una GET whitelisted per il grace plaintext §5.1.
+/// Estrae il basename (entrambi i separatori) e richiede match esatto
+/// case-insensitive (FS Windows e' case-insensitive).
+pub(crate) fn grace_get_whitelisted(path: &str) -> bool {
+    let mut base = path;
+    if let Some(pos) = base.rfind('/') {
+        base = &base[pos + 1..];
+    }
+    if let Some(pos) = base.rfind('\\') {
+        base = &base[pos + 1..];
+    }
+    for allowed in GRACE_GET_BASENAMES {
+        if base.eq_ignore_ascii_case(allowed) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Lato server GET (download): server = sender del file remote_src.
 ///
 /// Flusso: riceve GET_REQ -> valida -> META -> loop segmenti (sender) -> riceve ACK -> verifica -> conferma.
-pub async fn get_server(stream: &mut TcpStream, req: GetReq) -> Result<()> {
-    // Valida il path sorgente (server-side).
-    if let Err(e) = path::validate_server_path(&req.path) {
+///
+/// `grace_only` = connessione plaintext + REQUIRE_TLS (spec tls-pq §5.1):
+/// solo i basename whitelisted passano, tutto il resto e' ERR_PROTO.
+pub async fn get_server(stream: &mut Link, req: GetReq, grace_only: bool) -> Result<()> {
+    // Grace plaintext: solo gli artefatti pubblici dell'auto-update.
+    if grace_only && !grace_get_whitelisted(&req.path) {
+        let err_msg = ErrMsg {
+            code: proto::ERR_PROTO,
+            message: format!(
+                "GET non consentita in plaintext con REQUIRE_TLS: {}",
+                req.path
+            ),
+        };
+        proto::send_err(stream, &err_msg).await?;
+        return Err(anyhow!("GET grace rifiutata: {}", req.path));
+    }
+
+    // Valida il path sorgente (server-side) + basename vietati (la
+    // chiave privata TLS non e' esfiltrabile nemmeno dentro TLS, §7.1).
+    if let Err(e) = path::validate_servable_path(&req.path) {
         let err_msg = e.to_err_msg();
         eprintln!(
             "[ERROR] transfer get_server: path invalido - {} ({})",
@@ -1101,6 +1146,27 @@ mod tests {
         assert!(validate_segment_size(MAX_SEGMENT_SIZE).is_ok());
         assert!(validate_segment_size(MIN_SEGMENT_SIZE - 1).is_err());
         assert!(validate_segment_size(MAX_SEGMENT_SIZE + 1).is_err());
+    }
+
+    /// Whitelist GET grace-plaintext (tls-pq §5.1): match esatto sul
+    /// basename dei soli artefatti pubblici dell'auto-update.
+    #[test]
+    fn grace_get_whitelist_match_esatto() {
+        assert!(grace_get_whitelisted("/srv/crosspilot.ver"));
+        assert!(grace_get_whitelisted("crosspilot.linux"));
+        assert!(grace_get_whitelisted(r"C:\bin\crosspilot.exe"));
+        assert!(grace_get_whitelisted("CROSSPILOT.EXE"));
+        // Suffissi/prefissi NON matchano (spec §12 test 1).
+        assert!(!grace_get_whitelisted("crosspilot-1.exe"));
+        assert!(!grace_get_whitelisted("/srv/crosspilot.exe.old"));
+        assert!(!grace_get_whitelisted("mycrosspilot.exe"));
+        // File arbitrari vietati (spec §12 test 2). Il `..` NON e'
+        // compito di questo check (opera sul basename): lo intercetta
+        // validate_servable_path in get_server — coperto in path.rs.
+        assert!(!grace_get_whitelisted("/home/u/.env"));
+        assert!(!grace_get_whitelisted(".env"));
+        assert!(!grace_get_whitelisted("/srv/crosspilot-server.key"));
+        assert!(!grace_get_whitelisted(""));
     }
 
     /// Verifica make_part_path.

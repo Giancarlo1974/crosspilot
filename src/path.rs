@@ -110,6 +110,56 @@ pub fn contains_parent_component(path: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// File vietati sul canale TCP (spec tls-pq §7.1).
+// ---------------------------------------------------------------------------
+
+/// Basename mai servibili via PUT/GET sul canale TCP: la chiave privata
+/// TLS del server NON deve viaggiare mai su questo protocollo — ne' in
+/// lettura (GET la esfiltrerebbe) ne' in scrittura (PUT sovrascriverebbe
+/// l'identita' TLS del server). Il provisioning della coppia key+crt
+/// avviene solo sui canali di bootstrap (WinRM/SSH/SMB).
+pub const FORBIDDEN_SERVE_BASENAMES: &[&str] = &[crate::tls::SERVER_KEY_FILE];
+
+/// Estrae il basename del path gestendo entrambi i separatori ('/' e '\'),
+/// indipendentemente dall'OS di build: il client puo' mandare path con
+/// backslash anche verso un server unix e viceversa.
+fn basename_component(path: &str) -> &str {
+    let mut base = path;
+    if let Some(pos) = base.rfind('/') {
+        base = &base[pos + 1..];
+    }
+    if let Some(pos) = base.rfind('\\') {
+        base = &base[pos + 1..];
+    }
+    base
+}
+
+/// True se il basename del path e' nella lista dei file vietati
+/// (confronto case-insensitive: il filesystem Windows e' case-insensitive).
+pub fn is_forbidden_serve_basename(path: &str) -> bool {
+    let base = basename_component(path);
+    for forbidden in FORBIDDEN_SERVE_BASENAMES {
+        if base.eq_ignore_ascii_case(forbidden) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Come `validate_server_path` + rifiuto dei basename vietati. Usata dai
+/// handler PUT/GET del server (transfer.rs) al posto della validazione pura.
+pub fn validate_servable_path(path: &str) -> Result<(), TransferError> {
+    validate_server_path(path)?;
+    if is_forbidden_serve_basename(path) {
+        return Err(TransferError::new(
+            ERR_PATH_FORBIDDEN,
+            format!("file riservato, non servibile via protocollo: {}", path),
+        ));
+    }
+    Ok(())
+}
+
 /// Verifica che il file sorgente locale (lato client, per `put`) esista.
 /// Ritorna `Err(TransferError)` con codice `ERR_FILE_NOT_FOUND` se manca.
 pub fn require_local_file_exists(path: &str) -> Result<(), TransferError> {
@@ -581,6 +631,27 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.code, ERR_PATH_FORBIDDEN);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Basename vietato (tls-pq §7.1): la chiave privata del server non
+    /// passa ne' in GET ne' in PUT; il `..` resta ERR_PATH_FORBIDDEN.
+    #[test]
+    fn servable_path_blocks_key_e_parent() {
+        assert!(is_forbidden_serve_basename("/srv/crosspilot-server.key"));
+        assert!(is_forbidden_serve_basename(r"C:\bin\CROSSPILOT-SERVER.KEY"));
+        assert!(!is_forbidden_serve_basename("/srv/crosspilot.ver"));
+        assert!(!is_forbidden_serve_basename("/srv/crosspilot-server.crt"));
+        #[cfg(not(target_os = "windows"))]
+        {
+            let res = validate_servable_path("/srv/crosspilot-server.key");
+            assert!(res.is_err());
+            assert_eq!(res.unwrap_err().code, ERR_PATH_FORBIDDEN);
+            // `..` resta vietato anche su basename whitelisted.
+            let res2 = validate_servable_path("/srv/../crosspilot.ver");
+            assert!(res2.is_err());
+            let res3 = validate_servable_path("/srv/crosspilot.ver");
+            assert!(res3.is_ok());
+        }
     }
 
     #[test]

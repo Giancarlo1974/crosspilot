@@ -232,7 +232,9 @@ pub struct SshSession {
 
 /// Path del known_hosts dedicato: accanto al .env risolto da envs
 /// (stessa directory -> viaggia con la configurazione degli ambienti).
-fn known_hosts_path() -> PathBuf {
+/// Condiviso col pinning TLS: le righe `tls-sha256:` di tls.rs vivono
+/// nello stesso file delle host key SSH (spec tls-pq §7.2).
+pub(crate) fn known_hosts_path() -> PathBuf {
     let env_path = envs::env_file_path();
     let dir = match env_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),

@@ -29,6 +29,25 @@ winrm-rs = "1.2.2"
 smb2-client = "0.2.5"
 ms-scmr = "0.1"
 
+# TLS 1.3 post-quantum sul canale TCP client<->server (docs/tls-pq-spec.md §2).
+# Provider "ring": gia' compilato su tutti i target (rustls entra via
+# winrm-rs vendored e russh; workaround musl in AGENTS.md). aws-lc-rs
+# ESCLUSO: cmake+NASM -> cross-compile windows-gnu noto-fallito upstream
+# (issues #753/#835/#850) e musl static richiederebbe una toolchain extra.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Key exchange ibrido X25519+ML-KEM-768 pure-Rust (FIPS 203, codepoint
+# 0x11EC — lo stesso gruppo di Chrome/Cloudflare). Crate giovane ma la
+# meta' PQ e' additive: X25519 conserva comunque la sicurezza classica.
+rustls-pq-addon = "0.0.2"
+# Cert self-signed del server generato a runtime (spec §7.1): nessun key
+# material embeddato nel binario.
+rcgen = "0.14"
+# Decode dei PEM key/cert del server per ServerConfig (solo parsing, pure Rust).
+rustls-pemfile = "2"
+# Fingerprint "tls-sha256:<b64>" nel file crosspilot_known_hosts (spec §7.2).
+base64 = "0.23"
+
 # Canale SSH unificato (docs/ssh-unified-prescan-bootstrap-spec.md §1):
 # russh = client SSH2 puro Rust async (niente binario `ssh` di sistema,
 # niente FFI -> musl + windows-gnu ok); russh-sftp = sottosistema SFTP
@@ -56,6 +75,15 @@ winrm-rs = { path = "vendor/winrm-rs" }
 # (ms-scmr -> smb2-client ^0.2 usa lo stesso sorgente vendored).
 # TODO: proporre upstream (github.com/icedracon/smb2-client).
 smb2-client = { path = "vendor/smb2-client" }
+
+# PATCH LOCALE: rustls-pq-addon 0.0.2 dipende da ml-kem ^0.2.3 (kem
+# =0.3.0-pre.0), incompatibile con ml-kem ^0.3 richiesto da russh 0.63.3
+# (kem ^0.3): le due versioni di `kem` non risolvono insieme. Il crate
+# vendored porta i suoi ~1000 LoC a ml-kem 0.3 (EncapsulationKey/
+# DecapsulationKey top-level, trait kem::{Kem,Encapsulate,Decapsulate},
+# rand_core 0.10 accanto a rand_core 0.6 per x25519-dalek).
+# TODO: rimuovere quando upstream pubblica la versione su ml-kem 0.3.
+rustls-pq-addon = { path = "vendor/rustls-pq-addon" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["jobapi2", "processthreadsapi", "winnt", "handleapi", "synchapi", "fileapi", "winbase"] }

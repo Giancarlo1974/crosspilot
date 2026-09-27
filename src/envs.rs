@@ -60,6 +60,15 @@ const FIELDS: &[&str] = &[
     // "smb" = SMB/SCM primario; assente = WinRM primario + fallback SMB.
     // Non collide con nessun suffisso dei campi sopra.
     "BOOTSTRAP",
+    // Campi TLS (spec tls-pq §9): longest-first come gli SSH_* —
+    // TLS_NO_PIN precede TLS_PIN per evitare il match parziale del
+    // suffisso; AUTH_TOKEN/REQUIRE_TLS non collidono con altri suffissi.
+    "REQUIRE_TLS",
+    "TLS_NO_PIN",
+    "AUTH_TOKEN",
+    "TLS_CERT",
+    "TLS_KEY",
+    "TLS_PIN",
     "HOST",
     "PORT",
     "USER",
@@ -87,6 +96,12 @@ const FIELD_ORDER: &[&str] = &[
     "SSH_PASS",
     "SSH_INSECURE_NO_HOSTKEY",
     "BOOTSTRAP",
+    "TLS_KEY",
+    "TLS_CERT",
+    "TLS_PIN",
+    "TLS_NO_PIN",
+    "REQUIRE_TLS",
+    "AUTH_TOKEN",
 ];
 
 /// Nomi riservati: un ambiente con questi nomi colliderebbe con chiavi non
@@ -99,7 +114,9 @@ const FIELD_ORDER: &[&str] = &[
 /// - SSH:     CROSSPILOT_SSH_HOST/SSH_PORT/SSH_USER/SSH_KEY/SSH_PASS/
 ///   SSH_INSECURE_NO_HOSTKEY sono campi non prefissati: un env "SSH"
 ///   vedrebbe le sue chiavi HOST/PORT/USER/KEY/PASS shadow-ate da essi.
-const RESERVED: &[&str] = &["ENV", "SERVER", "CLIENT", "DEFAULT", "SSH"];
+/// - TLS:     CROSSPILOT_TLS_KEY/TLS_CERT/TLS_PIN/TLS_NO_PIN sono campi non
+///   prefissati: un env "TLS" shadow-erebbe le chiavi TLS reali (come SSH).
+const RESERVED: &[&str] = &["ENV", "SERVER", "CLIENT", "DEFAULT", "SSH", "TLS"];
 
 /// Chiave del selettore dell'ambiente attivo.
 const SELECTOR_KEY: &str = "CROSSPILOT_ENV";
@@ -790,8 +807,13 @@ fn cmd_show(lines: &[String], name: &str, reveal: bool) -> Result<()> {
             ),
             (None, None) => ("-".to_string(), "(non impostato)".to_string()),
         };
-        // Le password (PASS e SSH_PASS) sono mascherate a meno di --reveal.
-        let is_secret = *field == "PASS" || *field == "SSH_PASS";
+        // Password e segreti (PASS, SSH_PASS, AUTH_TOKEN, TLS_KEY=chiave
+        // privata, TLS_PIN=fingerprint pinning) sono mascherati a meno
+        // di --reveal. TLS_CERT/TLS_NO_PIN/REQUIRE_TLS non sono segreti.
+        let is_secret = matches!(
+            *field,
+            "PASS" | "SSH_PASS" | "AUTH_TOKEN" | "TLS_KEY" | "TLS_PIN"
+        );
         let shown = if is_secret && !reveal && value != "-" {
             "********".to_string()
         } else {
@@ -1001,6 +1023,35 @@ mod tests {
         // "SSH" riservato: CROSSPILOT_SSH_* sono campi non prefissati,
         // un env "SSH" non potrebbe mai definire HOST/PORT/USER propri.
         assert!(validate_name("ssh").is_err());
+        // "TLS" riservato (stessa ragione): CROSSPILOT_TLS_KEY/CERT/PIN/
+        // NO_PIN sono campi non prefissati (spec tls-pq §9).
+        assert!(validate_name("tls").is_err());
+    }
+
+    #[test]
+    fn parse_key_campi_tls() {
+        // I nuovi campi TLS (spec tls-pq §9) si parsano prefissati e non.
+        assert_eq!(
+            parse_key("CROSSPILOT_REQUIRE_TLS"),
+            ParsedKey::Field(None, "REQUIRE_TLS")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_PROD_TLS_NO_PIN"),
+            ParsedKey::Field(Some("PROD".to_string()), "TLS_NO_PIN")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_PROD_TLS_PIN"),
+            ParsedKey::Field(Some("PROD".to_string()), "TLS_PIN")
+        );
+        assert_eq!(
+            parse_key("CROSSPILOT_AUTH_TOKEN"),
+            ParsedKey::Field(None, "AUTH_TOKEN")
+        );
+        // Il suffisso TLS_PIN non ruba TLS_NO_PIN (longest-first).
+        assert_eq!(
+            parse_key("CROSSPILOT_X_TLS_NO_PIN"),
+            ParsedKey::Field(Some("X".to_string()), "TLS_NO_PIN")
+        );
     }
 
     #[test]

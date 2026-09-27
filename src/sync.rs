@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::net::TcpStream;
+use crate::tls::Link;
 
 use crate::path;
 use crate::proto::{
@@ -267,7 +267,7 @@ fn walk_recursive(
 /// Ritorna la lista di entry remote. `with_hash` controlla se il server include
 /// SHA-256 per i file (un solo passaggio sul filesystem remoto, sync-spec §6.1).
 pub async fn list_remote_dir(
-    stream: &mut TcpStream,
+    stream: &mut Link,
     remote_dir: &str,
     with_hash: bool,
 ) -> Result<Vec<Entry>> {
@@ -850,7 +850,7 @@ pub async fn execute_sync<F, Fut>(
 ) -> Result<SyncReport>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TcpStream>>,
+    Fut: std::future::Future<Output = Result<Link>>,
 {
     let start = Instant::now();
     let mut report = SyncReport::default();
@@ -1018,7 +1018,7 @@ where
 async fn run_mkdir_batch<F, Fut>(plan: &Plan, params: &SyncParams, connect: &F) -> Result<Vec<String>>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TcpStream>>,
+    Fut: std::future::Future<Output = Result<Link>>,
 {
     let mut paths = Vec::with_capacity(plan.dirs_to_create.len());
     for rel in &plan.dirs_to_create {
@@ -1067,7 +1067,7 @@ async fn run_delete_batch_files<F, Fut>(
 ) -> Result<Vec<String>>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TcpStream>>,
+    Fut: std::future::Future<Output = Result<Link>>,
 {
     let mut items = Vec::with_capacity(plan.files_to_delete.len());
     for rel in &plan.files_to_delete {
@@ -1085,7 +1085,7 @@ async fn run_delete_batch_dirs<F, Fut>(
 ) -> Result<Vec<String>>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TcpStream>>,
+    Fut: std::future::Future<Output = Result<Link>>,
 {
     let mut items = Vec::with_capacity(plan.dirs_to_delete.len());
     for rel in &plan.dirs_to_delete {
@@ -1105,7 +1105,7 @@ async fn run_delete_batch<F, Fut>(
 ) -> Result<Vec<String>>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TcpStream>>,
+    Fut: std::future::Future<Output = Result<Link>>,
 {
     let expected = items.len();
     let req = DeleteBatchReq { items };

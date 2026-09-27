@@ -49,6 +49,9 @@ mod version;
 mod self_update;
 // Auto-update bidirezionale via TCP (READY <ts> + UPDATE_REQ + updater).
 mod update;
+// TLS 1.3 post-quantum sul canale TCP (spec docs/tls-pq-spec.md):
+// Link unificato plaintext/TLS, cert rcgen, pinning TOFU, AUTH.
+mod tls;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -573,6 +576,21 @@ async fn server_mode(port: u16) -> Result<()> {
     // e ripulisce gli artefatti staged/residui dell'auto-update via TCP.
     update::self_describe();
 
+    // TLS 1.3 post-quantum (spec tls-pq): cert self-signed generato alla
+    // prima esecuzione (crosspilot-server.{key,crt} accanto all'exe) e
+    // acceptor condiviso per le connessioni. Se la generazione fallisce
+    // il server resta plaintext-only (dual-stack di rollout, spec §5).
+    let tls_acceptor = match tls::init_server_tls() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!(
+                "[server] WARNING: TLS non disponibile ({:#}) — solo connessioni plaintext",
+                e
+            );
+            None
+        }
+    };
+
     // Persistent Server Mode
     let shutdown_signal = Arc::new(Notify::new());
 
@@ -586,6 +604,7 @@ async fn server_mode(port: u16) -> Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((mut socket, _)) => {
+                        let tls_acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
                             // Handshake: "READY <BUILD_TS>" — il ts rende il
                             // server self-describing per l'auto-update via TCP
@@ -608,7 +627,7 @@ async fn server_mode(port: u16) -> Result<()> {
                             }
                             let _ = socket.flush().await;
             
-                            if let Err(e) = handle_connection(socket, shutdown_signal).await {
+                            if let Err(e) = handle_connection(socket, tls_acceptor, shutdown_signal).await {
                                 eprintln!("Connection error: {}", e);
                             }
                         });
@@ -714,7 +733,21 @@ async fn kill_listener_on_port_windows(port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) -> Result<()> {
+/// Dispatch di una connessione appena accettata (dopo `READY`).
+///
+/// Rilevamento transport/mode sui primi byte (spec tls-pq §3):
+/// - `0x16 0x03` -> TLS ClientHello -> handshake TLS + AUTH + stessa
+///   mode-detection ripetuta DENTRO il record layer;
+/// - `DFB1`      -> file mode framed in chiaro;
+/// - altro       -> shell mode in chiaro.
+///
+/// Con CROSSPILOT_REQUIRE_TLS=1 il plaintext resta accettato solo per la
+/// whitelist GET §5.1 (grace window per l'auto-update dei client vecchi).
+async fn handle_connection(
+    mut socket: TcpStream,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    shutdown_signal: Arc<Notify>,
+) -> Result<()> {
     // Detection modalità (spec §5): peek cumulativo fino a 4 byte.
     // Se i 4 byte == magic "DFB1" -> modo file (transfer). Altrimenti -> modo shell.
     // peek (non read) non consuma i byte: il socket è intatto per entrambe le modalità.
@@ -747,13 +780,37 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
         }
     }
 
+    // TLS ClientHello: entra nel ramo cifrato. REQUIRE_TLS o dual-stack
+    // e' indifferente — il TLS e' sempre accettato appena lo si riconosce.
+    if tls::looks_like_tls_hello(&peek_buf, filled) {
+        return handle_tls_connection(socket, tls_acceptor, shutdown_signal).await;
+    }
+
+    // Grace plaintext (spec §5.1): con REQUIRE_TLS solo le GET whitelisted
+    // degli artefatti pubblici passano ancora in chiaro — serve al client
+    // vecchio per scaricare .ver+binario e auto-aggiornarsi.
+    let grace_only = tls::require_tls();
+
     // Se abbiamo 4 byte e corrispondono al magic "DFB1" -> modo file transfer.
     if filled == 4 && peek_buf == *b"DFB1" {
         eprintln!("[DEBUG] handle_connection: rilevata modalità file transfer (magic DFB1)");
         // Delega al modulo transfer. Il socket non è stato consumato (peek).
-        if let Err(e) = handle_file_mode(socket).await {
+        let link = tls::Link::plain(socket);
+        if let Err(e) = handle_file_mode(link, grace_only).await {
             eprintln!("[ERROR] file transfer fallito: {}", e);
         }
+        return Ok(());
+    }
+
+    // Shell mode in chiaro: con REQUIRE_TLS vietato (spec §5.1) — si
+    // risponde una riga d'errore leggibile e si chiude, cosi' un client
+    // nuovo vede il motivo invece di un EOF muto.
+    if grace_only {
+        eprintln!("[server] REQUIRE_TLS: rifiutata connessione shell in chiaro");
+        let _ = socket
+            .write_all(b"ERR plaintext disabilitato (CROSSPILOT_REQUIRE_TLS)\n")
+            .await;
+        let _ = socket.flush().await;
         return Ok(());
     }
 
@@ -770,7 +827,106 @@ async fn handle_connection(mut socket: TcpStream, shutdown_signal: Arc<Notify>) 
         eprintln!("[DEBUG] handle_connection: peek timeout, modalità shell");
     }
 
-    // 1. Read command (read riparte dall'inizio: peek non ha consumato i byte).
+    let link = tls::Link::plain(socket);
+    shell_flow(link, shutdown_signal).await
+}
+
+/// Ramo TLS della dispatch (spec tls-pq §3): handshake, AUTH, poi la
+/// STESSA mode-detection ripetuta dentro il record layer (su TLS non
+/// esiste peek: i byte letti vengono ri-accodati in `Link.head`, resi
+/// invisibili al resto del protocollo).
+async fn handle_tls_connection(
+    socket: TcpStream,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    shutdown_signal: Arc<Notify>,
+) -> Result<()> {
+    let acceptor = match tls_acceptor {
+        Some(a) => a,
+        None => {
+            eprintln!("[server] TLS ClientHello ma cert non disponibile — connessione chiusa");
+            return Ok(());
+        }
+    };
+    let stream = match tls::accept_tls(acceptor, socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[server] handshake TLS fallito: {}", e);
+            return Ok(());
+        }
+    };
+    let mut link = tls::Link::tls_server(stream);
+    eprintln!("[DEBUG] TLS handshake ok (TLS 1.3, X25519MLKEM768)");
+
+    // AUTH dentro TLS (spec §8): prima operazione dopo l'handshake —
+    // token errato o assente -> chiusura immediata, nessuno stato
+    // consumato (rigetto pulito).
+    match tls::read_auth_line(&mut link).await {
+        Ok(line) => {
+            if let Err(e) = tls::check_auth_line(&line) {
+                eprintln!("[server] AUTH rifiutata: {}", e);
+                // Chiusura graziosa: poll_shutdown invia close_notify —
+                // senza di esso il client vede un brutto "unexpected EOF"
+                // di rustls invece dell'EOF pulito atteso dalla spec §8.
+                let _ = link.shutdown().await;
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            eprintln!("[server] AUTH mancante/malformata: {}", e);
+            let _ = link.shutdown().await;
+            return Ok(());
+        }
+    }
+
+    // Mode-detection dentro TLS: leggiamo fino a 4 byte (stesso budget
+    // dei 2s del peek in chiaro); i byte restano ri-accedibili al
+    // protocollo sottostante via Link::prepend.
+    let mut det = Vec::with_capacity(4);
+    loop {
+        let mut chunk = [0u8; 4];
+        let read_result = tokio::time::timeout(
+            tls::MODE_DETECT_TIMEOUT,
+            link.read(&mut chunk),
+        )
+        .await;
+        match read_result {
+            Ok(Ok(0)) => break,          // peer chiuso
+            Ok(Ok(n)) => {
+                det.extend_from_slice(&chunk[..n]);
+                if det.len() >= 4 {
+                    break;
+                }
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break,             // timeout -> shell mode
+        }
+    }
+    if det.is_empty() {
+        // Connessione chiusa subito dopo AUTH: niente da dispatchare.
+        return Ok(());
+    }
+    link.prepend(&det);
+
+    if det.as_slice() == b"DFB1" {
+        eprintln!("[DEBUG] handle_tls_connection: file transfer (magic DFB1) dentro TLS");
+        if let Err(e) = handle_file_mode(link, false).await {
+            eprintln!("[ERROR] file transfer TLS fallito: {}", e);
+        }
+        return Ok(());
+    }
+    eprintln!("[DEBUG] handle_tls_connection: shell mode dentro TLS");
+    shell_flow(link, shutdown_signal).await
+}
+
+/// Flusso shell-mode condiviso dai rami plaintext e TLS: legge la riga
+/// di comando (i byte gia' visti nel mode-detection rientrano via
+/// Link::prepend), gestisce quit/exit e il prefisso effimero, poi
+/// esegue e streamma l'output.
+async fn shell_flow(link: tls::Link, shutdown_signal: Arc<Notify>) -> Result<()> {
+    let mut socket = link;
+
+    // 1. Read command (la testa dello stream riporta i byte gia' letti
+    //    nel mode-detection TLS; su plaintext nulla e' stato consumato).
     let mut buf = [0; 1024];
     let n = socket.read(&mut buf).await?;
     if n == 0 {
@@ -835,7 +991,8 @@ const QUIT_AFTER_PREFIX: &str = "crosspilot:quit-after ";
 /// del client (il processo viene ucciso). Estratto da handle_connection
 /// (best-practice: unita' piccole): il caller decide il post-esecuzione —
 /// la modalita' effimera notifica lo shutdown del server a qualunque esito.
-async fn run_shell_command(socket: TcpStream, command_line: &str) -> Result<()> {
+/// `socket` e' un Link: funziona identico su plaintext e dentro TLS.
+async fn run_shell_command(socket: tls::Link, command_line: &str) -> Result<()> {
     // 2. Spawn process
     // ... rest of implementation matches previous logic
     // Detect OS for shell execution
@@ -884,7 +1041,9 @@ async fn run_shell_command(socket: TcpStream, command_line: &str) -> Result<()> 
     let stderr = child.stderr.take().context("Failed to open stderr")?;
 
     // 3. Stream output
-    let (mut socket_reader, mut socket_writer) = socket.into_split();
+    // tokio::io::split funziona su qualunque AsyncRead+AsyncWrite: TcpStream
+    // in chiaro e Link/TLS sono trattati allo stesso modo.
+    let (mut socket_reader, mut socket_writer) = tokio::io::split(socket);
     
     // Notification to kill child if socket drops
     let kill_notify = Arc::new(Notify::new());
@@ -892,7 +1051,7 @@ async fn run_shell_command(socket: TcpStream, command_line: &str) -> Result<()> 
     let kill_notify_clone_write = kill_notify.clone();
 
     // Monitor socket for disconnection (Read EOF)
-    tokio::spawn(async move {
+    let monitor_handle = tokio::spawn(async move {
         let mut buf = [0; 1024];
         // We don't expect any more data from client, so any read returning 0 means EOF (disconnect).
         loop {
@@ -952,6 +1111,11 @@ async fn run_shell_command(socket: TcpStream, command_line: &str) -> Result<()> 
             }
         }
         let _ = socket_writer.flush().await;
+        // Chiusura esplicita del lato scrittura: con tokio::io::split il
+        // drop NON fa shutdown (a differenza di TcpStream::into_split) —
+        // senza di questo il client non vedrebbe mai l'EOF (plaintext) o
+        // il close_notify (TLS) e resterebbe appeso a fine comando.
+        let _ = socket_writer.shutdown().await;
     });
 
     // Wait for child to exit OR kill signal
@@ -970,12 +1134,26 @@ async fn run_shell_command(socket: TcpStream, command_line: &str) -> Result<()> 
     let _ = stderr_handle.await;
     let _ = writer_handle.await;
 
+    // Il task monitor (lettura EOF sul lato read dello split) resterebbe
+    // appeso per sempre se il client non chiude per primo la connessione:
+    // il suo ReadHalf trattiene un Arc verso lo stream condiviso, quindi
+    // la socket resterebbe aperta — un leak fd+task per OGNI comando,
+    // piu' marcato su TLS dove il close_notify non chiude il read side.
+    // A comando terminato il monitor non ha piu' scopo (serve solo a
+    // uccidere il child se il client sparisce a meta'): abort esplicito.
+    monitor_handle.abort();
+
     Ok(())
 }
 
 /// Gestisce la modalità file transfer lato server (spec §5, §6).
 /// Legge il primo messaggio framed (PUT_REQ o GET_REQ) e delega al modulo transfer.
-async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
+///
+/// `grace_only` = connessione plaintext + CROSSPILOT_REQUIRE_TLS (spec
+/// tls-pq §5.1): passa SOLO una GET_REQ whitelisted (artefatti pubblici
+/// per l'auto-update dei client vecchi); qualunque altro msg framed —
+/// PUT, LIST/MKDIR/DELETE, UPDATE_REQ — riceve ERR_PROTO e chiude.
+async fn handle_file_mode(mut socket: tls::Link, grace_only: bool) -> Result<()> {
     // Legge il primo messaggio: il magic "DFB1" è già stato peek-ato ma non consumato,
     // quindi read_msg lo rilegge da capo insieme a version/msg_type/payload.
     //
@@ -998,6 +1176,21 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
         }
     };
 
+    // Grace plaintext §5.1: tutto tranne GET_REQ e' vietato in chiaro
+    // quando REQUIRE_TLS e' attivo (la whitelist del basename sta in
+    // transfer::get_server).
+    if grace_only && msg_type != proto::MSG_GET_REQ {
+        let err = proto::ErrMsg {
+            code: proto::ERR_PROTO,
+            message: format!(
+                "msg type {} non consentito in plaintext con REQUIRE_TLS",
+                msg_type
+            ),
+        };
+        let _ = proto::send_err(&mut socket, &err).await;
+        bail!("operazione framed {} rifiutata in chiaro (REQUIRE_TLS)", msg_type);
+    }
+
     match msg_type {
         proto::MSG_PUT_REQ => {
             let req = proto::decode_put_req(&payload)?;
@@ -1006,8 +1199,8 @@ async fn handle_file_mode(mut socket: TcpStream) -> Result<()> {
         }
         proto::MSG_GET_REQ => {
             let req = proto::decode_get_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: GET_REQ src={}", req.path);
-            transfer::get_server(&mut socket, req).await?;
+            eprintln!("[DEBUG] handle_file_mode: GET_REQ src={} grace={}", req.path, grace_only);
+            transfer::get_server(&mut socket, req, grace_only).await?;
         }
         // Directory sync (sync-spec §5): messaggi LIST/MKDIR_BATCH/DELETE_BATCH.
         proto::MSG_LIST_REQ => {
@@ -1170,26 +1363,32 @@ fn parse_ready_line(text: &str) -> Result<version::ServerHello> {
 }
 
 /// Una connessione TCP + lettura handshake "READY <ts> [<os>]" (singolo
-/// tentativo, niente retry/bootstrap/update). Ritorna il socket e il
-/// ServerHello remoto (ts None = server legacy; os None = OS non
-/// dichiarato). Usata da connect_and_handshake e dall'interno
-/// dell'orchestrazione update (le connessioni di PUT/GET/shell non devono
-/// ri-triggerare il confronto di versione).
-pub(crate) async fn connect_raw(addr: &str) -> Result<(TcpStream, version::ServerHello)> {
+/// tentativo, niente retry/bootstrap/update), poi il gate TLS §4/§5:
+/// server nuovo -> TLS 1.3+PQ con pinning e AUTH; server vecchio ->
+/// plaintext grace (o fatale con REQUIRE_TLS / pin preesistente).
+/// Ritorna il Link finale e il ServerHello remoto (ts None = server
+/// legacy; os None = OS non dichiarato). Usata da connect_and_handshake
+/// e dall'interno dell'orchestrazione update (le connessioni di
+/// PUT/GET/shell non devono ri-triggerare il confronto di versione).
+pub(crate) async fn connect_raw(addr: &str) -> Result<(tls::Link, version::ServerHello)> {
     let mut s = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
         .await
         .context("connect timeout")??;
     let hello = tokio::time::timeout(Duration::from_millis(1500), read_ready_line(&mut s))
         .await
         .context("handshake timeout")??;
-    Ok((s, hello))
+    let link = tls::client_wrap(s, &hello, addr).await?;
+    Ok((link, hello))
 }
 
-/// Stabilisce la connessione TCP al server, verifica l'handshake
-/// "READY <ts>" e orchestra l'auto-update via TCP sul version skew
-/// (update::reconcile). Bootstrap WinRM solo se il server non risponde.
+/// Stabilisce la connessione al server (Link: TLS o plaintext grace),
+/// verifica l'handshake "READY <ts>" e orchestra l'auto-update via TCP
+/// sul version skew (update::reconcile). Bootstrap solo se il server
+/// non risponde. Gli errori TLS fatali (pin mismatch, downgrade,
+/// handshake fallito) NON rientrano nel retry bootstrap: propagano
+/// subito come HostKeyMismatch.
 /// Riutilizzata dai comandi shell (--), transfer file (put/get) e sync.
-async fn connect_and_handshake() -> Result<TcpStream> {
+async fn connect_and_handshake() -> Result<tls::Link> {
     // Risoluzione via envs: CROSSPILOT_<ENV>_<CAMPO> -> fallback CROSSPILOT_<CAMPO>.
     let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
@@ -1209,6 +1408,12 @@ async fn connect_and_handshake() -> Result<TcpStream> {
         let (s, hello) = match conn {
             Ok(v) => v,
             Err(e) => {
+                // Errori TLS fatali: nessun retry, nessun bootstrap —
+                // propagano subito (pin mismatch = possibile MITM,
+                // downgrade = rollback attack, REQUIRE_TLS violato).
+                if e.downcast_ref::<tls::TlsFatal>().is_some() {
+                    return Err(e);
+                }
                 if let Some(dl) = update_deadline {
                     if std::time::Instant::now() < dl {
                         eprintln!("[DEBUG] update in corso, retry... ({})", e);
@@ -1264,6 +1469,17 @@ async fn connect_and_handshake() -> Result<TcpStream> {
         );
         match update::reconcile(hello).await {
             update::Reconcile::Proceed => {
+                // Se la connessione sopravvive in plaintext e' solo
+                // perche' il server e' pre-TLS e l'update non si e'
+                // applicato (NO_UPDATE, UPDATE_TRIED o update fallito):
+                // spec §5.2 — le operazioni utente proseguono ma la
+                // mancanza di cifratura va detta chiaramente.
+                if !s.is_tls() {
+                    eprintln!(
+                        "[WARN] connessione NON cifrata verso {} — server pre-TLS, considerare l'aggiornamento",
+                        addr
+                    );
+                }
                 eprintln!("Connected and verified.");
                 return Ok(s);
             }

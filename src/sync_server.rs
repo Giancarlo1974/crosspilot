@@ -20,7 +20,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::net::TcpStream;
+use crate::tls::Link;
 
 use crate::path;
 use crate::proto::{
@@ -40,7 +40,7 @@ use crate::verify::sha256_file_handle;
 /// containment (reparse point/junction, sync-spec §8.2) e risponde LIST_RES.
 /// Se entry_count supera il cap -> ERR 5. Se path invalido -> ERR 1.
 /// Directory non esistente -> LIST_RES con 0 entry (sync-spec §9 decisione).
-pub async fn list_server(stream: &mut TcpStream, req: &ListReq) -> Result<()> {
+pub async fn list_server(stream: &mut Link, req: &ListReq) -> Result<()> {
     // Valida il path base (transfer-spec §12).
     let validate_result = path::validate_server_path(&req.path);
     if let Err(e) = validate_result {
@@ -232,7 +232,7 @@ fn compute_remote_hash(path: &Path) -> Result<[u8; 32]> {
 
 /// Lato server: gestisce MKDIR_BATCH_REQ. Crea ogni directory (mkdir -p) con
 /// containment check (sync-spec §8.2, §9). Idempotente: esiste già -> status=0.
-pub async fn mkdir_batch_server(stream: &mut TcpStream, req: &MkdirBatchReq) -> Result<()> {
+pub async fn mkdir_batch_server(stream: &mut Link, req: &MkdirBatchReq) -> Result<()> {
     let expected = req.paths.len();
     let mut results = Vec::with_capacity(expected);
     let mut idx = 0usize;
@@ -288,7 +288,7 @@ fn mkdir_single(path_str: &str) -> BatchResult {
 
 /// Lato server: gestisce DELETE_BATCH_REQ. Elimina ogni path (file o dir recursive)
 /// con containment check (sync-spec §8.2, §9). Non esiste -> status=1 (not found).
-pub async fn delete_batch_server(stream: &mut TcpStream, req: &DeleteBatchReq) -> Result<()> {
+pub async fn delete_batch_server(stream: &mut Link, req: &DeleteBatchReq) -> Result<()> {
     let expected = req.items.len();
     let mut results = Vec::with_capacity(expected);
     let mut idx = 0usize;

@@ -699,10 +699,14 @@ async fn self_update_windows(
     std::process::exit(0);
 }
 
-/// Connessione TCP + handshake, SENZA logica di update (uso interno:
+/// Connessione + handshake, SENZA logica di update (uso interno:
 /// le connessioni di PUT/GET/shell dell'orchestrazione non devono
 /// ri-triggerare il reconcile).
-async fn open_conn() -> Result<TcpStream> {
+///
+/// Ritorna `Link`: connect_raw applica il gate TLS (spec tls-pq §4) —
+/// verso un server vecchio e' plaintext (grace per l'update), verso un
+/// server nuovo e' gia' TLS+pin+AUTH.
+async fn open_conn() -> Result<crate::tls::Link> {
     let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
     let addr = format!("{}:{}", host, client_port);
@@ -810,6 +814,20 @@ pub(crate) fn windows_inbound_allow_cmd(port: u16) -> String {
     )
 }
 
+/// Prefisso PATH difensivo per i comandi POSIX eseguiti sul remote in
+/// shell-mode: `sh -c` eredita l'ambiente del PROCESSO SERVER — se il
+/// server e' stato avviato con un PATH minimale (supervisor scarno,
+/// `env -i`, cron) i binari coreutils/util-linux (chmod, setsid, id,
+/// sha256sum, ...) non si trovano e il comando remoto fallisce anche a
+/// sistema sano. Bug osservato in e2e su NixOS:
+/// "sh: line 1: chmod: command not found" -> il functional check dello
+/// staged falliva e l'update abortiva pur essendo tutto sano.
+/// Le dir standard sono APPENDE a $PATH (un PATH custom continua a
+/// funzionare) e includono quella NixOS (/run/current-system/sw/bin).
+/// Il risultato resta un'unica riga (vincolo buffer shell-mode).
+const POSIX_PATH_FALLBACK: &str =
+    "PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/run/current-system/sw/bin\"; ";
+
 /// Implementazione Linux del macro-blocco firewall: script POSIX in
 /// cascata sui frontend comuni — ufw -> firewalld -> iptables -> nft.
 /// Stampa `FW=<esito>` per il log diagnostico. Tutto best-effort:
@@ -834,7 +852,7 @@ pub(crate) fn windows_inbound_allow_cmd(port: u16) -> String {
 /// pub(crate): riusato da bootstrap_ssh (stesso blocco, trasporto ssh).
 pub(crate) fn linux_inbound_allow_script(port: u16) -> String {
     format!(
-        "p={p}; \
+        "{fb}p={p}; \
          S=; [ \"$(id -u)\" -ne 0 ] && sudo -n true 2>/dev/null && S=\"sudo -n\"; \
          if command -v ufw >/dev/null 2>&1; then \
            $S ufw allow $p/tcp >/dev/null 2>&1 && echo FW=ufw || echo FW=fail:ufw; \
@@ -847,6 +865,7 @@ pub(crate) fn linux_inbound_allow_script(port: u16) -> String {
          elif command -v nft >/dev/null 2>&1; then \
            $S nft add rule inet filter input tcp dport $p accept 2>/dev/null && echo FW=nft || echo FW=fail:nft; \
          else echo FW=none; fi",
+        fb = POSIX_PATH_FALLBACK,
         p = port
     )
 }
@@ -919,8 +938,8 @@ fn legacy_spawn_cmd(remote_os: version::RemoteOs, staged: &str, port: u16, targe
     match remote_os {
         version::RemoteOs::Windows => task_spawn_cmd(staged, port, target),
         version::RemoteOs::Linux => format!(
-            "setsid \"{}\" update --target \"{}\" --port {} >/dev/null 2>&1 &",
-            staged, target, port
+            "{}setsid \"{}\" update --target \"{}\" --port {} >/dev/null 2>&1 &",
+            POSIX_PATH_FALLBACK, staged, target, port
         ),
     }
 }
@@ -1045,7 +1064,13 @@ async fn check_staged_runnable(staged: &str, remote_os: version::RemoteOs) -> Re
     // +x): chmod prima dell'esecuzione. Su Windows il bit non esiste.
     let cmd = match remote_os {
         version::RemoteOs::Windows => format!("\"{}\" --version", staged),
-        version::RemoteOs::Linux => format!("chmod 755 \"{}\" && \"{}\" --version", staged, staged),
+        // chmod via PATH di fallback: il sh -c del server remoto puo'
+        // avere un PATH minimale ereditato dal suo ambiente di avvio
+        // (bug e2e: "chmod: command not found" su server senza PATH).
+        version::RemoteOs::Linux => format!(
+            "{}chmod 755 \"{}\" && \"{}\" --version",
+            POSIX_PATH_FALLBACK, staged, staged
+        ),
     };
     eprintln!("[update] functional check staged: {}", cmd);
     let out = send_shell_and_drain(&cmd)
@@ -1116,7 +1141,7 @@ fn task_spawn_cmd(staged: &str, port: u16, target: &str) -> String {
 /// nome crosspilot-*, esistente), lo spawnza detached con
 /// `update --target <self> --wait-pid <pid> --port <porta>`, risponde
 /// UPDATE_RES e termina il processo server per consentire lo swap.
-pub async fn server_apply_update(socket: &mut TcpStream, req: &proto::UpdateReq) -> Result<()> {
+pub async fn server_apply_update(socket: &mut crate::tls::Link, req: &proto::UpdateReq) -> Result<()> {
     let staged = PathBuf::from(&req.staged_path);
     let self_exe = std::env::current_exe().context("current_exe")?;
 

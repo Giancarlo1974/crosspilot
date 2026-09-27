@@ -1,0 +1,104 @@
+# Vendored rustls-pq-addon 0.0.2, portato a ml-kem 0.3 (docs/tls-pq-spec.md).
+#
+# Originale: https://gitlab.torproject.org/nickm/rustls-pq-addon
+# (MIT OR Apache-2.0, autore Nick Mathewson).
+#
+# MOTIVO DEL VENDORING: il crate pubblicato dipende da ml-kem ^0.2.3
+# (kem =0.3.0-pre.0), incompatibile con ml-kem ^0.3 richiesto da russh
+# 0.63.3 (kem ^0.3): le due versioni di `kem` non risolvono insieme.
+# Porting: src/kem.rs + src/hybrid_kem.rs aggiornati alla nuova API
+# ml-kem 0.3 (EncapsulationKey/DecapsulationKey top-level, trait
+# kem::{Kem, Encapsulate, Decapsulate, TryKeyInit, KeyExport},
+# SharedKey infallibile); src/rng.rs implementa anche rand_core 0.10
+# (TryRng/Rng/TryCryptoRng) accanto a rand_core 0.6 (x25519-dalek).
+# Rimossi i dev-deps su rustls/aws_lc_rs: niente toolchain C.
+
+[package]
+edition = "2021"
+rust-version = "1.85.0"
+name = "rustls-pq-addon"
+version = "0.0.2"
+authors = ["Nick Mathewson <nickm@torproject.org>"]
+build = false
+autolib = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A pure-rust implementation of post-quantum hybrid TLS key exchange groups for use with rustls"
+readme = "README.md"
+keywords = [
+    "rustls",
+    "postquantum",
+    "hybrid",
+]
+categories = ["cryptography"]
+license = "MIT OR Apache-2.0"
+repository = "https://gitlab.torproject.org/nickm/rustls-pq-addon"
+
+[features]
+all_groups = [
+    "p256",
+    "p384",
+    "x25519",
+]
+default = [
+    "x25519",
+    "thread_rng",
+]
+p256 = ["dep:p256"]
+p384 = ["dep:p384"]
+thread_rng = ["dep:rand"]
+x25519 = ["dep:x25519-dalek"]
+
+[lib]
+name = "rustls_pq_addon"
+path = "src/lib.rs"
+
+[dependencies.ml-kem]
+version = "0.3"
+
+[dependencies.p256]
+version = "0.13.2"
+features = ["ecdh"]
+optional = true
+default-features = false
+
+[dependencies.p384]
+version = "0.13.1"
+features = ["ecdh"]
+optional = true
+default-features = false
+
+[dependencies.paste]
+version = "1.0.15"
+
+[dependencies.rand]
+version = "0.10"
+optional = true
+
+# x25519-dalek usa rand_core 0.6 (EphemeralSecret::random_from_rng).
+[dependencies.rand_core_06]
+version = "0.6.4"
+features = ["std"]
+package = "rand_core"
+
+# ml-kem 0.3 usa rand_core 0.10 (trait TryRng/TryCryptoRng/CryptoRng).
+[dependencies.rand_core_10]
+version = "0.10"
+package = "rand_core"
+
+[dependencies.rustls]
+version = "0.23.36"
+default-features = false
+
+[dependencies.thiserror]
+version = "2.0.18"
+
+[dependencies.x25519-dalek]
+version = "2.0.1"
+features = ["zeroize"]
+optional = true
+default-features = false
+
+[dependencies.zeroize]
+version = "1.8.2"
