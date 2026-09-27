@@ -22,6 +22,8 @@ mod verify;
 mod transfer;
 // Modulo directory sync (vedi docs/sync-spec.md).
 mod sync;
+// File .crosspilotignore nel source (pattern di esclusione automatici).
+mod sync_ignore;
 // Handler server per sync (separato da sync.rs per dimensione, best-practice < 1000 righe).
 mod sync_server;
 // Modulo bootstrap: selezione canale (prescan+candidati) + path WinRM
@@ -302,17 +304,26 @@ enum Commands {
         /// Esclude i path che matchano il pattern glob (ripetibile:
         /// --exclude 'data/postgres' --exclude '*.log'). Un path escluso
         /// non e' ne' confrontato ne' candidato a sync/delete.
+        /// Si aggiunge al file .crosspilotignore del source (stesso
+        /// formato, un pattern per riga, '#' commenti) caricato sempre.
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// Mirror one-way upload (Linux -> Windows) della directory.
-    /// Accetta anche un FILE singolo come sorgente (dispatch interno a put).
+    /// Mirror one-way upload (Linux -> remoto) della directory.
+    /// Accetta anche un FILE singolo come sorgente (dispatch interno a put):
+    /// in quel caso remote_dir puo' essere una directory (esistente o con
+    /// '/' finale -> dir/basename) oppure il path file completo di
+    /// destinazione — semantica rsync, rename incluso.
     /// Directory remote non leggibili: warning + continua (non abortisce);
     /// in quel caso --delete viene sospeso per sicurezza.
     Sync {
         /// Directory sorgente locale (Linux) oppure file singolo.
+        /// Se contiene .crosspilotignore, i suoi pattern glob (uno per
+        /// riga, '#' commenti) sono esclusi automaticamente.
         local_dir: String,
-        /// Directory destinazione remota (Windows, path assoluto).
+        /// Directory destinazione remota (path assoluto). Con sorgente
+        /// FILE: directory esistente/'/' finale -> <dir>/<basename>,
+        /// altrimenti path file di destinazione.
         remote_dir: String,
         /// Cancella su dest i file/directory non presenti nel source (default OFF).
         #[arg(long)]
@@ -414,6 +425,9 @@ async fn main() -> Result<()> {
     // -q resta accettato per compat e forza quiet anche in presenza di -v.
     let cli = Cli::parse();
     log::set_quiet(cli.quiet || !cli.verbose);
+    // -q ESPLICITO: l'auto-verbose dell'auto-update non deve mai
+    // scavalcarlo (contratto machine-readable per script/CI).
+    log::set_quiet_forced(cli.quiet);
     // Write-back .env opt-in per il drift identita' remota (spec §4).
     if cli.fix_env {
         envs::set_fix_env(true);
@@ -2008,14 +2022,20 @@ async fn client_sync_status(
 
     // 1 connessione per LIST (una connessione serve tutto il sync).
     let mut socket = connect_and_handshake().await?;
-    let outcome = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
+    let outcome = sync::list_remote_dir(&mut socket, remote_dir, checksum, true).await?;
 
     // Walk locale (skip non-UTF8 + riservati Windows + dir illeggibili).
-    let mut local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+    let local_path = std::path::Path::new(local_dir);
+    let mut local_walk = sync::walk_local_dir(local_path)?;
 
-    // --exclude: filtra entrambi i lati PRIMA del diff (esclusi = ignorati).
+    // Esclusioni: .crosspilotignore (nel source) + --exclude CLI, filtrano
+    // entrambi i lati PRIMA del diff (esclusi = ignorati).
+    let mut all_excludes = sync_ignore::load_ignore_patterns(local_path);
+    for pat in exclude {
+        all_excludes.push(pat.clone());
+    }
     let mut remote_entries = outcome.entries;
-    sync::apply_exclusions(&mut local_walk, &mut remote_entries, exclude);
+    sync::apply_exclusions(&mut local_walk, &mut remote_entries, &all_excludes);
 
     // Diff (con lowercase per case-insensitivity Windows, sync-spec §8.1).
     let mut diff = sync::compute_diff(
@@ -2027,6 +2047,19 @@ async fn client_sync_status(
     // Le dir remote illeggibili arrivano nel trailer LIST_RES: il contenuto
     // e' sconosciuto, va mostrato come warning (non come "identico").
     diff.skipped_remote = outcome.skipped;
+
+    // Caveat size-only: senza --checksum i file "identici" lo sono solo
+    // per dimensione — il caso diverso-contenuto non e' piu' silenzioso.
+    if !checksum {
+        let identical_files = sync::count_identical_files(&diff);
+        if identical_files > 0 {
+            eprintln!(
+                "[WARN] {} file considerati identici per sola dimensione — \
+                 usa --checksum per confronto contenuto",
+                identical_files
+            );
+        }
+    }
 
     // Output testuale (o riepilogo numerico se --quiet esplicito:
     // subcommand o -q globale — NON is_quiet(), che ora e' default-on).
@@ -2049,8 +2082,12 @@ async fn client_sync(
 ) -> Result<()> {
     let local_dir = params.local_dir.as_str();
     let remote_dir = params.remote_dir.as_str();
-    // Sorgente FILE singolo (richiesta utente): dispatch a put — remote_dir
-    // e' trattata come directory di destinazione (dest = remote_dir/basename).
+    // Sorgente FILE singolo (richiesta utente): dispatch a put.
+    // Bug fix (report utente): remote_dir era SEMPRE trattata come
+    // directory -> sync a.conf .../a.conf produceva .../a.conf/a.conf e
+    // ERR 3 su .part. Ora il dest si risolve con semantica rsync:
+    // directory esistente (o '/' finale) -> dir/basename, altrimenti il
+    // remote arg E' il path file di destinazione (rename incluso).
     let local_path = std::path::Path::new(local_dir);
     if local_path.is_file() {
         let base = local_path
@@ -2061,8 +2098,35 @@ async fn client_sync(
             eprintln!("[ERROR] sync: basename non ricavabile da {}", local_dir);
             std::process::exit(2);
         }
-        let remote_dst = sync::join_remote_path(remote_dir, &base);
-        return client_transfer_put(local_dir, &remote_dst, false, quit_after).await;
+        // Una sola connessione: probe LIST del parent + PUT (file-mode
+        // persistente, i messaggi si incolonnano sulla stessa sessione).
+        let mut socket = connect_and_handshake().await?;
+        let resolved = sync::resolve_remote_file_dest(&mut socket, remote_dir).await?;
+        let remote_dst = match resolved {
+            sync::RemoteFileDest::Dir(dir) => {
+                // '/' finale o directory esistente: dest = dir/basename.
+                // La crea se mancante (mkdir -p idempotente).
+                sync::ensure_remote_dir(&mut socket, &dir).await?;
+                let joined = sync::join_remote_path(&dir, &base);
+                eprintln!("[sync] destinazione remota (directory): {}", joined);
+                joined
+            }
+            sync::RemoteFileDest::File(p) => {
+                eprintln!("[sync] destinazione remota (file): {}", p);
+                p
+            }
+        };
+        let put_result = transfer::put_client(&mut socket, local_dir, &remote_dst).await;
+        if quit_after {
+            ephemeral_quit_best_effort().await;
+        }
+        put_result?;
+        crate::qprintln!(
+            "sync file: trasferimento completato ({} -> {})",
+            local_dir,
+            remote_dst
+        );
+        return Ok(());
     }
 
     // Valida local_dir prima di connettersi (fail-fast, exit code 2).
@@ -2073,14 +2137,19 @@ async fn client_sync(
 
     // 1 connessione per LIST (la sessione persistente la riusa per il sync).
     let mut socket = connect_and_handshake().await?;
-    let outcome = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
+    let outcome = sync::list_remote_dir(&mut socket, remote_dir, checksum, true).await?;
 
     // Walk locale.
     let mut local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
 
-    // --exclude: filtra entrambi i lati PRIMA del diff (esclusi = ignorati).
+    // Esclusioni: pattern di .crosspilotignore (nel source) + --exclude
+    // CLI. Filtra entrambi i lati PRIMA del diff (esclusi = ignorati).
+    let mut all_excludes = sync_ignore::load_ignore_patterns(local_path);
+    for pat in exclude {
+        all_excludes.push(pat.clone());
+    }
     let mut remote_entries = outcome.entries;
-    sync::apply_exclusions(&mut local_walk, &mut remote_entries, exclude);
+    sync::apply_exclusions(&mut local_walk, &mut remote_entries, &all_excludes);
 
     // Diff + piano.
     let mut diff = sync::compute_diff(
@@ -2090,6 +2159,22 @@ async fn client_sync(
         std::path::Path::new(local_dir),
     );
     diff.skipped_remote = outcome.skipped;
+
+    // Caveat size-only (report utente): senza --checksum un file con
+    // stessa dimensione ma contenuto diverso passa inosservato come
+    // IDENTICAL. Il default resta size (veloce, spec §6) ma il caso non
+    // deve piu' essere silenzioso: warn esplicita se ci sono file marcati
+    // identici per sola dimensione.
+    if !checksum {
+        let identical_files = sync::count_identical_files(&diff);
+        if identical_files > 0 {
+            eprintln!(
+                "[WARN] {} file considerati identici per sola dimensione — \
+                 usa --checksum per confronto contenuto",
+                identical_files
+            );
+        }
+    }
     let plan = sync::build_plan(&diff, params.delete);
 
     // Esecuzione: connect_and_handshake è la callback di connessione della
@@ -2098,7 +2183,7 @@ async fn client_sync(
         sync::execute_sync(&plan, &params, || async { connect_and_handshake().await }).await?;
 
     // Report finale.
-    sync::print_sync_report(&report, params.quiet);
+    sync::print_sync_report(&report, params.quiet, params.dry_run);
 
     // --ephemeral: il quit va inviato PRIMA dell'eventuale exit(1) per
     // errori di sync — un agente effimero non deve restare appeso per

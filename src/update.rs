@@ -203,6 +203,7 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
                 eprintln!("[update] self-update gia' tentato: proseguo col binario locale.");
                 return Reconcile::Proceed;
             }
+            enable_verbose_for_update();
             eprintln!(
                 "[update] remote piu' nuovo (ts={} > {}): self-update via TCP...",
                 t, local
@@ -226,6 +227,7 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
                 eprintln!("[update] update remoto gia' tentato: proseguo.");
                 return Reconcile::Proceed;
             }
+            enable_verbose_for_update();
             eprintln!(
                 "[update] remote {:?} piu' vecchio del locale (ts={}): update via TCP...",
                 remote_ts, local
@@ -268,6 +270,19 @@ pub async fn reconcile(hello: version::ServerHello) -> Reconcile {
                 }
             }
         }
+    }
+}
+
+/// Un auto-update e' un'operazione lunga e insolita: se la diagnostica
+/// era in quiet di default (comando lanciato senza -v) la riapre per
+/// visibilita' — l'utente deve vedere PUT/progressi/attese invece di un
+/// client apparentemente fermo (richiesta utente). `-q` ESPLICITO non
+/// viene scavalcato (contratto machine-readable): in quel caso la riga
+/// "[update] ..." sopra resta l'unica evidenza.
+fn enable_verbose_for_update() {
+    let enabled = crate::log::verbose_unless_forced();
+    if enabled {
+        eprintln!("[update] diagnostica attivata automaticamente per l'auto-update.");
     }
 }
 

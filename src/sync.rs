@@ -340,20 +340,24 @@ pub struct ListOutcome {
 /// Lato client: invia LIST_REQ e legge LIST_RES (o ERR).
 /// Ritorna entry remote + skipped. `with_hash` controlla se il server include
 /// SHA-256 per i file (un solo passaggio sul filesystem remoto, sync-spec §6.1).
+/// `recursive` = false lista solo il livello top della directory (probe
+/// poco costosi, es. resolve_remote_file_dest).
 pub async fn list_remote_dir(
     stream: &mut Link,
     remote_dir: &str,
     with_hash: bool,
+    recursive: bool,
 ) -> Result<ListOutcome> {
-    // Costruisce la ListReq: recursive=1 (tutto l'albero), with_hash dal flag.
+    // Costruisce la ListReq: recursive dal flag, with_hash dal flag.
     let req = ListReq {
         path: remote_dir.to_string(),
-        recursive: 1,
+        recursive: if recursive { 1 } else { 0 },
         with_hash: if with_hash { 1 } else { 0 },
     };
     crate::qprintln!(
-        "[DEBUG] list_remote_dir: LIST_REQ path={} recursive=1 with_hash={}",
+        "[DEBUG] list_remote_dir: LIST_REQ path={} recursive={} with_hash={}",
         remote_dir,
+        req.recursive,
         req.with_hash
     );
     proto::send_list_req(stream, &req).await?;
@@ -947,6 +951,181 @@ pub fn join_remote_path(remote_dir: &str, rel_path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Destinazione di `sync <file> <remote>` - risoluzione file vs directory.
+// ---------------------------------------------------------------------------
+
+/// Esito della risoluzione di `remote_dir` quando il source e' un FILE singolo.
+#[derive(Debug)]
+pub enum RemoteFileDest {
+    /// Il remote e' una directory (esistente, o '/' finale): il file va
+    /// in `<dir>/<basename>`.
+    Dir(String),
+    /// Il remote e' il path FILE completo di destinazione (rename supportato).
+    File(String),
+}
+
+/// Risolve `remote_dir` per `sync <file> <remote>`.
+///
+/// Bug report: il remote era SEMPRE trattato come directory, quindi
+/// `sync default.conf /var/docker/.../default.conf` produceva
+/// `.../default.conf/default.conf` e falliva con `ERR 3: impossibile
+/// creare .part`. Ora la semantica e' quella di rsync:
+/// - '/' (o '\') finale -> directory esplicita;
+/// - path esistente come DIRECTORY sul remote -> directory;
+/// - qualunque altro caso (file esistente, path mancante) -> il remote
+///   arg E' il path file di destinazione (rename incluso).
+///
+/// Il tipo remoto si scopre con UNA LIST non-ricorsiva della directory
+/// PADRE: LIST sul path stesso non distingue "dir vuota" da "inesistente"
+/// (entrambe rispondono 0 entry), mentre il parent dice se il basename
+/// esiste ed e' una directory.
+pub async fn resolve_remote_file_dest(
+    stream: &mut Link,
+    remote_dir: &str,
+) -> Result<RemoteFileDest> {
+    // '/' o '\' finale = intento directory esplicito (la creazione se
+    // mancante e' demandata a ensure_remote_dir dal caller).
+    let stripped = remote_dir.trim_end_matches(['/', '\\']);
+    if stripped.len() < remote_dir.len() {
+        // Root secche da NON "snudare": "/" -> stripped "" e "C:\" ->
+        // stripped "C:" (drive-relative, non la root). In quei casi il
+        // remote e' gia' la directory.
+        let is_bare_root = stripped.is_empty()
+            || (stripped.len() == 2 && stripped.ends_with(':'));
+        let dir = if is_bare_root {
+            remote_dir.to_string()
+        } else {
+            stripped.to_string()
+        };
+        crate::qprintln!(
+            "[DEBUG] sync file: remote '{}' -> directory (separatore finale)",
+            remote_dir
+        );
+        return Ok(RemoteFileDest::Dir(dir));
+    }
+
+    // Scomposizione parent/basename sul separatore finale ('/' o '\'):
+    // senza separatore non c'e' parent da ispezionare -> path file.
+    let split = remote_parent_and_base(remote_dir);
+    let (parent, remote_base) = match split {
+        Some(pb) => pb,
+        None => {
+            crate::qprintln!(
+                "[DEBUG] sync file: remote '{}' senza separatore -> path file",
+                remote_dir
+            );
+            return Ok(RemoteFileDest::File(remote_dir.to_string()));
+        }
+    };
+
+    // Probe: LIST del parent (NON ricorsiva — serve solo il tipo del
+    // basename, non il contenuto). Il confronto e' case-insensitive come
+    // il diff (sync-spec §8.1): su Windows "Conf.d" == "conf.d".
+    let probe = list_remote_dir(stream, &parent, false, false).await;
+    let base_lower = remote_base.to_lowercase();
+    match probe {
+        Ok(outcome) => {
+            for entry in &outcome.entries {
+                let entry_lower = entry.rel_path.to_lowercase();
+                if entry_lower == base_lower && entry.is_dir == 1 {
+                    crate::qprintln!(
+                        "[DEBUG] sync file: remote '{}' e' una directory esistente",
+                        remote_dir
+                    );
+                    return Ok(RemoteFileDest::Dir(remote_dir.to_string()));
+                }
+            }
+            crate::qprintln!(
+                "[DEBUG] sync file: remote '{}' non e' directory esistente -> path file",
+                remote_dir
+            );
+        }
+        Err(e) => {
+            // Probe fallito (parent invalido/illeggibile): il dest resta il
+            // path file — un eventuale errore reale emerga al PUT, non qui.
+            crate::qprintln!(
+                "[DEBUG] sync file: probe parent '{}' fallita ({}) -> dest come path file",
+                parent,
+                e
+            );
+        }
+    }
+    Ok(RemoteFileDest::File(remote_dir.to_string()))
+}
+
+/// Scompone un remote path in (parent, basename) sull'ULTIMO separatore
+/// ('/' o '\'). Casi limite: "/x" -> parent "/" (non ""); "C:\x" ->
+/// parent "C:\" (non "C:", che sarebbe drive-relative). Senza separatore
+/// -> None (nessun parent da ispezionare). Funzione pura (testabile
+/// senza rete, best-practice: logica separata dal probe).
+fn remote_parent_and_base(remote_dir: &str) -> Option<(String, String)> {
+    let pos = remote_dir.rfind(['/', '\\'])?;
+    let base = remote_dir[pos + 1..].to_string();
+    if base.is_empty() {
+        return None;
+    }
+    let parent_slice = &remote_dir[..pos];
+    let mut parent = if parent_slice.is_empty() {
+        remote_dir[..=pos].to_string()
+    } else {
+        parent_slice.to_string()
+    };
+    if parent.ends_with(':') {
+        parent.push('\\');
+    }
+    Some((parent, base))
+}
+
+/// Crea una directory remota (mkdir -p idempotente) via MKDIR_BATCH.
+/// Usata quando il dest di un sync-file e' dichiarato directory ('/'
+/// finale) ma potrebbe non esistere ancora sul remote.
+pub async fn ensure_remote_dir(stream: &mut Link, dir: &str) -> Result<()> {
+    let req = MkdirBatchReq {
+        paths: vec![dir.to_string()],
+    };
+    proto::send_mkdir_batch_req(stream, &req).await?;
+    let (msg_type, payload) = proto::read_msg(stream).await?;
+    if msg_type == MSG_ERR {
+        let err = proto::decode_err(&payload)?;
+        bail!("MKDIR rifiutato: ERR {}: {}", err.code, err.message);
+    }
+    if msg_type != MSG_MKDIR_BATCH_RES {
+        bail!(
+            "ensure_remote_dir: atteso MKDIR_BATCH_RES (tipo {}), ricevuto tipo {}",
+            MSG_MKDIR_BATCH_RES,
+            msg_type
+        );
+    }
+    let res = proto::decode_mkdir_batch_res(&payload, 1)?;
+    for r in &res.results {
+        if r.status == 2 {
+            bail!("mkdir remoto '{}' fallito: ERR {}: {}", dir, r.code, r.message);
+        }
+    }
+    Ok(())
+}
+
+/// Conta i FILE marcati Identical nel diff (le directory non contano: per
+/// loro "identical" significa solo presente su entrambi i lati). Usato dal
+/// warning "confronto per sola dimensione" quando --checksum non e' attivo.
+pub fn count_identical_files(diff: &Diff) -> usize {
+    let mut n = 0usize;
+    for e in &diff.entries {
+        if e.status != EntryStatus::Identical {
+            continue;
+        }
+        let local_is_dir = match &e.local {
+            Some(l) => l.is_dir == 1,
+            None => false,
+        };
+        if !local_is_dir {
+            n += 1;
+        }
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
 // Output testuale - sync-spec §10 (status), §11 (sync).
 // ---------------------------------------------------------------------------
 
@@ -1042,10 +1221,16 @@ pub fn print_plan(plan: &Plan) {
 }
 
 /// Stampa il riepilogo finale di sync (sync-spec §11).
-pub fn print_sync_report(report: &SyncReport, quiet: bool) {
+/// Con `dry_run` i contatori riflettono il PIANO (nessuna op eseguita):
+/// il testo lo dice esplicitamente — prima stampava "0 trasferiti" anche
+/// con un piano pieno e l'utente doveva contare le righe PUT a mano
+/// (bug report sul riepilogo fuorviante).
+pub fn print_sync_report(report: &SyncReport, quiet: bool, dry_run: bool) {
     if quiet {
+        let dry_tag = if dry_run { "dry_run=1 " } else { "" };
         eprintln!(
-            "[sync] put={} delete={} skip={} errors={} bytes={} delta={} time={:.1}s",
+            "[sync] {}put={} delete={} skip={} errors={} bytes={} delta={} time={:.1}s",
+            dry_tag,
             report.put_count,
             report.delete_count,
             report.skip_count,
@@ -1059,16 +1244,27 @@ pub fn print_sync_report(report: &SyncReport, quiet: bool) {
         for err in &report.errors {
             eprintln!("[sync] ERRORE {}", err);
         }
-        eprintln!(
-            "[sync] completato: {} trasferiti ({} byte totali, delta {} byte), {} cancellati, {} saltati, {} errori, {:.1}s",
-            report.put_count,
-            report.bytes_total,
-            report.delta_bytes,
-            report.delete_count,
-            report.skip_count,
-            report.error_count,
-            report.elapsed.as_secs_f64()
-        );
+        if dry_run {
+            eprintln!(
+                "[sync] dry-run (nessuna modifica remota): {} da trasferire ({} byte totali), {} da cancellare, {} saltati, {} conflict/errori",
+                report.put_count,
+                report.bytes_total,
+                report.delete_count,
+                report.skip_count,
+                report.error_count
+            );
+        } else {
+            eprintln!(
+                "[sync] completato: {} trasferiti ({} byte totali, delta {} byte), {} cancellati, {} saltati, {} errori, {:.1}s",
+                report.put_count,
+                report.bytes_total,
+                report.delta_bytes,
+                report.delete_count,
+                report.skip_count,
+                report.error_count,
+                report.elapsed.as_secs_f64()
+            );
+        }
     }
 }
 
@@ -1247,8 +1443,35 @@ where
     }
 
     // --dry-run: stampa il piano ed esci (sync-spec §7 passo 4, §14 test 8).
+    // Bug fix (report utente): i contatori del riepilogo contavano solo le
+    // operazioni ESEGUITE -> in dry-run stampavano sempre 0/0/0 anche con
+    // un piano pieno, e l'utente doveva fare grep manuale sulle righe PUT.
+    // Ora il report riflette il piano: files_to_put -> put_count, i set di
+    // cancellazione -> delete_count, tutte le categorie SKIP stampate da
+    // print_plan -> skip_count, i conflict -> error_count.
     if params.dry_run {
         print_plan(plan);
+        report.put_count = plan.files_to_put.len() as u32;
+        let del_files = plan.files_to_delete.len() as u32;
+        let del_dirs = plan.dirs_to_delete.len() as u32;
+        report.delete_count = del_files + del_dirs;
+        let mut skip_total = plan.skipped_identical.len();
+        skip_total += plan.skipped_non_utf8.len();
+        skip_total += plan.skipped_reserved.len();
+        skip_total += plan.skipped_unreadable.len();
+        skip_total += plan.skipped_remote.len();
+        report.skip_count = skip_total as u32;
+        report.error_count = plan.conflicts.len() as u32;
+        // bytes_total: somma delle dimensioni locali dei file da trasferire
+        // (stat locale, nessuna op remota). delta_bytes resta 0: il delta
+        // reale e' calcolabile solo trasferendo.
+        for rel in &plan.files_to_put {
+            let full = local_dir.join(rel);
+            let meta = fs::metadata(&full);
+            if let Ok(m) = meta {
+                report.bytes_total += m.len();
+            }
+        }
         report.elapsed = start.elapsed();
         return Ok(report);
     }
@@ -1257,8 +1480,15 @@ where
     // (reconnect-on-drop + fallback one-shot su server legacy).
     let mut session = SyncSession::new(connect);
 
-    // --- Passo 5: MKDIR_BATCH (tutte le dirs_to_create in un batch) ---
-    if !plan.dirs_to_create.is_empty() {
+    // --- Passo 5: MKDIR_BATCH (remote_dir + tutte le dirs_to_create) ---
+    // Il batch si manda anche quando dirs_to_create e' vuoto ma ci sono
+    // file da trasferire: il remote_dir stesso e' il primo path del batch
+    // (mkdir -p idempotente). Senza questo, sync su root remota NUOVA con
+    // sorgente piatto (solo file top-level) falliva al primo PUT con
+    // ERR 3 su .part — nessun MKDIR creava la root (bug latente: la spec
+    // §9 presuppone "dest nuovo = caso comune" ma la root non era mai
+    // creata esplicitamente).
+    if !plan.dirs_to_create.is_empty() || !plan.files_to_put.is_empty() {
         let mkdir_result = run_mkdir_batch(plan, params, &mut session).await;
         match mkdir_result {
             Ok(mkdir_errors) => {
@@ -1269,7 +1499,7 @@ where
                 }
                 if !params.quiet {
                     crate::qprintln!(
-                        "[sync] MKDIR  {} directory create",
+                        "[sync] MKDIR  {} directory create (root inclusa)",
                         plan.dirs_to_create.len()
                     );
                 }
@@ -1415,18 +1645,25 @@ where
 
 /// Esegue MKDIR_BATCH_REQ sulla connessione della sessione. Ritorna la lista
 /// di messaggi di errore per-path (status=2). Count mismatch -> errore fatale.
+/// Il primo path del batch e' sempre il remote_dir stesso (mkdir -p
+/// idempotente): garantisce la root di destinazione anche quando non ci
+/// sono sotto-directory da creare (sync su dest nuovo con source piatto).
 async fn run_mkdir_batch(
     plan: &Plan,
     params: &SyncParams,
     session: &mut SyncSession,
 ) -> Result<Vec<String>> {
-    let mut paths = Vec::with_capacity(plan.dirs_to_create.len());
+    let mut paths = Vec::with_capacity(plan.dirs_to_create.len() + 1);
+    // Root remota per prima: i genitori vengono sempre prima dei figli
+    // (mkdir -p la creerebbe comunque, ma esplicitarla rende l'errore di
+    // validazione/containment della ROOT diagnosticabile subito).
+    paths.push(params.remote_dir.clone());
     for rel in &plan.dirs_to_create {
         let full = join_remote_path(&params.remote_dir, rel);
         paths.push(full);
     }
     let req = MkdirBatchReq { paths };
-    let expected = plan.dirs_to_create.len();
+    let expected = req.paths.len();
 
     let payload = session
         .op(async |socket: &mut Link| {
@@ -1453,7 +1690,13 @@ async fn run_mkdir_batch(
     while idx < res.results.len() {
         let r = &res.results[idx];
         if r.status == 2 {
-            let rel = &plan.dirs_to_create[idx];
+            // Il primo risultato riguarda il remote_dir (root), i successivi
+            // seguono l'ordine di dirs_to_create.
+            let rel = if idx == 0 {
+                params.remote_dir.as_str()
+            } else {
+                plan.dirs_to_create[idx - 1].as_str()
+            };
             errors.push(format!("{}: server ERR {}: {}", rel, r.code, r.message));
         }
         idx += 1;
@@ -2019,6 +2262,31 @@ mod tests {
         assert_eq!(joined_slash, "/tmp/remote/file.txt");
     }
 
+    // --- remote_parent_and_base (risoluzione dest file singolo) ---------
+
+    #[test]
+    fn remote_parent_and_base_splits() {
+        // Unix: split sull'ultimo '/'.
+        let (p, b) = remote_parent_and_base("/var/docker/nginx/conf.d/default.conf").unwrap();
+        assert_eq!(p, "/var/docker/nginx/conf.d");
+        assert_eq!(b, "default.conf");
+        // Root unix: il parent di "/x" e' "/" non "".
+        let (p2, b2) = remote_parent_and_base("/x").unwrap();
+        assert_eq!(p2, "/");
+        assert_eq!(b2, "x");
+        // Windows: split su '\'; il parent di "C:\x" e' "C:\" non "C:".
+        let (p3, b3) = remote_parent_and_base("C:\\ci\\conf\\app.conf").unwrap();
+        assert_eq!(p3, "C:\\ci\\conf");
+        assert_eq!(b3, "app.conf");
+        let (p4, b4) = remote_parent_and_base("C:\\x").unwrap();
+        assert_eq!(p4, "C:\\");
+        assert_eq!(b4, "x");
+        // Senza separatore -> None (nessun parent).
+        assert!(remote_parent_and_base("app.conf").is_none());
+        // Basename vuoto (trailing sep non gestito qui) -> None.
+        assert!(remote_parent_and_base("/dir/").is_none());
+    }
+
     // --- Esclusioni --exclude (glob semplice) -------------------------------
 
     #[test]
@@ -2052,6 +2320,50 @@ mod tests {
         assert!(glob_match("x", "x"));
         assert!(!glob_match("x", "xy"));
         assert!(glob_match("", ""));
+    }
+
+    // --- execute_sync --dry-run (bug report: riepilogo sempre 0/0/0) -----
+
+    #[tokio::test]
+    async fn dry_run_report_reflects_plan() {
+        // Bug report: --dry-run stampava "0 trasferiti, 0 saltati, 0 errori"
+        // anche con un piano pieno — i contatori ignoravano il dry-run.
+        // Ora il report riflette il piano (PUT/DELETE/SKIP/CONFLICT).
+        let root = std::env::temp_dir().join("crosspilot_dry_run_report");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"hello").unwrap();
+
+        let plan = Plan {
+            files_to_put: vec!["a.txt".to_string()],
+            files_to_delete: vec!["gone.txt".to_string()],
+            dirs_to_delete: vec!["old".to_string()],
+            skipped_identical: vec!["same.txt".to_string()],
+            skipped_remote: vec!["denied".to_string()],
+            conflicts: vec![("conf".to_string(), "file vs dir".to_string())],
+            ..Default::default()
+        };
+        let params = SyncParams {
+            local_dir: root.to_string_lossy().into_owned(),
+            remote_dir: "/remote".to_string(),
+            delete: true,
+            dry_run: true,
+            quiet: false,
+        };
+        // Connect callback che fallirebbe se chiamata: prova che il
+        // dry-run non tocca la rete.
+        let connect = || async {
+            Err::<Link, anyhow::Error>(anyhow!("dry-run non deve connettersi"))
+        };
+        let report = execute_sync(&plan, &params, connect).await.unwrap();
+        assert_eq!(report.put_count, 1);
+        assert_eq!(report.delete_count, 2);
+        // skipped_identical + skipped_remote = 2 righe SKIP stampate.
+        assert_eq!(report.skip_count, 2);
+        assert_eq!(report.error_count, 1);
+        assert_eq!(report.bytes_total, 5);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     // --- Helper di test ----------------------------------------------------

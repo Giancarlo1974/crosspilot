@@ -15,6 +15,18 @@
 //!    Su remote Windows il join con spazi resta (semantica cmd.exe
 //!    storicamente documentata: "i token sono uniti con spazi").
 //!
+//!    Eccezioni al quoting (bug report "niente comandi composti"):
+//!    - **token singolo**: `crosspilot -- "cmd1 && cmd2"` era quotato come
+//!      `'cmd1 && cmd2'` -> sh remoto lo leggeva come UN nome di comando ->
+//!      "No such file or directory". Un token unico dopo `--` E' una
+//!      command-line completa: passa raw (l'unica interpretazione utile).
+//!    - **operatori shell puri** (`&&`, `||`, `;`, `|`, `&`, `>`, `>>`,
+//!      `2>`, `2>&1`, `&>` ...): un token fatto solo di metacaratteri
+//!      shell non puo' essere un argomento — se quotato non funzionera'
+//!      MAI come operatore. Passa raw: `crosspilot -- a '&&' b` funziona.
+//!      Un token come `a&&b` (testo + metacaratteri) resta quotato:
+//!      e' un argomento letterale, non un operatore.
+//!
 //! 2. **Subcommand `run`**: upload script in tmp remoto + esecuzione +
 //!    cleanup. Path tmp e interprete dipendono dall'OS remoto.
 //!
@@ -79,19 +91,63 @@ pub fn posix_quote(token: &str) -> String {
     out
 }
 
+/// True se il token e' un OPERATORE di shell puro: composto solo da
+/// metacaratteri (`&`, `|`, `;`, `<`, `>`, `(`, `)`) e cifre di fd
+/// (redirect `2>`, `2>&1`, `>&2`...), con almeno un metacarattere.
+/// Esempi: `&&`, `||`, `;`, `|`, `&`, `>`, `>>`, `<`, `2>`, `2>&1`,
+/// `&>`, `&>>`, `;;`, `|&`, `(`, `)`. Un token cosi' non puo' essere un
+/// argomento di un comando: se quotato (`'&&'`) viene passato a sh come
+/// TESTO e il composto non funziona mai (bug report: "No such file or
+/// directory" su `crosspilot -- a '&&' b`).
+/// `123` (solo cifre, nessun metacarattere) NON e' un operatore.
+fn is_shell_operator_token(token: &str) -> bool {
+    let mut has_operator_char = false;
+    for c in token.chars() {
+        let is_op_char = matches!(c, '&' | '|' | ';' | '<' | '>' | '(' | ')');
+        let is_fd_digit = c.is_ascii_digit();
+        if !is_op_char && !is_fd_digit {
+            return false;
+        }
+        if is_op_char {
+            has_operator_char = true;
+        }
+    }
+    has_operator_char
+}
+
 /// Ricostruisce la command-line remota dai token catturati da clap dopo `--`.
 /// - `unix = true`  -> ogni token e' posix_quote()-ato e unito con spazi:
 ///   il raggruppamento della shell locale sopravvive al transito (fix del
 ///   bug "sleep: missing operand" / "docker ps accepts no arguments").
+///   Eccezioni (fix "niente comandi composti"):
+///   - UN token solo -> raw: e' una command-line completa
+///     (`crosspilot -- "a && b"`), quotarla la rende un nome di comando;
+///   - operatori shell puri (`&&`, `;`, `|`...) -> raw: sono operatori,
+///     non argomenti.
 /// - `unix = false` -> join con spazi nudi (semantica cmd.exe, invariata).
 pub fn rejoin_command(tokens: &[String], unix: bool) -> String {
     if !unix {
         return tokens.join(" ");
     }
+    // Token singolo su remote unix: nessun raggruppamento da preservare —
+    // quotarlo forzerebbe sh a cercare un comando letterale (con spazi e
+    // metacaratteri inclusi) che non esiste. Raw = l'unica lettura sensata.
+    if tokens.len() == 1 {
+        let only = &tokens[0];
+        return only.clone();
+    }
     let mut parts: Vec<String> = Vec::with_capacity(tokens.len());
     for t in tokens {
-        let q = posix_quote(t);
-        parts.push(q);
+        // Operatori puri -> nudi (sono operatori, mai argomenti).
+        // Testo con metacaratteri misti (es. `a&&b`) -> quotato com'e'.
+        let is_operator = is_shell_operator_token(t);
+        if is_operator {
+            let raw = t.clone();
+            parts.push(raw);
+        } else {
+            let q = posix_quote(t);
+            parts.push(q);
+        }
     }
     parts.join(" ")
 }
@@ -356,6 +412,54 @@ mod tests {
         assert_eq!(rejoin_command(&tokens2, true), "docker ps");
         // Windows: join nudo invariato (legacy).
         assert_eq!(rejoin_command(&tokens, false), "sh -c sleep 8; docker ps");
+    }
+
+    #[test]
+    fn rejoin_unix_single_token_is_raw() {
+        // Bug report: `crosspilot -- "cmd1 && cmd2"` arriva come UN token —
+        // quotarlo produceva 'cmd1 && cmd2' -> sh lo cercava come comando
+        // letterale ("No such file or directory"). Ora passa raw.
+        let tokens = vec!["systemctl restart nginx && systemctl status nginx".to_string()];
+        assert_eq!(
+            rejoin_command(&tokens, true),
+            "systemctl restart nginx && systemctl status nginx"
+        );
+        // Anche con ; e pipe.
+        let tokens2 = vec!["a; b | c > /tmp/out".to_string()];
+        assert_eq!(rejoin_command(&tokens2, true), "a; b | c > /tmp/out");
+        // Token singolo semplice: invariato (raw == non-quotato).
+        let tokens3 = vec!["hostname".to_string()];
+        assert_eq!(rejoin_command(&tokens3, true), "hostname");
+    }
+
+    #[test]
+    fn rejoin_unix_pure_operators_unquoted() {
+        // Bug report: `crosspilot -- a '&&' b` produceva a '&&' b -> a
+        // riceveva "&&" e "b" come argomenti. L'operatore puro passa raw.
+        let tokens = vec!["ls".to_string(), "&&".to_string(), "pwd".to_string()];
+        assert_eq!(rejoin_command(&tokens, true), "ls && pwd");
+        // Redirect e pipe puri.
+        let tokens2 = vec![
+            "echo".to_string(),
+            "hi".to_string(),
+            ">>".to_string(),
+            "/tmp/f".to_string(),
+        ];
+        assert_eq!(rejoin_command(&tokens2, true), "echo hi >> /tmp/f");
+        // fd redirect composto: 2>&1 e' tutto metacaratteri+cifre -> operatore.
+        let tokens3 = vec![
+            "cmd".to_string(),
+            "2>&1".to_string(),
+            "|".to_string(),
+            "less".to_string(),
+        ];
+        assert_eq!(rejoin_command(&tokens3, true), "cmd 2>&1 | less");
+        // NON operatori: testo misto con metacaratteri resta argomento quotato.
+        let tokens4 = vec!["echo".to_string(), "a&&b".to_string()];
+        assert_eq!(rejoin_command(&tokens4, true), "echo 'a&&b'");
+        // Solo cifre: non e' operatore (ma e' posix-safe: resta nudo).
+        let tokens5 = vec!["sleep".to_string(), "5".to_string()];
+        assert_eq!(rejoin_command(&tokens5, true), "sleep 5");
     }
 
     #[test]
