@@ -52,6 +52,11 @@ mod update;
 // TLS 1.3 post-quantum sul canale TCP (spec docs/tls-pq-spec.md):
 // Link unificato plaintext/TLS, cert rcgen, pinning TOFU, AUTH.
 mod tls;
+// Gate dell'output diagnostico per il flag globale -q/--quiet (log.rs).
+mod log;
+// Costruzione command-line remota: quoting POSIX, tmp path di `run`,
+// marker exit-code (runcmd.rs).
+mod runcmd;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -181,22 +186,35 @@ struct Cli {
     )]
     ephemeral: bool,
 
-    /// Comando da eseguire sul server Windows remoto.
+    /// Output diagnostico minimo su stderr (modalità scripting): sopprime
+    /// [DEBUG], progressi e messaggi di connessione. Warning ed errori
+    /// restano sempre visibili; l'output dei comandi (stdout) è invariato.
+    #[arg(
+        short = 'q',
+        long,
+        global = true,
+        help = "Quiet: suppress debug/progress diagnostics on stderr (warnings and errors still shown)"
+    )]
+    quiet: bool,
+
+    /// Comando da eseguire sul server remoto.
     ///
-    /// Tutto ciò che segue `--` viene preso letteralmente (i token sono uniti
-    /// con spazi) e inviato a cmd.exe sul server Windows. Evita l'escaping
-    /// della shell Linux.
+    /// Tutto ciò che segue `--` viene preso letteralmente. Su remote UNIX
+    /// i token sono ri-quotati stile POSIX (il raggruppamento fatto dalla
+    /// shell locale sopravvive: `crosspilot -- sh -c "sleep 8; docker ps"`
+    /// funziona). Su remote Windows i token sono uniti con spazi e inviati
+    /// a cmd.exe.
     ///
     /// Esempi:
     ///   crosspilot -- dir 'c:\\'
-    ///   crosspilot -- powershell -Command "Get-ChildItem 'C:\\Program Files'"
-    ///   crosspilot -- echo "hello 'world' \"test\""
+    ///   crosspilot -- sh -c "sleep 8; docker ps"
+    ///   crosspilot -- docker ps --format '{{.Names}} {{.Status}}'
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
         num_args = 1..,
         value_name = "COMMAND",
-        help = "Command to execute on the remote Windows server (use -- to pass it)"
+        help = "Command to execute on the remote server (use -- to pass it)"
     )]
     raw_cmd: Vec<String>,
 }
@@ -215,6 +233,10 @@ enum Commands {
         local_src: String,
         /// Path destinazione remoto (Windows, es. C:\ci\app.exe).
         remote_dst: String,
+        /// Dopo l'upload rende il file eseguibile sul remote (chmod a+x;
+        /// solo remote unix — su Windows e' un no-op con warning).
+        #[arg(long)]
+        exec: bool,
     },
     /// Download (get) di un file remoto verso un path locale (transfer delta stile rsync).
     Get {
@@ -235,10 +257,18 @@ enum Commands {
         /// Output minimo (solo riepilogo numerico su stderr, per CI).
         #[arg(long)]
         quiet: bool,
+        /// Esclude i path che matchano il pattern glob (ripetibile:
+        /// --exclude 'data/postgres' --exclude '*.log'). Un path escluso
+        /// non e' ne' confrontato ne' candidato a sync/delete.
+        #[arg(long)]
+        exclude: Vec<String>,
     },
     /// Mirror one-way upload (Linux -> Windows) della directory.
+    /// Accetta anche un FILE singolo come sorgente (dispatch interno a put).
+    /// Directory remote non leggibili: warning + continua (non abortisce);
+    /// in quel caso --delete viene sospeso per sicurezza.
     Sync {
-        /// Directory sorgente locale (Linux). Deve esistere.
+        /// Directory sorgente locale (Linux) oppure file singolo.
         local_dir: String,
         /// Directory destinazione remota (Windows, path assoluto).
         remote_dir: String,
@@ -254,12 +284,28 @@ enum Commands {
         /// Output minimo (solo riepilogo numerico su stderr, per CI).
         #[arg(long)]
         quiet: bool,
+        /// Esclude i path che matchano il pattern glob (ripetibile).
+        #[arg(long)]
+        exclude: Vec<String>,
     },
     /// Spegne il server remoto senza eseguire altro: invia `quit` su una
     /// connessione shell-mode. Equivale a `crosspilot --ephemeral` senza
     /// comando e a `crosspilot -- quit`.
     #[command(visible_alias = "shutdown", alias = "stop")]
     Quit,
+    /// Esegue uno script locale sul remote: upload in tmp + esecuzione +
+    /// cleanup, in una sola operazione ("agentless" per script).
+    ///
+    /// Su remote unix: script con shebang -> chmod +x ed esecuzione diretta
+    /// (l'interprete dichiarato dallo script e' rispettato); senza shebang
+    /// -> `sh`. Su remote Windows: .ps1 -> powershell, altro -> cmd /c call.
+    /// L'exit code dello script diventa l'exit code di crosspilot.
+    Run {
+        /// Script locale da eseguire (.sh, .ps1, .bat, ...).
+        script: String,
+        /// Argomenti passati allo script remoto.
+        args: Vec<String>,
+    },
     /// (interno) Updater staged: attende la morte del server, fa lo swap
     /// exe -> exe.old / staged -> exe, poi rilancia `exe --server`.
     /// Lanciato detached dal server (MSG_UPDATE_REQ) o via schtasks/setsid
@@ -337,12 +383,16 @@ async fn main() -> Result<()> {
     let env_host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let env_winrm = envs::var("PORT").unwrap_or_else(|| "5985".to_string());
     let env_client = envs::var("CLIENT_PORT").unwrap_or_else(|| "5330".to_string());
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] ambiente attivo: {} -> host={} winrm={} client={}",
         env_label, env_host, env_winrm, env_client
     );
 
     let cli = Cli::parse();
+
+    // Flag globale -q/--quiet: sopprime SOLO il chiacchiericcio di
+    // progresso/debug (qprintln!); warning ed errori restano su stderr.
+    log::set_quiet(cli.quiet);
 
     if cli.server || matches!(cli.command, Some(Commands::Server { .. })) {
         let port = if let Some(Commands::Server { port }) = cli.command {
@@ -352,28 +402,40 @@ async fn main() -> Result<()> {
         };
         server_mode(port).await?;
     } else if !cli.raw_cmd.is_empty() {
-        // Forma raw: `crosspilot -- dir c:\`. I token dopo `--` sono
-        // presi letteralmente da clap (allow_hyphen_values + trailing_var_arg)
-        // e uniti con spazi per ricostruire il comando cmd.exe.
-        let cmd = cli.raw_cmd.join(" ");
-        client_mode(&cmd, cli.ephemeral).await?;
+        // Forma raw: `crosspilot -- dir c:\`. I token dopo `--` sono presi
+        // letteralmente da clap; la ricomposizione della command-line
+        // dipende dall'OS remoto (POSIX-quote su unix, join su Windows —
+        // vedi runcmd::rejoin_command, deciso dentro client_mode).
+        client_mode(&cli.raw_cmd, cli.ephemeral).await?;
     } else {
         match cli.command {
             // Transfer file: upload (put) lato client.
-            Some(Commands::Put { local_src, remote_dst }) => {
-                client_transfer_put(&local_src, &remote_dst, cli.ephemeral).await?;
+            Some(Commands::Put { local_src, remote_dst, exec }) => {
+                client_transfer_put(&local_src, &remote_dst, exec, cli.ephemeral).await?;
             }
             // Transfer file: download (get) lato client.
             Some(Commands::Get { remote_src, local_dst }) => {
                 client_transfer_get(&remote_src, &local_dst, cli.ephemeral).await?;
             }
             // Directory sync: status (diff read-only) lato client.
-            Some(Commands::Status { local_dir, remote_dir, checksum, quiet }) => {
-                client_sync_status(&local_dir, &remote_dir, checksum, quiet, cli.ephemeral).await?;
+            Some(Commands::Status { local_dir, remote_dir, checksum, quiet, exclude }) => {
+                client_sync_status(&local_dir, &remote_dir, checksum, quiet, &exclude, cli.ephemeral).await?;
             }
             // Directory sync: sync (mirror one-way upload) lato client.
-            Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet }) => {
-                client_sync(&local_dir, &remote_dir, delete, dry_run, checksum, quiet, cli.ephemeral).await?;
+            // I flag sono gia' raggruppati in SyncParams (clippy too_many_arguments).
+            Some(Commands::Sync { local_dir, remote_dir, delete, dry_run, checksum, quiet, exclude }) => {
+                let params = sync::SyncParams {
+                    local_dir,
+                    remote_dir,
+                    delete,
+                    dry_run,
+                    quiet: quiet || cli.quiet,
+                };
+                client_sync(params, checksum, &exclude, cli.ephemeral).await?;
+            }
+            // Esecuzione script remota (upload tmp + run + cleanup).
+            Some(Commands::Run { script, args }) => {
+                client_run(&script, &args, cli.ephemeral).await?;
             }
             // Spegnimento esplicito del server remoto (nessuna operazione).
             Some(Commands::Quit) => {
@@ -793,7 +855,7 @@ async fn handle_connection(
 
     // Se abbiamo 4 byte e corrispondono al magic "DFB1" -> modo file transfer.
     if filled == 4 && peek_buf == *b"DFB1" {
-        eprintln!("[DEBUG] handle_connection: rilevata modalità file transfer (magic DFB1)");
+        crate::qprintln!("[DEBUG] handle_connection: rilevata modalità file transfer (magic DFB1)");
         // Delega al modulo transfer. Il socket non è stato consumato (peek).
         let link = tls::Link::plain(socket);
         if let Err(e) = handle_file_mode(link, grace_only).await {
@@ -824,7 +886,7 @@ async fn handle_connection(
         );
     }
     if timed_out {
-        eprintln!("[DEBUG] handle_connection: peek timeout, modalità shell");
+        crate::qprintln!("[DEBUG] handle_connection: peek timeout, modalità shell");
     }
 
     let link = tls::Link::plain(socket);
@@ -855,7 +917,7 @@ async fn handle_tls_connection(
         }
     };
     let mut link = tls::Link::tls_server(stream);
-    eprintln!("[DEBUG] TLS handshake ok (TLS 1.3, X25519MLKEM768)");
+    crate::qprintln!("[DEBUG] TLS handshake ok (TLS 1.3, X25519MLKEM768)");
 
     // AUTH dentro TLS (spec §8): prima operazione dopo l'handshake —
     // token errato o assente -> chiusura immediata, nessuno stato
@@ -908,13 +970,13 @@ async fn handle_tls_connection(
     link.prepend(&det);
 
     if det.as_slice() == b"DFB1" {
-        eprintln!("[DEBUG] handle_tls_connection: file transfer (magic DFB1) dentro TLS");
+        crate::qprintln!("[DEBUG] handle_tls_connection: file transfer (magic DFB1) dentro TLS");
         if let Err(e) = handle_file_mode(link, false).await {
             eprintln!("[ERROR] file transfer TLS fallito: {}", e);
         }
         return Ok(());
     }
-    eprintln!("[DEBUG] handle_tls_connection: shell mode dentro TLS");
+    crate::qprintln!("[DEBUG] handle_tls_connection: shell mode dentro TLS");
     shell_flow(link, shutdown_signal).await
 }
 
@@ -938,6 +1000,10 @@ async fn shell_flow(link: tls::Link, shutdown_signal: Arc<Notify>) -> Result<()>
     // Check for quit/exit command
     if command_line.eq_ignore_ascii_case("quit") || command_line.eq_ignore_ascii_case("exit") {
         println!("Quit command received. notifying shutdown.");
+        // Chiusura graziosa del link (close_notify su TLS): senza di essa
+        // il client che streamma riceve UnexpectedEof e il quit riuscito
+        // esce con codice 1 (bug visto in e2e su `crosspilot -- quit`).
+        let _ = socket.shutdown().await;
         shutdown_signal.notify_one();
         return Ok(());
     }
@@ -955,15 +1021,50 @@ async fn shell_flow(link: tls::Link, shutdown_signal: Arc<Notify>) -> Result<()>
         if command_line.is_empty() {
             // Prefisso senza comando: solo shutdown (equivale a `quit`).
             println!("Ephemeral quit received. notifying shutdown.");
+            let _ = socket.shutdown().await;
             shutdown_signal.notify_one();
             return Ok(());
         }
         quit_after = true;
-        println!("[DEBUG] ephemeral request: shutdown del server a fine comando ({})", command_line);
+        crate::qprintln!("[DEBUG] ephemeral request: shutdown del server a fine comando ({})", command_line);
+    }
+
+    // Prefisso-sentinel exit-code (EXIT_CODE_PREFIX): il client chiede
+    // l'exit status del comando — a fine stream il server accoda la riga
+    // `CROSSPILOT_EXIT_CODE=<n>`. Inviato solo da client dello stesso
+    // build (un server pre-feature lo passerebbe a cmd.exe come testo).
+    let mut want_exit_code = false;
+    if let Some(rest) = command_line.strip_prefix(runcmd::EXIT_CODE_PREFIX) {
+        command_line = rest.trim().to_string();
+        want_exit_code = true;
+        if command_line.is_empty() {
+            // Prefisso senza comando: solo il marker (exit code 0).
+            let _ = socket
+                .write_all(format!("{}{}\n", runcmd::EXIT_MARKER, 0).as_bytes())
+                .await;
+            let _ = socket.shutdown().await;
+            if quit_after {
+                shutdown_signal.notify_one();
+            }
+            return Ok(());
+        }
+    }
+
+    // Ri-check quit/exit DOPO lo strip dei prefissi: `crosspilot -- quit`
+    // arriva ora come "crosspilot:exit-code quit" (il client antepone il
+    // sentinel a ogni comando dello stesso build) — senza questo check il
+    // comando finirebbe a sh/cmd come testo ignoto e il server resterebbe
+    // su (regressione rispetto al quit nudo intercettato sopra).
+    if command_line.eq_ignore_ascii_case("quit") || command_line.eq_ignore_ascii_case("exit") {
+        println!("Quit command received (con prefissi). notifying shutdown.");
+        // Chiusura graziosa: vedi il quit nudo sopra.
+        let _ = socket.shutdown().await;
+        shutdown_signal.notify_one();
+        return Ok(());
     }
 
     // 2. Esegue il comando e streamma stdout+stderr sul socket.
-    let run_result = run_shell_command(socket, &command_line).await;
+    let run_result = run_shell_command(socket, &command_line, want_exit_code).await;
 
     // 3. Ephemeral: a richiesta conclusa — a qualunque esito — il server
     // deve spegnersi. La notify arriva DOPO il flush del writer interno
@@ -992,7 +1093,7 @@ const QUIT_AFTER_PREFIX: &str = "crosspilot:quit-after ";
 /// (best-practice: unita' piccole): il caller decide il post-esecuzione —
 /// la modalita' effimera notifica lo shutdown del server a qualunque esito.
 /// `socket` e' un Link: funziona identico su plaintext e dentro TLS.
-async fn run_shell_command(socket: tls::Link, command_line: &str) -> Result<()> {
+async fn run_shell_command(socket: tls::Link, command_line: &str, want_exit_code: bool) -> Result<()> {
     // 2. Spawn process
     // ... rest of implementation matches previous logic
     // Detect OS for shell execution
@@ -1075,6 +1176,10 @@ async fn run_shell_command(socket: tls::Link, command_line: &str) -> Result<()> 
     
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let tx_stderr = tx.clone();
+    // Sender tenuto da parte per il marker di exit code (EXIT_CODE_PREFIX):
+    // tx e tx_stderr vengono mossi nei task reader — questo resta per
+    // l'append finale DOPO che tutto l'output e' stato consegnato.
+    let tx_marker = tx.clone();
 
     let stdout_handle = tokio::spawn(async move {
         let mut buf = [0; 1024];
@@ -1119,9 +1224,12 @@ async fn run_shell_command(socket: tls::Link, command_line: &str) -> Result<()> 
     });
 
     // Wait for child to exit OR kill signal
+    let mut exit_code: Option<i32> = None;
     tokio::select! {
-        _ = child.wait() => {
-            // Process finished normally
+        status = child.wait() => {
+            // Process finished normally: cattura l'exit status (per il
+            // marker richiesto via EXIT_CODE_PREFIX — prima era ignorato).
+            exit_code = status.ok().and_then(|s| s.code());
         }
         _ = kill_notify.notified() => {
             println!("Client disconnected, killing process...");
@@ -1132,6 +1240,19 @@ async fn run_shell_command(socket: tls::Link, command_line: &str) -> Result<()> 
     // Cleanup
     let _ = stdout_handle.await;
     let _ = stderr_handle.await;
+
+    // Marker di exit code richiesto dal client (sentinel EXIT_CODE_PREFIX):
+    // va DOPO tutto l'output — si invia sul canale ordinato SOLO dopo che
+    // i reader stdout/stderr hanno chiuso (EOF dei pipe = child uscito).
+    // exit_code None (processo killato/nessun code) -> 255.
+    if want_exit_code {
+        let marker = format!("\n{}{}\n", runcmd::EXIT_MARKER, exit_code.unwrap_or(255));
+        let _ = tx_marker.send(marker.into_bytes()).await;
+    }
+    // Chiude l'ultimo sender: il writer svuota la coda e fa shutdown —
+    // senza drop(tx_marker) rx.recv() resterebbe appeso all'infinito.
+    drop(tx_marker);
+
     let _ = writer_handle.await;
 
     // Il task monitor (lettura EOF sul lato read dello split) resterebbe
@@ -1154,87 +1275,115 @@ async fn run_shell_command(socket: tls::Link, command_line: &str) -> Result<()> 
 /// per l'auto-update dei client vecchi); qualunque altro msg framed —
 /// PUT, LIST/MKDIR/DELETE, UPDATE_REQ — riceve ERR_PROTO e chiude.
 async fn handle_file_mode(mut socket: tls::Link, grace_only: bool) -> Result<()> {
-    // Legge il primo messaggio: il magic "DFB1" è già stato peek-ato ma non consumato,
-    // quindi read_msg lo rilegge da capo insieme a version/msg_type/payload.
+    // LOOP di messaggi sulla STESSA connessione (sessione persistente):
+    // prima il server chiudeva dopo UNA operazione — il sync apriva una
+    // connessione TCP+TLS per OGNI file (handshake ripetuto, lento e
+    // rumoroso). Ora si resta nel loop finche' il client chiude o un
+    // handler fallisce: i messaggi framed sono auto-delimitati (magic
+    // "DFB1" per messaggio), quindi PUT/LIST/MKDIR/DELETE consecutivi si
+    // incolonnano naturalmente. I client vecchi (un msg per connessione)
+    // funzionano identici: al secondo read_msg si ottiene EOF -> uscita.
     //
-    // Su errore di framing (magic/versione/payload invalidi) si tenta PRIMA un
-    // ERR best-effort e poi si chiude: senza di esso il client vede solo
-    // "early eof" (socket chiuso senza spiegazione). E' il sintomo del server
-    // H101 zombificato (build intermedia con VERSION=2) che rifiutava ogni
-    // messaggio framed chiudendo in silenzio.
-    let (msg_type, payload) = match proto::read_msg(&mut socket).await {
-        Ok(v) => v,
-        Err(e) => {
-            let err = proto::ErrMsg {
-                code: proto::ERR_PROTO,
-                message: format!("framing non valido: {}", e),
-            };
-            // Best-effort: se il socket e' gia' rotto la scrittura fallisce
-            // silenziosamente e il client vedra' comunque early eof.
-            let _ = proto::send_err(&mut socket, &err).await;
-            return Err(e);
-        }
-    };
-
-    // Grace plaintext §5.1: tutto tranne GET_REQ e' vietato in chiaro
-    // quando REQUIRE_TLS e' attivo (la whitelist del basename sta in
-    // transfer::get_server).
-    if grace_only && msg_type != proto::MSG_GET_REQ {
-        let err = proto::ErrMsg {
-            code: proto::ERR_PROTO,
-            message: format!(
-                "msg type {} non consentito in plaintext con REQUIRE_TLS",
-                msg_type
-            ),
+    // Il primo messaggio: il magic "DFB1" e' gia' stato peek-ato ma non
+    // consumato, quindi read_msg lo rilegge da capo insieme a
+    // version/msg_type/payload.
+    let mut ops_served = 0u32;
+    loop {
+        let (msg_type, payload) = match proto::read_msg(&mut socket).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Qualunque errore di lettura dopo >=1 op servita (EOF del
+                // client a fine sync, reset, framing corrotto): la sessione
+                // si chiude senza risposta — gli handler delle op precedenti
+                // hanno gia' risposto e non esiste un peer affidabile a cui
+                // mandare un ERR. Log di debug e uscita pulita.
+                let is_eof = e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .map(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+                        .unwrap_or(false)
+                });
+                if is_eof || ops_served > 0 {
+                    crate::qprintln!(
+                        "[DEBUG] handle_file_mode: chiusura dopo {} op ({})",
+                        ops_served,
+                        e
+                    );
+                    return Ok(());
+                }
+                // Errore di framing sul PRIMO messaggio (magic/versione/
+                // payload invalidi): si tenta PRIMA un ERR best-effort e
+                // poi si chiude — senza di esso il client vede solo "early
+                // eof" (sintomo del server H101 zombificato, build
+                // intermedia con VERSION=2 che rifiutava ogni messaggio).
+                let err = proto::ErrMsg {
+                    code: proto::ERR_PROTO,
+                    message: format!("framing non valido: {}", e),
+                };
+                let _ = proto::send_err(&mut socket, &err).await;
+                return Err(e);
+            }
         };
-        let _ = proto::send_err(&mut socket, &err).await;
-        bail!("operazione framed {} rifiutata in chiaro (REQUIRE_TLS)", msg_type);
-    }
 
-    match msg_type {
-        proto::MSG_PUT_REQ => {
-            let req = proto::decode_put_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: PUT_REQ dst={} ({} byte)", req.path, req.total_new_size);
-            transfer::put_server(&mut socket, req).await?;
-        }
-        proto::MSG_GET_REQ => {
-            let req = proto::decode_get_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: GET_REQ src={} grace={}", req.path, grace_only);
-            transfer::get_server(&mut socket, req, grace_only).await?;
-        }
-        // Directory sync (sync-spec §5): messaggi LIST/MKDIR_BATCH/DELETE_BATCH.
-        proto::MSG_LIST_REQ => {
-            let req = proto::decode_list_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: LIST_REQ path={} recursive={} with_hash={}", req.path, req.recursive, req.with_hash);
-            sync_server::list_server(&mut socket, &req).await?;
-        }
-        proto::MSG_MKDIR_BATCH_REQ => {
-            let req = proto::decode_mkdir_batch_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: MKDIR_BATCH_REQ count={}", req.paths.len());
-            sync_server::mkdir_batch_server(&mut socket, &req).await?;
-        }
-        proto::MSG_DELETE_BATCH_REQ => {
-            let req = proto::decode_delete_batch_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: DELETE_BATCH_REQ count={}", req.items.len());
-            sync_server::delete_batch_server(&mut socket, &req).await?;
-        }
-        // Self-update via TCP (update-spec): spawn updater staged + uscita.
-        proto::MSG_UPDATE_REQ => {
-            let req = proto::decode_update_req(&payload)?;
-            eprintln!("[DEBUG] handle_file_mode: UPDATE_REQ staged={}", req.staged_path);
-            update::server_apply_update(&mut socket, &req).await?;
-        }
-        _ => {
-            // Tipo di messaggio non riconosciuto: invia ERR protocollo.
+        // Grace plaintext §5.1: tutto tranne GET_REQ e' vietato in chiaro
+        // quando REQUIRE_TLS e' attivo (la whitelist del basename sta in
+        // transfer::get_server).
+        if grace_only && msg_type != proto::MSG_GET_REQ {
             let err = proto::ErrMsg {
                 code: proto::ERR_PROTO,
-                message: format!("tipo di messaggio non valido per apertura: {}", msg_type),
+                message: format!(
+                    "msg type {} non consentito in plaintext con REQUIRE_TLS",
+                    msg_type
+                ),
             };
             let _ = proto::send_err(&mut socket, &err).await;
-            bail!("tipo di messaggio non valido: {}", msg_type);
+            bail!("operazione framed {} rifiutata in chiaro (REQUIRE_TLS)", msg_type);
         }
+
+        match msg_type {
+            proto::MSG_PUT_REQ => {
+                let req = proto::decode_put_req(&payload)?;
+                crate::qprintln!("[DEBUG] handle_file_mode: PUT_REQ dst={} ({} byte)", req.path, req.total_new_size);
+                transfer::put_server(&mut socket, req).await?;
+            }
+            proto::MSG_GET_REQ => {
+                let req = proto::decode_get_req(&payload)?;
+                crate::qprintln!("[DEBUG] handle_file_mode: GET_REQ src={} grace={}", req.path, grace_only);
+                transfer::get_server(&mut socket, req, grace_only).await?;
+            }
+            // Directory sync (sync-spec §5): messaggi LIST/MKDIR_BATCH/DELETE_BATCH.
+            proto::MSG_LIST_REQ => {
+                let req = proto::decode_list_req(&payload)?;
+                crate::qprintln!("[DEBUG] handle_file_mode: LIST_REQ path={} recursive={} with_hash={}", req.path, req.recursive, req.with_hash);
+                sync_server::list_server(&mut socket, &req).await?;
+            }
+            proto::MSG_MKDIR_BATCH_REQ => {
+                let req = proto::decode_mkdir_batch_req(&payload)?;
+                crate::qprintln!("[DEBUG] handle_file_mode: MKDIR_BATCH_REQ count={}", req.paths.len());
+                sync_server::mkdir_batch_server(&mut socket, &req).await?;
+            }
+            proto::MSG_DELETE_BATCH_REQ => {
+                let req = proto::decode_delete_batch_req(&payload)?;
+                crate::qprintln!("[DEBUG] handle_file_mode: DELETE_BATCH_REQ count={}", req.items.len());
+                sync_server::delete_batch_server(&mut socket, &req).await?;
+            }
+            // Self-update via TCP (update-spec): spawn updater staged + uscita.
+            proto::MSG_UPDATE_REQ => {
+                let req = proto::decode_update_req(&payload)?;
+                crate::qprintln!("[DEBUG] handle_file_mode: UPDATE_REQ staged={}", req.staged_path);
+                update::server_apply_update(&mut socket, &req).await?;
+            }
+            _ => {
+                // Tipo di messaggio non riconosciuto: invia ERR protocollo.
+                let err = proto::ErrMsg {
+                    code: proto::ERR_PROTO,
+                    message: format!("tipo di messaggio non valido per apertura: {}", msg_type),
+                };
+                let _ = proto::send_err(&mut socket, &err).await;
+                bail!("tipo di messaggio non valido: {}", msg_type);
+            }
+        }
+        ops_served += 1;
     }
-    Ok(())
 }
 
 /// Errore finale del retry loop di connessione. Se il bootstrap ha rilevato
@@ -1305,10 +1454,13 @@ fn final_connect_error(addr: &str) -> anyhow::Error {
     anyhow::anyhow!("Failed to connect to server after bootstrap attempt")
 }
 
-/// Legge la riga di handshake del server fino a '\n' (cap 256 byte) e la
-/// parsa (parse_ready_line). Errore su EOF/riga sconosciuta (zombie).
-async fn read_ready_line(s: &mut TcpStream) -> Result<version::ServerHello> {
-    let mut line = Vec::with_capacity(32);
+/// Legge la riga di handshake del server fino a '\n' (cap 256 byte,
+/// cumulativo su `line`) e la parsa (parse_ready_line). Errore su
+/// EOF/riga sconosciuta (zombie). Il buffer e' del chiamante: permette a
+/// read_ready_line_grace di riprendere la lettura dopo un timeout senza
+/// perdere i byte parziali gia' arrivati (un "READY" spezzato in due
+/// segmenti TCP a cavallo delle due finestre non si corrompe).
+async fn read_ready_line_into(s: &mut TcpStream, line: &mut Vec<u8>) -> Result<version::ServerHello> {
     let mut byte = [0u8; 1];
     loop {
         let n = s.read(&mut byte).await?;
@@ -1323,8 +1475,68 @@ async fn read_ready_line(s: &mut TcpStream) -> Result<version::ServerHello> {
             bail!("handshake troppo lungo (>256 byte)");
         }
     }
-    let text = String::from_utf8_lossy(&line);
+    let text = String::from_utf8_lossy(line);
     parse_ready_line(text.trim_end())
+}
+
+/// Wrapper a buffer interno per i probe one-shot (listener_is_live,
+/// poll_server_startup, remote_build_info): li' nessuna ripresa dopo il
+/// timeout, il buffer puo' essere ricreato a ogni chiamata.
+async fn read_ready_line(s: &mut TcpStream) -> Result<version::ServerHello> {
+    let mut line = Vec::with_capacity(32);
+    read_ready_line_into(s, &mut line).await
+}
+
+/// Timeout della prima attesa READY: un server gia' dentro l'accept loop
+/// risponde in pochi ms. Corto di proposito, cosi' la detection di
+/// listener estranei/zombie (porta occupata da un processo che non parla
+/// il nostro protocollo) non rallenta il fallback al bootstrap.
+const READY_FAST: Duration = Duration::from_millis(1500);
+
+/// Finestra extra di attesa READY quando il connect e' riuscito ma la
+/// riga non arriva (race di cold-start, bug report #0): il listener fa
+/// bind PRIMA dell'init (firewall self-ensure, self_describe, cert TLS)
+/// e l'accept loop parte solo dopo — nella finestra il kernel completa
+/// il TCP handshake (connect ok, connessione in backlog) ma READY non e'
+/// ancora scritto. L'attesa avviene sulla STESSA socket: quando l'accept
+/// loop parte, il server scrive READY anche alle connessioni accumulate
+/// in backlog. Prima di questo fix il primo comando dopo l'avvio del
+/// server scadeva l'handshake a 1.5s e cadeva in bootstrap pur essendo
+/// il server vivo.
+const READY_COLD_START: Duration = Duration::from_secs(30);
+
+/// Attesa READY in due fasi (v. READY_COLD_START): prima `fast`, poi — a
+/// connect gia' riuscito — `cold` sulla STESSA socket e sullo stesso
+/// buffer `line`. Un peer che parla ma non dice READY esce subito col
+/// suo errore di parse (nessuna attesa extra per i listener estranei
+/// "loquaci"); solo il peer silenzioso consuma la finestra intera.
+async fn read_ready_line_grace(
+    s: &mut TcpStream,
+    line: &mut Vec<u8>,
+    fast: Duration,
+    cold: Duration,
+    addr: &str,
+) -> Result<version::ServerHello> {
+    let first = tokio::time::timeout(fast, read_ready_line_into(s, line)).await;
+    match first {
+        Ok(done) => return done,
+        Err(_) => {
+            // Debug log a dimostrazione della tesi: se il server era in
+            // cold-start questa riga appare e la fase 2 riceve il READY.
+            crate::qprintln!(
+                "[DEBUG] {}: nessun READY entro {:?} — server in init? attesa cold-start (max {:?})...",
+                addr, fast, cold
+            );
+        }
+    }
+    let second = tokio::time::timeout(cold, read_ready_line_into(s, line)).await;
+    match second {
+        Ok(done) => done,
+        Err(_) => bail!(
+            "handshake timeout (inclusi {:?} di attesa cold-start)",
+            cold
+        ),
+    }
 }
 
 /// Parsa la riga di handshake del server:
@@ -1363,7 +1575,8 @@ fn parse_ready_line(text: &str) -> Result<version::ServerHello> {
 }
 
 /// Una connessione TCP + lettura handshake "READY <ts> [<os>]" (singolo
-/// tentativo, niente retry/bootstrap/update), poi il gate TLS §4/§5:
+/// tentativo, niente retry/bootstrap/update; attesa READY in due fasi
+/// fast+cold-start, v. read_ready_line_grace), poi il gate TLS §4/§5:
 /// server nuovo -> TLS 1.3+PQ con pinning e AUTH; server vecchio ->
 /// plaintext grace (o fatale con REQUIRE_TLS / pin preesistente).
 /// Ritorna il Link finale e il ServerHello remoto (ts None = server
@@ -1371,12 +1584,13 @@ fn parse_ready_line(text: &str) -> Result<version::ServerHello> {
 /// e dall'interno dell'orchestrazione update (le connessioni di
 /// PUT/GET/shell non devono ri-triggerare il confronto di versione).
 pub(crate) async fn connect_raw(addr: &str) -> Result<(tls::Link, version::ServerHello)> {
-    let mut s = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
-        .await
-        .context("connect timeout")??;
-    let hello = tokio::time::timeout(Duration::from_millis(1500), read_ready_line(&mut s))
-        .await
-        .context("handshake timeout")??;
+    let conn = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await;
+    let mut s = conn.context("connect timeout")??;
+    // Buffer READY allocato una volta: sopravvive al timeout della fase
+    // "fast" e riaccoglie i byte parziali nella finestra cold-start
+    // (read_ready_line_grace) — niente perdita di segmenti a cavallo.
+    let mut line = Vec::with_capacity(32);
+    let hello = read_ready_line_grace(&mut s, &mut line, READY_FAST, READY_COLD_START, addr).await?;
     let link = tls::client_wrap(s, &hello, addr).await?;
     Ok((link, hello))
 }
@@ -1389,6 +1603,16 @@ pub(crate) async fn connect_raw(addr: &str) -> Result<(tls::Link, version::Serve
 /// subito come HostKeyMismatch.
 /// Riutilizzata dai comandi shell (--), transfer file (put/get) e sync.
 async fn connect_and_handshake() -> Result<tls::Link> {
+    let (link, _hello) = connect_and_handshake_hello().await?;
+    Ok(link)
+}
+
+/// Come connect_and_handshake ma ritorna anche il ServerHello remoto
+/// (ts + tag OS opzionale): serve a client_mode/run per decidere il
+/// quoting della command-line (POSIX su unix, join su Windows) e per
+/// attivare il marker exit-code SOLO su server dello stesso BUILD_TS
+/// (il prefisso-sentinel e' compreso solo da build uguali).
+async fn connect_and_handshake_hello() -> Result<(tls::Link, version::ServerHello)> {
     // Risoluzione via envs: CROSSPILOT_<ENV>_<CAMPO> -> fallback CROSSPILOT_<CAMPO>.
     let host = envs::var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let client_port = envs::var("CLIENT_PORT").unwrap_or_else(|| "47330".to_string());
@@ -1402,7 +1626,7 @@ async fn connect_and_handshake() -> Result<tls::Link> {
     let mut update_deadline: Option<std::time::Instant> = None;
     loop {
         attempt += 1;
-        eprintln!("Connecting to {} (Attempt {})...", addr, attempt);
+        crate::qprintln!("Connecting to {} (Attempt {})...", addr, attempt);
 
         let conn = connect_raw(&addr).await;
         let (s, hello) = match conn {
@@ -1416,7 +1640,7 @@ async fn connect_and_handshake() -> Result<tls::Link> {
                 }
                 if let Some(dl) = update_deadline {
                     if std::time::Instant::now() < dl {
-                        eprintln!("[DEBUG] update in corso, retry... ({})", e);
+                        crate::qprintln!("[DEBUG] update in corso, retry... ({})", e);
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -1429,7 +1653,10 @@ async fn connect_and_handshake() -> Result<tls::Link> {
                 if attempt >= max_attempts {
                     return Err(final_connect_error(&addr));
                 }
-                eprintln!("Connection failed or timed out. Bootstrapping...");
+                // Logga l'errore reale: prima era ingoiato dal loop e al
+                // suo posto partiva solo il bootstrap — diagnosi cieca
+                // (visto in e2e: handshake TLS fallito, output muto).
+                crate::qprintln!("Connection failed or timed out ({}). Bootstrapping...", e);
                 match bootstrap::bootstrap_server().await {
                     Ok(()) => {}
                     Err(e) => {
@@ -1461,7 +1688,7 @@ async fn connect_and_handshake() -> Result<tls::Link> {
             }
         };
 
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] handshake: remote_ts={:?} remote_os={:?} locale={}",
             hello.ts,
             hello.os,
@@ -1480,11 +1707,11 @@ async fn connect_and_handshake() -> Result<tls::Link> {
                         addr
                     );
                 }
-                eprintln!("Connected and verified.");
-                return Ok(s);
+                crate::qprintln!("Connected and verified.");
+                return Ok((s, hello));
             }
             update::Reconcile::Reconnect => {
-                eprintln!("[update] server in aggiornamento: attesa restart (max 90s)...");
+                crate::qprintln!("[update] server in aggiornamento: attesa restart (max 90s)...");
                 // Prima di riconnettersi: attendere la MORTE del vecchio
                 // server (porta giu'). Senza questa attesa la riconnessione
                 // puo' cadere nei ~100ms di grace post-UPDATE_REQ e parlare
@@ -1500,7 +1727,7 @@ async fn connect_and_handshake() -> Result<tls::Link> {
                 // server e' gia' stato fermato (quit) e quello nuovo e'
                 // gia' in ascolto (atteso dal polling di bootstrap_server).
                 // Riconnessione immediata, con deadline di sicurezza.
-                eprintln!("[update] server aggiornato via fallback bootstrap: riconnessione...");
+                crate::qprintln!("[update] server aggiornato via fallback bootstrap: riconnessione...");
                 update_deadline = Some(std::time::Instant::now() + Duration::from_secs(90));
                 attempt = 0;
                 continue;
@@ -1511,8 +1738,10 @@ async fn connect_and_handshake() -> Result<tls::Link> {
 
 /// Lato client: PUT (upload) di un file locale verso il server.
 /// Stabilisce la connessione, handshake, poi delega a transfer::put_client.
+/// Con `exec` il file remoto riceve chmod a+x post-upload (solo remote
+/// unix — il PUT lascia 644; su Windows il flag e' un no-op con warning).
 /// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
-async fn client_transfer_put(local_src: &str, remote_dst: &str, quit_after: bool) -> Result<()> {
+async fn client_transfer_put(local_src: &str, remote_dst: &str, exec: bool, quit_after: bool) -> Result<()> {
     // Valida il path sorgente locale prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_file_exists(local_src) {
         eprintln!("[ERROR] put: {}", e);
@@ -1521,14 +1750,45 @@ async fn client_transfer_put(local_src: &str, remote_dst: &str, quit_after: bool
 
     let mut socket = connect_and_handshake().await?;
     let result = transfer::put_client(&mut socket, local_src, remote_dst).await;
+
+    // --exec: chmod +x sul file appena caricato (remote unix). La shell-mode
+    // e' un canale separato: connessione fresca dedicata. Solo a put riuscito.
+    if result.is_ok() && exec {
+        remote_chmod_exec(remote_dst).await;
+    }
+
     // --ephemeral: lo shutdown va inviato a QUALUNQUE esito del transfer
     // (stessa semantica del prefisso shell-mode: l'agente non resta appeso).
     if quit_after {
         ephemeral_quit_best_effort().await;
     }
     result?;
-    eprintln!("put: trasferimento completato ({} -> {})", local_src, remote_dst);
+    crate::qprintln!("put: trasferimento completato ({} -> {})", local_src, remote_dst);
     Ok(())
+}
+
+/// `chmod a+x` su un file remoto via shell-mode (canale separato dal
+/// transfer framed). Best-effort: un fallimento del chmod non fa
+/// fallire il put — warning + proseguimento. Solo remote unix.
+/// Il comando attende il file staged: il rename .part->dest sul server
+/// puo' arrivare dopo questa connessione (race osservata in e2e).
+async fn remote_chmod_exec(remote_dst: &str) {
+    if !bootstrap::remote_is_unix() {
+        eprintln!("[WARN] put --exec: remote non unix, chmod ignorato");
+        return;
+    }
+    let mut cmd = runcmd::wait_for_file_prefix(remote_dst, true);
+    cmd.push_str("chmod a+x ");
+    cmd.push_str(&runcmd::posix_quote(remote_dst));
+    match shell_once(&cmd).await {
+        Ok(Some(0)) | Ok(None) => {}
+        Ok(Some(code)) => {
+            eprintln!("[WARN] put --exec: chmod remoto fallito (exit {})", code);
+        }
+        Err(e) => {
+            eprintln!("[WARN] put --exec: chmod remoto fallito: {}", e);
+        }
+    }
 }
 
 /// Lato client: GET (download) di un file remoto verso un path locale.
@@ -1541,31 +1801,38 @@ async fn client_transfer_get(remote_src: &str, local_dst: &str, quit_after: bool
         ephemeral_quit_best_effort().await;
     }
     result?;
-    eprintln!("get: trasferimento completato ({} -> {})", remote_src, local_dst);
+    crate::qprintln!("get: trasferimento completato ({} -> {})", remote_src, local_dst);
     Ok(())
 }
 
 /// Lato client: status (diff read-only) tra directory locale e remota.
 /// sync-spec §6. Exit code: 0 ok (anche con differenze), 1 errore, 2 path invalido.
-async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, quiet: bool, quit_after: bool) -> Result<()> {
+async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, quiet: bool, exclude: &[String], quit_after: bool) -> Result<()> {
     // Valida local_dir prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_dir_exists(local_dir) {
         eprintln!("[ERROR] status: {}", e);
         std::process::exit(2);
     }
 
-    // 1 connessione per LIST (sync-spec §5: una connessione = una operazione).
+    // 1 connessione per LIST (una connessione serve tutto il sync).
     let mut socket = connect_and_handshake().await?;
-    let remote_entries = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
+    let outcome = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
 
-    // Walk locale (skip non-UTF8 + nomi riservati Windows, sync-spec §8.3).
-    let local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+    // Walk locale (skip non-UTF8 + riservati Windows + dir illeggibili).
+    let mut local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+
+    // --exclude: filtra entrambi i lati PRIMA del diff (esclusi = ignorati).
+    let mut remote_entries = outcome.entries;
+    sync::apply_exclusions(&mut local_walk, &mut remote_entries, exclude);
 
     // Diff (con lowercase per case-insensitivity Windows, sync-spec §8.1).
-    let diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+    let mut diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+    // Le dir remote illeggibili arrivano nel trailer LIST_RES: il contenuto
+    // e' sconosciuto, va mostrato come warning (non come "identico").
+    diff.skipped_remote = outcome.skipped;
 
     // Output testuale (o riepilogo numerico se --quiet).
-    sync::print_status(&diff, quiet);
+    sync::print_status(&diff, quiet || log::is_quiet());
 
     if quit_after {
         ephemeral_quit_best_effort().await;
@@ -1577,44 +1844,57 @@ async fn client_sync_status(local_dir: &str, remote_dir: &str, checksum: bool, q
 /// sync-spec §7. Exit code: 0 se tutto ok, 1 se almeno un errore (ma sync completa
 /// tutti i file possibili), 2 path invalido.
 async fn client_sync(
-    local_dir: &str,
-    remote_dir: &str,
-    delete: bool,
-    dry_run: bool,
+    params: sync::SyncParams,
     checksum: bool,
-    quiet: bool,
+    exclude: &[String],
     quit_after: bool,
 ) -> Result<()> {
+    let local_dir = params.local_dir.as_str();
+    let remote_dir = params.remote_dir.as_str();
+    // Sorgente FILE singolo (richiesta utente): dispatch a put — remote_dir
+    // e' trattata come directory di destinazione (dest = remote_dir/basename).
+    let local_path = std::path::Path::new(local_dir);
+    if local_path.is_file() {
+        let base = local_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if base.is_empty() {
+            eprintln!("[ERROR] sync: basename non ricavabile da {}", local_dir);
+            std::process::exit(2);
+        }
+        let remote_dst = sync::join_remote_path(remote_dir, &base);
+        return client_transfer_put(local_dir, &remote_dst, false, quit_after).await;
+    }
+
     // Valida local_dir prima di connettersi (fail-fast, exit code 2).
     if let Err(e) = path::require_local_dir_exists(local_dir) {
         eprintln!("[ERROR] sync: {}", e);
         std::process::exit(2);
     }
 
-    // 1 connessione per LIST (sync-spec §5).
+    // 1 connessione per LIST (la sessione persistente la riusa per il sync).
     let mut socket = connect_and_handshake().await?;
-    let remote_entries = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
+    let outcome = sync::list_remote_dir(&mut socket, remote_dir, checksum).await?;
 
     // Walk locale.
-    let local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+    let mut local_walk = sync::walk_local_dir(std::path::Path::new(local_dir))?;
+
+    // --exclude: filtra entrambi i lati PRIMA del diff (esclusi = ignorati).
+    let mut remote_entries = outcome.entries;
+    sync::apply_exclusions(&mut local_walk, &mut remote_entries, exclude);
 
     // Diff + piano.
-    let diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
-    let plan = sync::build_plan(&diff, delete);
+    let mut diff = sync::compute_diff(&local_walk, &remote_entries, checksum, std::path::Path::new(local_dir));
+    diff.skipped_remote = outcome.skipped;
+    let plan = sync::build_plan(&diff, params.delete);
 
-    // Esecuzione: connect_and_handshake è la callback per ogni nuova connessione
-    // (LIST, put, MKDIR, DELETE). Niente parallele (best-practice).
-    let params = sync::SyncParams {
-        local_dir: local_dir.to_string(),
-        remote_dir: remote_dir.to_string(),
-        delete,
-        dry_run,
-        quiet,
-    };
+    // Esecuzione: connect_and_handshake è la callback di connessione della
+    // SyncSession (riusata; reconnect-on-drop). Niente parallele.
     let report = sync::execute_sync(&plan, &params, || async { connect_and_handshake().await }).await?;
 
     // Report finale.
-    sync::print_sync_report(&report, quiet);
+    sync::print_sync_report(&report, params.quiet);
 
     // --ephemeral: il quit va inviato PRIMA dell'eventuale exit(1) per
     // errori di sync — un agente effimero non deve restare appeso per
@@ -1630,37 +1910,178 @@ async fn client_sync(
     Ok(())
 }
 
+/// OS del remote: prima il tag dichiarato nell'handshake (`READY <ts> L|W`,
+/// non ancora inviato dai server attuali), poi l'euristica EXE_PATH/OS
+/// dell'ambiente (bootstrap::remote_is_unix — la stessa che sceglie il
+/// canale di bootstrap SSH vs WinRM).
+fn remote_is_unix_hello(hello: &version::ServerHello) -> bool {
+    match hello.os {
+        Some(version::RemoteOs::Linux) => true,
+        Some(version::RemoteOs::Windows) => false,
+        None => bootstrap::remote_is_unix(),
+    }
+}
+
 /// Lato client, forma `--`: invia il comando shell-mode e streamma la
 /// risposta su stdout fino a EOF. Con `quit_after` (flag --ephemeral)
 /// il comando parte col prefisso QUIT_AFTER_PREFIX: e' il SERVER a
 /// spegnersi a fine esecuzione (a qualunque esito — vedi
 /// handle_connection), non il client a inviare un `quit` dopo.
-async fn client_mode(cmd: &str, quit_after: bool) -> Result<()> {
+///
+/// I token sono ricomposti in base all'OS remoto: POSIX-quote su unix
+/// (il raggruppamento della shell locale sopravvive — fix "sleep: missing
+/// operand"), join con spazi su Windows (semantica cmd.exe).
+/// Su server dello stesso BUILD_TS si chiede il marker di exit code
+/// (EXIT_CODE_PREFIX) e l'exit code remoto diventa quello del processo.
+async fn client_mode(tokens: &[String], quit_after: bool) -> Result<()> {
     // Connessione + handshake + auto-update (stessa logica di put/get/sync:
     // connect_and_handshake orchestra retry, bootstrap e version skew).
-    let mut socket = connect_and_handshake().await?;
+    // La variante _hello serve a leggere l'OS remoto dichiarato.
+    let (mut socket, hello) = connect_and_handshake_hello().await?;
+    let remote_unix = remote_is_unix_hello(&hello);
+    let cmd = runcmd::rejoin_command(tokens, remote_unix);
 
-    // Send command. In modalita' effimera il prefisso e' parte della
-    // stessa riga di comando: una sola write, nessuna seconda connessione.
+    // Exit-code marker: il prefisso-sentinel e' compreso SOLO da server
+    // dello stesso build — su server diversi il comando resta come oggi
+    // (il ts e' allineato da reconcile, quindi diverso => update fallito
+    // o NO_UPDATE: in quel caso meglio il comportamento legacy).
+    let want_exit_code = hello.ts == Some(version::BUILD_TS);
+
     let mut wire_cmd = String::new();
     if quit_after {
         wire_cmd.push_str(QUIT_AFTER_PREFIX);
     }
-    wire_cmd.push_str(cmd);
+    if want_exit_code {
+        wire_cmd.push_str(runcmd::EXIT_CODE_PREFIX);
+    }
+    wire_cmd.push_str(&cmd);
     socket.write_all(wire_cmd.as_bytes()).await?;
 
-    // Stream output to stdout
+    let exit_code = stream_shell_output(&mut socket, want_exit_code, true).await?;
+    if let Some(code) = exit_code {
+        if code != 0 {
+            std::process::exit(code);
+        }
+    }
+    Ok(())
+}
+
+/// Streamma l'output shell-mode su stdout fino a EOF (`echo=false`:
+/// drena e scarta — comandi interni come cleanup). Con `want_exit_code`
+/// tiene in coda gli ultimi EXIT_MARKER_TAIL byte senza stamparli: se la
+/// coda termina col marker `CROSSPILOT_EXIT_CODE=<n>` lo estrae (e non lo
+/// stampa) e ne ritorna il valore; altrimenti stampa la coda e torna None
+/// (server senza marker = exit code ignoto -> trattato come 0).
+async fn stream_shell_output(socket: &mut tls::Link, want_exit_code: bool, echo: bool) -> Result<Option<i32>> {
     let mut stdout = tokio::io::stdout();
     let mut buf = [0; 1024];
+    let mut tail: Vec<u8> = Vec::new();
     loop {
         let n = socket.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        stdout.write_all(&buf[..n]).await?;
-        stdout.flush().await?;
+        if want_exit_code {
+            // Accumula in coda e stampa solo l'eccesso: il marker puo'
+            // arrivare spezzato su piu' chunk, lo troviamo sempre intero.
+            tail.extend_from_slice(&buf[..n]);
+            if tail.len() > runcmd::EXIT_MARKER_TAIL {
+                let flush_n = tail.len() - runcmd::EXIT_MARKER_TAIL;
+                if echo {
+                    stdout.write_all(&tail[..flush_n]).await?;
+                }
+                tail.drain(..flush_n);
+            }
+        } else if echo {
+            stdout.write_all(&buf[..n]).await?;
+        }
+        if echo {
+            stdout.flush().await?;
+        }
+    }
+    if want_exit_code {
+        let (rest, code) = runcmd::extract_exit_marker(&tail);
+        if echo && !rest.is_empty() {
+            stdout.write_all(rest).await?;
+            stdout.flush().await?;
+        }
+        return Ok(code);
+    }
+    Ok(None)
+}
+
+/// Un comando shell-mode "one-shot" su connessione fresca: usato dai
+/// path interni (chmod post-put, cleanup di `run`) dove non serve il
+/// quoting da token — la command-line e' gia' completa. L'output remoto
+/// e' scartato; ritorna l'exit code quando il server e' dello stesso
+/// build (prefisso-sentinel compreso), None altrove.
+async fn shell_once(cmd: &str) -> Result<Option<i32>> {
+    let (mut socket, hello) = connect_and_handshake_hello().await?;
+    let want_exit_code = hello.ts == Some(version::BUILD_TS);
+    let mut wire_cmd = String::new();
+    if want_exit_code {
+        wire_cmd.push_str(runcmd::EXIT_CODE_PREFIX);
+    }
+    wire_cmd.push_str(cmd);
+    socket.write_all(wire_cmd.as_bytes()).await?;
+    stream_shell_output(&mut socket, want_exit_code, false).await
+}
+
+/// Lato client, subcommand `run`: upload dello script in tmp remoto,
+/// esecuzione via shell-mode (exit code propagato) e cleanup dello staged.
+/// Con `quit_after` (--ephemeral) il quit finale e' best-effort DOPO il
+/// cleanup (un quit nel comando di esecuzione impedirebbe il cleanup).
+async fn client_run(script: &str, args: &[String], quit_after: bool) -> Result<()> {
+    // Valida lo script locale (fail-fast, exit code 2 come put).
+    if let Err(e) = path::require_local_file_exists(script) {
+        eprintln!("[ERROR] run: {}", e);
+        std::process::exit(2);
     }
 
+    // OS remoto per la scelta di tmp/interprete: serve l'handshake, ma
+    // la connessione e' per-op — uso l'euristica env-based (coerente con
+    // la scelta dei dialetti bootstrap, mai in contraddizione col remote).
+    let remote_unix = bootstrap::remote_is_unix();
+    let remote_tmp = runcmd::remote_tmp_script_path(script, remote_unix)?;
+    runcmd::check_remote_path(&remote_tmp)?;
+
+    // 1) Upload dello script (connessione framed dedicata).
+    let mut socket = connect_and_handshake().await?;
+    transfer::put_client(&mut socket, script, &remote_tmp).await?;
+
+    // 2) Esecuzione via shell-mode (connessione fresca: i modi sono
+    //    per-connessione, non mixabili). Chiede il marker di exit code
+    //    solo se il server e' dello stesso build (prefisso compreso).
+    let exec_cmd = runcmd::build_exec_command(script, &remote_tmp, args, remote_unix)?;
+    let cleanup_cmd = runcmd::build_cleanup_command(&remote_tmp, remote_unix);
+    let mut exec_socket = connect_and_handshake_hello().await?;
+    let want_exit_code = exec_socket.1.ts == Some(version::BUILD_TS);
+    let mut wire_cmd = String::new();
+    if want_exit_code {
+        wire_cmd.push_str(runcmd::EXIT_CODE_PREFIX);
+    }
+    wire_cmd.push_str(&exec_cmd);
+    exec_socket.0.write_all(wire_cmd.as_bytes()).await?;
+    let exec_outcome = stream_shell_output(&mut exec_socket.0, want_exit_code, true).await;
+
+    // 3) Cleanup dello staged remoto: SEMPRE tentato (anche a exec
+    //    fallita), best-effort — lo script in tmp non deve sopravvivere.
+    if let Err(e) = shell_once(&cleanup_cmd).await {
+        eprintln!("[WARN] run: cleanup remoto fallito ({}): {}", remote_tmp, e);
+    }
+
+    // --ephemeral: shutdown finale a operazione conclusa.
+    if quit_after {
+        ephemeral_quit_best_effort().await;
+    }
+
+    let exit_code = exec_outcome?;
+    if let Some(code) = exit_code {
+        if code != 0 {
+            std::process::exit(code);
+        }
+    }
+    crate::qprintln!("run: {} eseguito sul remote ({})", script, remote_tmp);
     Ok(())
 }
 
@@ -1681,7 +2102,7 @@ async fn client_quit() -> Result<()> {
     let mut buf = [0u8; 64];
     let eof = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await;
     match eof {
-        Ok(Ok(0)) => eprintln!("[DEBUG] quit consegnato: server in shutdown."),
+        Ok(Ok(0)) => crate::qprintln!("[DEBUG] quit consegnato: server in shutdown."),
         _ => eprintln!("[WARN] quit inviato ma nessun EOF entro 5s: il server potrebbe non spegnersi."),
     }
     Ok(())
@@ -1693,7 +2114,7 @@ async fn client_quit() -> Result<()> {
 /// un fallimento del quit NON deve mascherare l'esito dell'operazione
 /// principale — il warning resta nel log.
 async fn ephemeral_quit_best_effort() {
-    eprintln!("[ephemeral] operazione conclusa: invio quit al server...");
+    crate::qprintln!("[ephemeral] operazione conclusa: invio quit al server...");
     if let Err(e) = client_quit().await {
         eprintln!("[WARN] --ephemeral: quit post-operazione fallito: {:#}", e);
     }
@@ -1749,5 +2170,70 @@ mod tests {
         // Righe non-READY: zombie/protocollo diverso -> errore.
         assert!(parse_ready_line("HELLO").is_err());
         assert!(parse_ready_line("").is_err());
+    }
+
+    #[tokio::test]
+    async fn ready_grace_cold_start_delayed() {
+        // Race di cold-start (bug report #0): il listener accetta subito
+        // (backlog kernel) ma scrive READY solo dopo l'init — oltre la
+        // finestra "fast". La fase 2 sulla stessa socket deve riceverlo.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let acc = listener.accept().await;
+            let (mut srv, _) = acc.unwrap();
+            // Ritardo > fast(50ms): simula l'init del server pre-accept.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // READY spezzato in due write: verifica anche che i byte
+            // parziali della prima fase sopravvivano alla seconda
+            // (buffer condiviso, niente perdita di segmenti a cavallo).
+            let w1 = srv.write_all(b"READY 1758").await;
+            w1.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let w2 = srv.write_all(b"530400 L\n").await;
+            w2.unwrap();
+        });
+        let addr = format!("127.0.0.1:{}", port);
+        let mut s = TcpStream::connect(&addr).await.unwrap();
+        let mut line = Vec::new();
+        let hello = read_ready_line_grace(
+            &mut s,
+            &mut line,
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+            "test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(hello.ts, Some(1758530400));
+        assert_eq!(hello.os, Some(version::RemoteOs::Linux));
+    }
+
+    #[tokio::test]
+    async fn ready_grace_listener_silenzioso_timeout() {
+        // Listener estraneo che accetta ma non parla mai: la finestra
+        // cold-start scade comunque e l'errore resta "handshake timeout"
+        // (segnale corretto per il fallback al bootstrap).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let acc = listener.accept().await;
+            let (_srv, _) = acc.unwrap();
+            // Tiene la connessione aperta senza mai scrivere.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let addr = format!("127.0.0.1:{}", port);
+        let mut s = TcpStream::connect(&addr).await.unwrap();
+        let mut line = Vec::new();
+        let res = read_ready_line_grace(
+            &mut s,
+            &mut line,
+            Duration::from_millis(30),
+            Duration::from_millis(120),
+            "test",
+        )
+        .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("handshake timeout"), "err={}", err);
     }
 }

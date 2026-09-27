@@ -77,7 +77,7 @@ fn ssh_context() -> SshCtx {
     let password = ssh_password();
     // Mai loggare la password (spec §3: stessa disciplina di ssh_context
     // storico — solo target/porta/utente).
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] ssh_context: {}@{}:{} key={} pass={}",
         user,
         host,
@@ -147,7 +147,7 @@ async fn ssh_write(
                 );
             }
         }
-        None => eprintln!(
+        None => crate::qprintln!(
             "[DEBUG] deploy-ssh: stat post-upload {} non disponibile",
             remote_path
         ),
@@ -183,12 +183,12 @@ async fn remote_build_info(
     let out = ssh_run(sess, &cmd, "remote_build_info").await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let info = version::parse_remote_info(&stdout);
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] remote_build_info (ssh/{:?}): exe_present={} ts={:?} linux_present={}",
         d, info.exe_present, info.build_ts, info.linux_present
     );
     if let Some(h) = &info.exe_sha256 {
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] remote_build_info (ssh): exe_sha256={}",
             &h[..16.min(h.len())]
         );
@@ -308,7 +308,7 @@ async fn deploy_exe(
                 staged_ts = Some(ts);
             }
         }
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] deploy-ssh functional check: exit={:?} ts={:?} atteso={}",
             out.code,
             staged_ts,
@@ -688,7 +688,7 @@ async fn remote_startup_diag(sess: &SshSession, d: Dialect) {
                     let ready_probe_ok = stdout.contains("READY_PROBE: ok");
                     // Debug log di supporto: l'esito del probe e' la prova
                     // diretta della tesi (init lenta vs filtro esterno).
-                    eprintln!(
+                    crate::qprintln!(
                         "[DEBUG] diag: proc={} listen={} ready_probe={}",
                         has_proc,
                         has_listen,

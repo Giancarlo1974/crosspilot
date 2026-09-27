@@ -379,7 +379,7 @@ pub fn canonicalize_under(remote_dir: &Path, joined: &Path) -> Result<(), Transf
     }
 
     // Debug: il suffix è stato calcolato per tracciabilità (best-practice: log).
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] canonicalize_under: base={} canon_existing={} suffix={} -> ok",
         canon_base.display(),
         canon_existing.display(),

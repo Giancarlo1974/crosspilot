@@ -677,6 +677,18 @@ pub struct ListEntry {
 pub struct ListRes {
     /// Entry enumerate (entry_count sul wire).
     pub entries: Vec<ListEntry>,
+    /// Rel_path delle directory che il server non ha potuto leggere
+    /// (es. Permission denied): il walk e' continuato ma il contenuto di
+    /// queste dir e' SCONOSCIUTO — il client le segnala come warning e,
+    /// con --delete, sospende la fase di cancellazione (semantica rsync
+    /// "IO error encountered -- skipping file deletion").
+    ///
+    /// Codificato come TRAILER dopo le entry (u32 count + stringhe):
+    /// i decoder vecchi si fermano a entry_count e ignorano i byte
+    /// residui, quindi un server nuovo resta compatibile con client
+    /// vecchi; un server vecchio non emette il trailer e il client nuovo
+    /// legge skipped vuoto. Nessun bump di VERSION necessario.
+    pub skipped: Vec<String>,
 }
 
 /// Singolo item di un batch DELETE: path + flag recursive.
@@ -790,7 +802,13 @@ pub fn decode_list_req(payload: &[u8]) -> Result<ListReq> {
     Ok(ListReq { path, recursive, with_hash })
 }
 
-/// Codifica una ListRes in payload (u32 LE entry_count + [entry]×N).
+/// Cap sul numero di path "skipped" nel trailer di LIST_RES (difensivo:
+/// i path saltati per errori di lettura sono rari; un tetto evita payload
+/// spropositati su filesystem rotti).
+pub const LIST_SKIPPED_CAP: u32 = 1000;
+
+/// Codifica una ListRes in payload (u32 LE entry_count + [entry]×N +
+/// trailer skipped: u32 LE count + [u16 LE len + utf8]×M).
 pub fn encode_list_res(res: &ListRes) -> Result<Vec<u8>> {
     let count = res.entries.len() as u32;
     let mut payload = Vec::new();
@@ -799,6 +817,20 @@ pub fn encode_list_res(res: &ListRes) -> Result<Vec<u8>> {
     for entry in &res.entries {
         encode_list_entry(&mut payload, entry)?;
     }
+    // Trailer skipped (backward-compat: i decoder vecchi lo ignorano).
+    let skipped_count = res.skipped.len().min(LIST_SKIPPED_CAP as usize) as u32;
+    let skipped_bytes = skipped_count.to_le_bytes();
+    payload.extend_from_slice(&skipped_bytes);
+    let mut idx = 0usize;
+    while idx < skipped_count as usize {
+        let s = &res.skipped[idx];
+        let s_bytes = s.as_bytes();
+        let s_len = s_bytes.len() as u16;
+        let s_len_bytes = s_len.to_le_bytes();
+        payload.extend_from_slice(&s_len_bytes);
+        payload.extend_from_slice(s_bytes);
+        idx += 1;
+    }
     Ok(payload)
 }
 
@@ -806,6 +838,11 @@ pub fn encode_list_res(res: &ListRes) -> Result<Vec<u8>> {
 /// `with_hash` indica se il server ha incluso SHA-256 per i file (deve
 /// corrispondere al flag della ListReq originale): senza di esso il decoder
 /// non può distinguere i 32 byte dell'hash dai byte della entry successiva.
+///
+/// Il trailer skipped (presente solo nei server nuovi) e' OPZIONALE: se il
+/// payload termina dopo le entry (server vecchio) skipped resta vuoto; se
+/// e' presente ma malformato si logga e si prosegue (mai fallire la LIST
+/// per metadati diagnostici).
 pub fn decode_list_res(payload: &[u8], with_hash: bool) -> Result<ListRes> {
     if payload.len() < 4 {
         bail!("ListRes: payload troppo corto ({} byte, attesi almeno 4)", payload.len());
@@ -826,7 +863,50 @@ pub fn decode_list_res(payload: &[u8], with_hash: bool) -> Result<ListRes> {
         entries.push(entry);
         i += 1;
     }
-    Ok(ListRes { entries })
+    let skipped = decode_skipped_trailer(payload, offset);
+    Ok(ListRes { entries, skipped })
+}
+
+/// Decodifica il trailer skipped opzionale di LIST_RES (u32 LE count +
+/// [u16 LE len + utf8]×M) a partire da `offset`. Payload terminato o
+/// trailer troncato -> lista vuota + warning (tolleranza forward-compat).
+fn decode_skipped_trailer(payload: &[u8], offset: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    // Server vecchio: nessun byte residuo dopo le entry.
+    if offset >= payload.len() {
+        return out;
+    }
+    if payload.len() < offset + 4 {
+        crate::qprintln!("[WARN] ListRes: trailer skipped troncato (count), ignorato");
+        return out;
+    }
+    let count = u32::from_le_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]);
+    let count = count.min(LIST_SKIPPED_CAP);
+    let mut pos = offset + 4;
+    let mut i = 0u32;
+    while i < count {
+        if payload.len() < pos + 2 {
+            crate::qprintln!("[WARN] ListRes: trailer skipped troncato (len), parziale");
+            return out;
+        }
+        let s_len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+        if payload.len() < pos + s_len {
+            crate::qprintln!("[WARN] ListRes: trailer skipped troncato (path), parziale");
+            return out;
+        }
+        let s_bytes = &payload[pos..pos + s_len];
+        let s = String::from_utf8_lossy(s_bytes).into_owned();
+        out.push(s);
+        pos += s_len;
+        i += 1;
+    }
+    out
 }
 
 /// Codifica una singola entry e l'appende al payload.
@@ -1450,7 +1530,7 @@ mod tests {
                 sha256: None,
             },
         ];
-        let res = ListRes { entries };
+        let res = ListRes { entries, skipped: Vec::new() };
         let payload = encode_list_res(&res).unwrap();
         let decoded = decode_list_res(&payload, false).unwrap();
         assert_eq!(decoded.entries.len(), 3);
@@ -1481,7 +1561,7 @@ mod tests {
                 sha256: None,
             },
         ];
-        let res = ListRes { entries };
+        let res = ListRes { entries, skipped: Vec::new() };
         let payload = encode_list_res(&res).unwrap();
         let decoded = decode_list_res(&payload, true).unwrap();
         assert_eq!(decoded.entries.len(), 2);
@@ -1496,6 +1576,53 @@ mod tests {
         let payload = encode_list_res(&res).unwrap();
         let decoded = decode_list_res(&payload, false).unwrap();
         assert!(decoded.entries.is_empty());
+    }
+
+    #[test]
+    fn list_res_skipped_trailer_roundtrip() {
+        // Server nuovo: il trailer skipped sopravvive al roundtrip.
+        let res = ListRes {
+            entries: vec![ListEntry {
+                rel_path: "ok.txt".to_string(),
+                size: 2,
+                is_dir: 0,
+                sha256: None,
+            }],
+            skipped: vec![
+                "keycloak/data/postgres".to_string(),
+                "root_only".to_string(),
+            ],
+        };
+        let payload = encode_list_res(&res).unwrap();
+        let decoded = decode_list_res(&payload, false).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.skipped.len(), 2);
+        assert_eq!(decoded.skipped[0], "keycloak/data/postgres");
+    }
+
+    #[test]
+    fn list_res_skipped_trailer_backward_compat() {
+        // Client nuovo + server vecchio: payload senza trailer -> skipped vuoto.
+        // Simula il vecchio encode: solo u32 count + entry, niente trailer.
+        let mut payload = Vec::new();
+        let count_bytes = 0u32.to_le_bytes();
+        payload.extend_from_slice(&count_bytes);
+        let decoded = decode_list_res(&payload, false).unwrap();
+        assert!(decoded.entries.is_empty());
+        assert!(decoded.skipped.is_empty());
+    }
+
+    #[test]
+    fn list_res_skipped_trailer_truncated_tollerato() {
+        // Trailer malformato (2 byte residui): tollerato, skipped vuoto.
+        let res = ListRes {
+            entries: vec![],
+            skipped: vec!["a".to_string()],
+        };
+        let mut payload = encode_list_res(&res).unwrap();
+        payload.truncate(payload.len() - 2);
+        let decoded = decode_list_res(&payload, false).unwrap();
+        assert!(decoded.skipped.is_empty());
     }
 
     #[test]

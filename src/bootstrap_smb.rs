@@ -114,7 +114,7 @@ pub(crate) fn smb_context() -> SmbCtx {
     let user_raw = envs::var("USER").unwrap_or_else(|| "gianca".to_string());
     let pass = envs::var("PASS").unwrap_or_else(|| "gianca".to_string());
     let (user, domain) = bootstrap::split_domain_user(&user_raw);
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] smb_context: host={} user={} domain={}",
         host, user, domain
     );
@@ -616,12 +616,12 @@ async fn remote_build_info(
     }
 
     let info = version::parse_remote_info(&report);
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] remote_build_info (smb): exe_present={} ts={:?} linux_present={}",
         info.exe_present, info.build_ts, info.linux_present
     );
     if let Some(h) = &info.exe_sha256 {
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] remote_build_info (smb): exe_sha256={}",
             &h[..16.min(h.len())]
         );

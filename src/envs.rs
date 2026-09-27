@@ -175,11 +175,11 @@ pub fn load_dotenv() -> bool {
         }
         match dotenvy::from_path(path) {
             Ok(_) => {
-                eprintln!("[DEBUG] Loaded .env from: {}", path.display());
+                crate::qprintln!("[DEBUG] Loaded .env from: {}", path.display());
                 return true;
             }
             Err(e) => {
-                eprintln!("[DEBUG] Failed to load .env from {}: {}", path.display(), e);
+                crate::qprintln!("[DEBUG] Failed to load .env from {}: {}", path.display(), e);
             }
         }
     }
@@ -743,7 +743,7 @@ fn save(path: &Path, lines: &[String]) -> Result<()> {
         .with_context(|| format!("scrittura {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    eprintln!("[DEBUG] .env salvato: {}", path.display());
+    crate::qprintln!("[DEBUG] .env salvato: {}", path.display());
     Ok(())
 }
 

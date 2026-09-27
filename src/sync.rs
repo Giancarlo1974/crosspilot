@@ -48,6 +48,11 @@ pub struct WalkResult {
     pub skipped_non_utf8: Vec<String>,
     /// Path skippati perché contengono nomi riservati Windows (sync-spec §8.3).
     pub skipped_reserved: Vec<(String, &'static str)>,
+    /// Sotto-directory locali non leggibili (es. Permission denied): il walk
+    /// continua, ma il contenuto e' sconosciuto — con --delete la fase di
+    /// cancellazione va sospesa (semantica rsync: IO error -> niente delete).
+    /// La radice illeggibile resta invece fatale (walk vuoto = niente sync).
+    pub skipped_unreadable: Vec<String>,
 }
 
 /// Stato di una entry nel diff (sync-spec §6, §10).
@@ -83,6 +88,12 @@ pub struct Diff {
     pub entries: Vec<DiffEntry>,
     pub skipped_non_utf8: Vec<String>,
     pub skipped_reserved: Vec<(String, &'static str)>,
+    /// Sotto-directory LOCALI non leggibili (dal walk): contenuto ignoto.
+    pub skipped_unreadable: Vec<String>,
+    /// Sotto-directory REMOTE non leggibili (trailer LIST_RES; vuoto su
+    /// server pre-feature): contenuto ignoto. Riempito dal caller dopo
+    /// compute_diff (list_remote_dir lo restituisce a parte).
+    pub skipped_remote: Vec<String>,
 }
 
 impl Diff {
@@ -132,6 +143,12 @@ pub struct Plan {
     pub skipped_non_utf8: Vec<String>,
     /// Path skippati nomi riservati Windows.
     pub skipped_reserved: Vec<(String, &'static str)>,
+    /// Sotto-directory locali non leggibili: se non vuoto, la fase DELETE
+    /// va sospesa (contenuto sorgente potenzialmente sotto-enumerato).
+    pub skipped_unreadable: Vec<String>,
+    /// Sotto-directory remote non leggibili (da LIST_RES skipped): se non
+    /// vuoto, la fase DELETE va sospesa (contenuto dest sconosciuto).
+    pub skipped_remote: Vec<String>,
 }
 
 /// Report finale di sync (sync-spec §11).
@@ -159,10 +176,11 @@ pub fn walk_local_dir(dir: &Path) -> Result<WalkResult> {
     let mut entries = Vec::new();
     let mut skipped_non_utf8 = Vec::new();
     let mut skipped_reserved = Vec::<(String, &'static str)>::new();
-    walk_recursive(dir, Path::new(""), &mut entries, &mut skipped_non_utf8, &mut skipped_reserved)?;
+    let mut skipped_unreadable = Vec::new();
+    walk_recursive(dir, Path::new(""), &mut entries, &mut skipped_non_utf8, &mut skipped_reserved, &mut skipped_unreadable)?;
     // Ordina per rel_path per output deterministico (sync-spec §16).
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok(WalkResult { entries, skipped_non_utf8, skipped_reserved })
+    Ok(WalkResult { entries, skipped_non_utf8, skipped_reserved, skipped_unreadable })
 }
 
 /// Funzione ricorsiva interna del walk. `base` è la dir root, `rel` è il path
@@ -173,14 +191,28 @@ fn walk_recursive(
     out: &mut Vec<Entry>,
     skipped_non_utf8: &mut Vec<String>,
     skipped_reserved: &mut Vec<(String, &'static str)>,
+    skipped_unreadable: &mut Vec<String>,
 ) -> Result<()> {
     let full = base.join(rel);
     let read_dir_result = fs::read_dir(&full);
     let dir_iter = match read_dir_result {
         Ok(it) => it,
         Err(e) => {
-            // Errore di lettura directory: propaga (sync-spec §13 ERR 3 IO).
-            return Err(anyhow!("impossibile leggere directory {}: {}", full.display(), e));
+            // Radice illeggibile -> fatale. Sotto-directory illeggibile ->
+            // warning + skip (bugfix: una dir root-only abortiva l'intero
+            // sync; ora il walk continua come rsync). La dir e' comunque
+            // gia' enumerata come entry dal chiamante: con --delete il
+            // contenuto mancante non va cancellato (vedi execute_sync).
+            if rel.as_os_str().is_empty() {
+                return Err(anyhow!("impossibile leggere directory {}: {}", full.display(), e));
+            }
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            eprintln!(
+                "[WARN] walk: directory non leggibile, skip contenuto: {} ({})",
+                rel_str, e
+            );
+            skipped_unreadable.push(rel_str);
+            return Ok(());
         }
     };
     for entry in dir_iter {
@@ -246,7 +278,7 @@ fn walk_recursive(
                 sha256: None,
             });
             // Ricorsione nella sottodirectory.
-            walk_recursive(base, &child_rel, out, skipped_non_utf8, skipped_reserved)?;
+            walk_recursive(base, &child_rel, out, skipped_non_utf8, skipped_reserved, skipped_unreadable)?;
         } else {
             out.push(Entry {
                 rel_path: child_rel_str,
@@ -263,21 +295,31 @@ fn walk_recursive(
 // LIST remoto (lato client) - sync-spec §6, §9.
 // ---------------------------------------------------------------------------
 
+/// Esito di LIST remoto: entry enumerate + directory remote non leggibili
+/// (trailer opzionale di LIST_RES — vuoto su server pre-feature).
+#[derive(Debug, Default)]
+pub struct ListOutcome {
+    pub entries: Vec<Entry>,
+    /// rel_path delle sotto-dir remote illeggibili (walk continuato):
+    /// il loro contenuto e' sconosciuto — vedi delete-guard in execute_sync.
+    pub skipped: Vec<String>,
+}
+
 /// Lato client: invia LIST_REQ e legge LIST_RES (o ERR).
-/// Ritorna la lista di entry remote. `with_hash` controlla se il server include
+/// Ritorna entry remote + skipped. `with_hash` controlla se il server include
 /// SHA-256 per i file (un solo passaggio sul filesystem remoto, sync-spec §6.1).
 pub async fn list_remote_dir(
     stream: &mut Link,
     remote_dir: &str,
     with_hash: bool,
-) -> Result<Vec<Entry>> {
+) -> Result<ListOutcome> {
     // Costruisce la ListReq: recursive=1 (tutto l'albero), with_hash dal flag.
     let req = ListReq {
         path: remote_dir.to_string(),
         recursive: 1,
         with_hash: if with_hash { 1 } else { 0 },
     };
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] list_remote_dir: LIST_REQ path={} recursive=1 with_hash={}",
         remote_dir, req.with_hash
     );
@@ -299,7 +341,7 @@ pub async fn list_remote_dir(
     }
     // Decodifica con il flag with_hash coerente con la richiesta.
     let res = proto::decode_list_res(&payload, with_hash)?;
-    eprintln!("[DEBUG] list_remote_dir: ricevute {} entry", res.entries.len());
+    crate::qprintln!("[DEBUG] list_remote_dir: ricevute {} entry", res.entries.len());
 
     // Validazione difensiva (sync-spec §8): ogni rel_path ricevuto dal server
     // non deve contenere '..' (un server malevolo/buggato non deve far escapare
@@ -316,7 +358,149 @@ pub async fn list_remote_dir(
         }
         clean.push(entry.clone());
     }
-    Ok(clean)
+    // Skipped remoti (trailer opzionale): le dir qui elencate esistono ma
+    // non sono leggibili dal server — il loro contenuto e' sconosciuto.
+    if !res.skipped.is_empty() {
+        eprintln!(
+            "[WARN] list_remote_dir: {} directory remote non leggibili (contenuto ignoto)",
+            res.skipped.len()
+        );
+    }
+    Ok(ListOutcome {
+        entries: clean,
+        skipped: res.skipped,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Esclusioni (--exclude <pattern>) - glob semplice su rel_path.
+// ---------------------------------------------------------------------------
+
+/// Match glob minimale: '*' = qualunque sequenza (incl. '/', vuota),
+/// '?' = un carattere. Ricorsione su '*' con backtracking.
+/// (Niente dipendenze esterne: la sintassi resta volutamente essenziale.)
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    glob_match_rec(&pat, 0, &txt, 0)
+}
+
+/// Cuore ricorsivo del match glob con backtracking su '*'.
+fn glob_match_rec(pat: &[char], pi: usize, txt: &[char], ti: usize) -> bool {
+    if pi == pat.len() {
+        return ti == txt.len();
+    }
+    match pat[pi] {
+        '*' => {
+            // '*' matcha zero o piu' caratteri qualsiasi (anche '/').
+            let mut k = ti;
+            while k <= txt.len() {
+                if glob_match_rec(pat, pi + 1, txt, k) {
+                    return true;
+                }
+                k += 1;
+            }
+            false
+        }
+        '?' => ti < txt.len() && glob_match_rec(pat, pi + 1, txt, ti + 1),
+        c => ti < txt.len() && txt[ti] == c && glob_match_rec(pat, pi + 1, txt, ti + 1),
+    }
+}
+
+/// True se `rel_path` e' escluso da `patterns` (semantica --exclude stile
+/// rsync, semplificata):
+/// - pattern con '/'  -> match sul rel_path intero E su ogni antenato
+///   (escludere "a/b" esclude anche il subtree "a/b/c");
+/// - pattern senza '/' -> match sul basename di ogni componente del path
+///   (escludere "*.log" esclude "sub/x.log"; escludere "cache" esclude
+///   "a/cache/b" perche' il componente dir "cache" matcha).
+pub fn is_excluded(rel_path: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    // Candidati: il rel_path stesso + ogni antenato (componente a prefisso).
+    // Es: "a/b/c" -> ["a/b/c", "a/b", "a"].
+    let mut candidates: Vec<&str> = Vec::new();
+    candidates.push(rel_path);
+    let bytes = rel_path.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            let ancestor = &rel_path[..i];
+            candidates.push(ancestor);
+        }
+        i += 1;
+    }
+    for pat in patterns {
+        let pat = pat.trim_matches('/');
+        if pat.is_empty() {
+            continue;
+        }
+        let has_slash = pat.contains('/');
+        for cand in &candidates {
+            if has_slash {
+                if glob_match(pat, cand) {
+                    return true;
+                }
+            } else {
+                // Pattern basename-only: confronta col nome del componente.
+                let base = cand.rsplit('/').next().unwrap_or(cand);
+                if glob_match(pat, base) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Filtra le entry locali e remote secondo le esclusioni --exclude.
+/// Entrambi i lati: un path escluso non e' ne' trasferito ne' cancellato
+/// (esattamente come rsync --exclude).
+pub fn apply_exclusions(
+    local: &mut WalkResult,
+    remote: &mut Vec<Entry>,
+    patterns: &[String],
+) {
+    if patterns.is_empty() {
+        return;
+    }
+    // Locale: le entry escluse spariscono dal source (non vanno in NEW).
+    let mut kept_local: Vec<Entry> = Vec::with_capacity(local.entries.len());
+    let mut excluded_count = 0usize;
+    let mut idx = 0usize;
+    while idx < local.entries.len() {
+        let e = &local.entries[idx];
+        if is_excluded(&e.rel_path, patterns) {
+            excluded_count += 1;
+        } else {
+            kept_local.push(e.clone());
+        }
+        idx += 1;
+    }
+    local.entries = kept_local;
+    // Remoto: le entry escluse spariscono dalla vista -> non MISSING ->
+    // non cancellabili con --delete (rsync: l'esclusione protegge anche
+    // dalla cancellazione, non solo dal trasferimento).
+    let mut kept_remote: Vec<Entry> = Vec::with_capacity(remote.len());
+    let mut j = 0usize;
+    while j < remote.len() {
+        let e = &remote[j];
+        if is_excluded(&e.rel_path, patterns) {
+            excluded_count += 1;
+        } else {
+            kept_remote.push(e.clone());
+        }
+        j += 1;
+    }
+    *remote = kept_remote;
+    if excluded_count > 0 {
+        crate::qprintln!(
+            "[sync] --exclude: {} path esclusi (pattern: {})",
+            excluded_count,
+            patterns.join(", ")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +724,8 @@ pub fn compute_diff(local: &WalkResult, remote: &[Entry], checksum: bool, local_
         entries,
         skipped_non_utf8: local.skipped_non_utf8.clone(),
         skipped_reserved: local.skipped_reserved.clone(),
+        skipped_unreadable: local.skipped_unreadable.clone(),
+        skipped_remote: Vec::new(),
     }
 }
 
@@ -647,6 +833,8 @@ pub fn build_plan(diff: &Diff, delete: bool) -> Plan {
         skipped_identical,
         skipped_non_utf8: diff.skipped_non_utf8.clone(),
         skipped_reserved: diff.skipped_reserved.clone(),
+        skipped_unreadable: diff.skipped_unreadable.clone(),
+        skipped_remote: diff.skipped_remote.clone(),
     }
 }
 
@@ -743,6 +931,14 @@ pub fn print_status(diff: &Diff, quiet: bool) {
             counts.new, counts.changed, counts.missing, counts.identical, counts.conflict
         );
     }
+    // Walk incompleti: directory non leggibili (il contenuto e' sconosciuto,
+    // non "identico" — un sync --delete le proteggerebbe comunque).
+    for s in &diff.skipped_unreadable {
+        eprintln!("[status] WARN directory locale non leggibile: {}", s);
+    }
+    for s in &diff.skipped_remote {
+        eprintln!("[status] WARN directory remota non leggibile: {}", s);
+    }
 }
 
 /// Etichetta di stato per l'output testuale (sync-spec §10).
@@ -789,6 +985,14 @@ pub fn print_plan(plan: &Plan) {
     // SKIP riservati Windows.
     for (s, reason) in &plan.skipped_reserved {
         println!("SKIP      {} ({})", s, reason);
+    }
+    // SKIP directory locali illeggibili (walk sorgente incompleto).
+    for s in &plan.skipped_unreadable {
+        println!("SKIP      {} (directory locale non leggibile)", s);
+    }
+    // SKIP directory remote illeggibili (walk dest incompleto).
+    for s in &plan.skipped_remote {
+        println!("SKIP      {} (directory remota non leggibile)", s);
     }
 }
 
@@ -837,24 +1041,170 @@ pub struct SyncParams {
     pub quiet: bool,
 }
 
+/// Connessione persistente riusabile per tutte le operazioni di un sync.
+///
+/// Prima ogni operazione apriva una connessione nuova (spec §5 "una
+/// connessione = una operazione"): handshake TCP+TLS ripetuto per OGNI
+/// file (report utente: sync lento e rumoroso). I server nuovi tengono
+/// la connessione file-mode aperta in un loop di messaggi, quindi una
+/// sola sessione serve tutto il sync.
+///
+/// Compatibilita' con i server vecchi (che chiudono dopo UNA operazione):
+/// il primo fallimento di trasporto su una connessione gia' usata marca
+/// `single_shot` — da quel punto si riapre una connessione fresca per
+/// ogni op, riproducendo il comportamento legacy senza round-trip sprecati.
+/// Qualunque drop di trasporto causa UNA riconnessione+retry (tutte le
+/// operazioni sync — LIST, PUT, MKDIR_BATCH, DELETE_BATCH — sono
+/// idempotenti); gli errori di protocollo non si ritentano mai.
+/// Futuro boxed della connect callback (alias per type_complexity).
+type ConnectFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Link>> + Send>>;
+/// Callback boxed che apre connessione+handshake+reconcile.
+type ConnectFn = Box<dyn FnMut() -> ConnectFut + Send>;
+
+pub struct SyncSession {
+    /// Connessione corrente (None = da (ri)aprire prima della prossima op).
+    link: Option<Link>,
+    /// Callback che apre connessione+handshake+reconcile (connect_and_handshake).
+    connect: ConnectFn,
+    /// Il link corrente ha gia' completato almeno un'op: se ora muore il
+    /// server e' "one-shot" (chiude dopo ogni operazione = pre-sessione
+    /// persistente) — si passa a conn fresca per op senza altri fallimenti.
+    served_on_link: bool,
+    /// Server "one-shot" rilevato: conn fresca per op (comportamento legacy).
+    single_shot: bool,
+    /// Contatore riconnessioni (diagnostica/report).
+    pub reconnects: u32,
+}
+
+impl SyncSession {
+    /// Avvolge la callback di connessione (es. `|| connect_and_handshake().await`).
+    pub fn new<F, Fut>(mut connect: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Link>> + Send + 'static,
+    {
+        Self {
+            link: None,
+            connect: Box::new(move || Box::pin(connect())),
+            served_on_link: false,
+            single_shot: false,
+            reconnects: 0,
+        }
+    }
+
+    /// Esegue un'operazione framed sulla connessione corrente.
+    /// Su drop di trasporto: una riconnessione + retry (le op sync sono
+    /// idempotenti). Errori di protocollo: propagati subito, mai ritentati.
+    pub async fn op<T>(
+        &mut self,
+        mut f: impl AsyncFnMut(&mut Link) -> Result<T>,
+    ) -> Result<T> {
+        let mut attempt = 0u32;
+        loop {
+            if self.link.is_none() {
+                let conn = (self.connect)().await?;
+                self.link = Some(conn);
+                self.served_on_link = false;
+            }
+            attempt += 1;
+            // take() del link: libera il borrow su self durante l'await.
+            let mut link = self.link.take().unwrap();
+            let was_used = self.served_on_link;
+            let result = f(&mut link).await;
+            match result {
+                Ok(v) => {
+                    if self.single_shot {
+                        // Server one-shot: la connessione e' comunque morta
+                        // dopo l'op — si butta subito (prossima op riapre).
+                        self.link = None;
+                        self.served_on_link = false;
+                    } else {
+                        self.link = Some(link);
+                        self.served_on_link = true;
+                    }
+                    return Ok(v);
+                }
+                Err(e) => {
+                    self.link = None;
+                    self.served_on_link = false;
+                    if attempt >= 2 || !is_transport_drop(&e) {
+                        return Err(e);
+                    }
+                    if was_used {
+                        // Morta DOPO un'op riuscita -> chiusura-per-op del
+                        // server legacy, non un problema di rete.
+                        self.single_shot = true;
+                    }
+                    self.reconnects += 1;
+                    crate::qprintln!(
+                        "[sync] connessione remota chiusa, riconnessione e retry..."
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// True se l'errore e' un drop di trasporto (connessione chiusa/reset/eof):
+/// unico caso in cui riconnettere+riprovare ha senso. Gli errori di
+/// protocollo ("rifiutata", "atteso X ricevuto Y", ERR server) non sono
+/// ritentabili: su una connessione fresca fallirebbero identici.
+fn is_transport_drop(e: &anyhow::Error) -> bool {
+    // io::Error in catena: UnexpectedEof/ConnectionReset/BrokenPipe di
+    // read_exact/write_all, o errori TLS incapsulati come io::Error.
+    for cause in e.chain() {
+        if cause.is::<std::io::Error>() {
+            return true;
+        }
+    }
+    // Fallback testuale per errori anyhow senza io::Error nella catena
+    // (es. "early eof" sollevato come bail! testuale dal reader TLS).
+    let msg = format!("{:#}", e).to_lowercase();
+    msg.contains("eof")
+        || msg.contains("closed")
+        || msg.contains("reset by peer")
+        || msg.contains("broken pipe")
+}
+
 /// Esegue il piano di sync: MKDIR_BATCH + put per-file + DELETE_BATCH.
 /// Gestisce CONFLICT (abort di quel path, errore parziale), --dry-run, --quiet.
 /// Niente connessioni parallele (best-practice): ogni operazione è sequenziale.
 ///
-/// `connect` è una callback che stabilisce una nuova connessione+handshake per
-/// ogni operazione (riutilizza connect_and_handshake di main.rs, invariata).
+/// Tutte le operazioni vanno su UNA SyncSession (connessione persistente
+/// riusata con reconnect-on-drop); su server pre-sessione il fallback
+/// "una connessione per op" e' automatico (vedi SyncSession).
+///
+/// `connect` è una callback che stabilisce una nuova connessione+handshake
+/// (riutilizza connect_and_handshake di main.rs, invariata).
 pub async fn execute_sync<F, Fut>(
     plan: &Plan,
     params: &SyncParams,
     connect: F,
 ) -> Result<SyncReport>
 where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Link>>,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Link>> + Send + 'static,
 {
     let start = Instant::now();
     let mut report = SyncReport::default();
     let local_dir = Path::new(&params.local_dir);
+
+    // Walk incompleto (dir locali o remote illeggibili): i contenuti
+    // sotto-enumerati rendono la fase DELETE pericolosa (file esistenti
+    // ma non visti apparirebbero "extra" -> cancellati). Semantica rsync:
+    // "IO error encountered -- skipping file deletion". Warning esplicito
+    // + skip di TUTTA la fase delete, anche in dry-run... no: in dry-run
+    // il piano si mostra comunque com'e' (nessun effetto collaterale).
+    let delete_guard = params.delete
+        && (!plan.skipped_unreadable.is_empty() || !plan.skipped_remote.is_empty());
+    if delete_guard {
+        eprintln!(
+            "[WARN] sync: --delete sospeso: {} dir locali e {} dir remote non leggibili \
+             (contenuto ignoto — nessuna cancellazione per sicurezza)",
+            plan.skipped_unreadable.len(),
+            plan.skipped_remote.len()
+        );
+    }
 
     // --dry-run: stampa il piano ed esci (sync-spec §7 passo 4, §14 test 8).
     if params.dry_run {
@@ -863,9 +1213,13 @@ where
         return Ok(report);
     }
 
-    // --- Passo 5: MKDIR_BATCH (1 connessione, tutte le dirs_to_create) ---
+    // Sessione persistente: una connessione serve tutte le operazioni
+    // (reconnect-on-drop + fallback one-shot su server legacy).
+    let mut session = SyncSession::new(connect);
+
+    // --- Passo 5: MKDIR_BATCH (tutte le dirs_to_create in un batch) ---
     if !plan.dirs_to_create.is_empty() {
-        let mkdir_result = run_mkdir_batch(plan, params, &connect).await;
+        let mkdir_result = run_mkdir_batch(plan, params, &mut session).await;
         match mkdir_result {
             Ok(mkdir_errors) => {
                 // Conta gli errori di mkdir (status=2).
@@ -874,7 +1228,7 @@ where
                     report.error_count += 1;
                 }
                 if !params.quiet {
-                    eprintln!(
+                    crate::qprintln!(
                         "[sync] MKDIR  {} directory create",
                         plan.dirs_to_create.len()
                     );
@@ -892,7 +1246,7 @@ where
         }
     }
 
-    // --- Passo 6: put per-file (sequenziale, 1 connessione per file) ---
+    // --- Passo 6: put per-file (sequenziale sulla sessione) ---
     for rel_path in &plan.files_to_put {
         let local_full = local_dir.join(rel_path);
         let local_str = match local_full.to_str() {
@@ -919,26 +1273,21 @@ where
             }
         };
 
-        // Nuova connessione per ogni put (riutilizza put_client, sync-spec §7).
-        let connect_result = connect().await;
-        let mut socket = match connect_result {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = format!("{}: connessione fallita: {}", rel_path, e);
-                eprintln!("[sync] ERRORE {}", msg);
-                report.errors.push(msg);
-                report.error_count += 1;
-                continue;
-            }
-        };
-
-        let put_result = crate::transfer::put_client(&mut socket, &local_str, &remote_full).await;
+        // PUT sulla connessione della sessione (riusata; reconnect+retry
+        // automatico su drop — put e' idempotente, sync-spec §7).
+        let local_ref = local_str.as_str();
+        let remote_ref = remote_full.as_str();
+        let put_result = session
+            .op(async |socket: &mut Link| {
+                crate::transfer::put_client(socket, local_ref, remote_ref).await
+            })
+            .await;
         match put_result {
             Ok(()) => {
                 report.put_count += 1;
                 report.bytes_total += file_size;
                 if !params.quiet {
-                    eprintln!("[sync] PUT    {} ({} byte)", rel_path, file_size);
+                    crate::qprintln!("[sync] PUT    {} ({} byte)", rel_path, file_size);
                 }
             }
             Err(e) => {
@@ -958,11 +1307,13 @@ where
         report.error_count += 1;
     }
 
-    // --- Passo 8: DELETE (solo con --delete) ---
-    if params.delete {
-        // 8a: DELETE_BATCH file (1 connessione, recursive=0).
+    // --- Passo 8: DELETE (solo con --delete E walk completo) ---
+    // delete_guard: se il walk ha saltato directory illeggibili (locale o
+    // remote) la fase delete e' sospesa — il warning e' gia' stato emesso.
+    if params.delete && !delete_guard {
+        // 8a: DELETE_BATCH file (recursive=0).
         if !plan.files_to_delete.is_empty() {
-            let del_result = run_delete_batch_files(plan, params, &connect).await;
+            let del_result = run_delete_batch_files(plan, params, &mut session).await;
             match del_result {
                 Ok(del_errors) => {
                     for err in &del_errors {
@@ -971,7 +1322,7 @@ where
                     }
                     report.delete_count += plan.files_to_delete.len() as u32;
                     if !params.quiet {
-                        eprintln!("[sync] DELETE {} file", plan.files_to_delete.len());
+                        crate::qprintln!("[sync] DELETE {} file", plan.files_to_delete.len());
                     }
                 }
                 Err(e) => {
@@ -982,9 +1333,9 @@ where
                 }
             }
         }
-        // 8b: DELETE_BATCH dir (1 connessione distinta, recursive=1, profondità decrescente).
+        // 8b: DELETE_BATCH dir (recursive=1, profondità decrescente).
         if !plan.dirs_to_delete.is_empty() {
-            let del_result = run_delete_batch_dirs(plan, params, &connect).await;
+            let del_result = run_delete_batch_dirs(plan, params, &mut session).await;
             match del_result {
                 Ok(del_errors) => {
                     for err in &del_errors {
@@ -993,7 +1344,7 @@ where
                     }
                     report.delete_count += plan.dirs_to_delete.len() as u32;
                     if !params.quiet {
-                        eprintln!("[sync] DELETE {} dir (recursive)", plan.dirs_to_delete.len());
+                        crate::qprintln!("[sync] DELETE {} dir (recursive)", plan.dirs_to_delete.len());
                     }
                 }
                 Err(e) => {
@@ -1009,17 +1360,19 @@ where
     // Skip identical (conteggio per report).
     report.skip_count = plan.skipped_identical.len() as u32;
 
+    // Diagnostica sessione: quante riconnessioni sono servite (drop di
+    // rete o fallback one-shot su server legacy).
+    if session.reconnects > 0 {
+        crate::qprintln!("[sync] riconnessioni effettuate: {}", session.reconnects);
+    }
+
     report.elapsed = start.elapsed();
     Ok(report)
 }
 
-/// Esegue MKDIR_BATCH_REQ su una nuova connessione. Ritorna la lista di messaggi
-/// di errore per-path (status=2). Count mismatch -> errore fatale propagato.
-async fn run_mkdir_batch<F, Fut>(plan: &Plan, params: &SyncParams, connect: &F) -> Result<Vec<String>>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Link>>,
-{
+/// Esegue MKDIR_BATCH_REQ sulla connessione della sessione. Ritorna la lista
+/// di messaggi di errore per-path (status=2). Count mismatch -> errore fatale.
+async fn run_mkdir_batch(plan: &Plan, params: &SyncParams, session: &mut SyncSession) -> Result<Vec<String>> {
     let mut paths = Vec::with_capacity(plan.dirs_to_create.len());
     for rel in &plan.dirs_to_create {
         let full = join_remote_path(&params.remote_dir, rel);
@@ -1028,22 +1381,24 @@ where
     let req = MkdirBatchReq { paths };
     let expected = plan.dirs_to_create.len();
 
-    let connect_result = connect().await;
-    let mut socket = connect_result?;
-    proto::send_mkdir_batch_req(&mut socket, &req).await?;
-
-    let (msg_type, payload) = proto::read_msg(&mut socket).await?;
-    if msg_type == MSG_ERR {
-        let err = proto::decode_err(&payload)?;
-        bail!("MKDIR_BATCH rifiutato: ERR {}: {}", err.code, err.message);
-    }
-    if msg_type != MSG_MKDIR_BATCH_RES {
-        bail!(
-            "MKDIR_BATCH: atteso MKDIR_BATCH_RES (tipo {}), ricevuto tipo {}",
-            MSG_MKDIR_BATCH_RES,
-            msg_type
-        );
-    }
+    let payload = session
+        .op(async |socket: &mut Link| {
+            proto::send_mkdir_batch_req(socket, &req).await?;
+            let (msg_type, payload) = proto::read_msg(socket).await?;
+            if msg_type == MSG_ERR {
+                let err = proto::decode_err(&payload)?;
+                bail!("MKDIR_BATCH rifiutato: ERR {}: {}", err.code, err.message);
+            }
+            if msg_type != MSG_MKDIR_BATCH_RES {
+                bail!(
+                    "MKDIR_BATCH: atteso MKDIR_BATCH_RES (tipo {}), ricevuto tipo {}",
+                    MSG_MKDIR_BATCH_RES,
+                    msg_type
+                );
+            }
+            Ok(payload)
+        })
+        .await?;
     // Count mismatch -> ERR 5 (sync-spec §9): decode restituisce Err.
     let res = proto::decode_mkdir_batch_res(&payload, expected)?;
     let mut errors = Vec::new();
@@ -1059,73 +1414,62 @@ where
     Ok(errors)
 }
 
-/// Esegue DELETE_BATCH_REQ per i file (recursive=0) su una nuova connessione.
-async fn run_delete_batch_files<F, Fut>(
+/// Esegue DELETE_BATCH_REQ per i file (recursive=0) sulla connessione della sessione.
+async fn run_delete_batch_files(
     plan: &Plan,
     params: &SyncParams,
-    connect: &F,
-) -> Result<Vec<String>>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Link>>,
-{
+    session: &mut SyncSession,
+) -> Result<Vec<String>> {
     let mut items = Vec::with_capacity(plan.files_to_delete.len());
     for rel in &plan.files_to_delete {
         let full = join_remote_path(&params.remote_dir, rel);
         items.push(DeleteItem { path: full, recursive: 0 });
     }
-    run_delete_batch(plan, &plan.files_to_delete, items, connect).await
+    run_delete_batch(&plan.files_to_delete, items, session).await
 }
 
-/// Esegue DELETE_BATCH_REQ per le directory (recursive=1) su una nuova connessione.
-async fn run_delete_batch_dirs<F, Fut>(
+/// Esegue DELETE_BATCH_REQ per le directory (recursive=1) sulla connessione della sessione.
+async fn run_delete_batch_dirs(
     plan: &Plan,
     params: &SyncParams,
-    connect: &F,
-) -> Result<Vec<String>>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Link>>,
-{
+    session: &mut SyncSession,
+) -> Result<Vec<String>> {
     let mut items = Vec::with_capacity(plan.dirs_to_delete.len());
     for rel in &plan.dirs_to_delete {
         let full = join_remote_path(&params.remote_dir, rel);
         items.push(DeleteItem { path: full, recursive: 1 });
     }
-    run_delete_batch(plan, &plan.dirs_to_delete, items, connect).await
+    run_delete_batch(&plan.dirs_to_delete, items, session).await
 }
 
 /// Helper comune per DELETE_BATCH (file o dir). `rels` serve per mappare gli
 /// errori per-path al rel_path (per il report).
-async fn run_delete_batch<F, Fut>(
-    _plan: &Plan,
+async fn run_delete_batch(
     rels: &[String],
     items: Vec<DeleteItem>,
-    connect: &F,
-) -> Result<Vec<String>>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Link>>,
-{
+    session: &mut SyncSession,
+) -> Result<Vec<String>> {
     let expected = items.len();
     let req = DeleteBatchReq { items };
 
-    let connect_result = connect().await;
-    let mut socket = connect_result?;
-    proto::send_delete_batch_req(&mut socket, &req).await?;
-
-    let (msg_type, payload) = proto::read_msg(&mut socket).await?;
-    if msg_type == MSG_ERR {
-        let err = proto::decode_err(&payload)?;
-        bail!("DELETE_BATCH rifiutato: ERR {}: {}", err.code, err.message);
-    }
-    if msg_type != MSG_DELETE_BATCH_RES {
-        bail!(
-            "DELETE_BATCH: atteso DELETE_BATCH_RES (tipo {}), ricevuto tipo {}",
-            MSG_DELETE_BATCH_RES,
-            msg_type
-        );
-    }
+    let payload = session
+        .op(async |socket: &mut Link| {
+            proto::send_delete_batch_req(socket, &req).await?;
+            let (msg_type, payload) = proto::read_msg(socket).await?;
+            if msg_type == MSG_ERR {
+                let err = proto::decode_err(&payload)?;
+                bail!("DELETE_BATCH rifiutato: ERR {}: {}", err.code, err.message);
+            }
+            if msg_type != MSG_DELETE_BATCH_RES {
+                bail!(
+                    "DELETE_BATCH: atteso DELETE_BATCH_RES (tipo {}), ricevuto tipo {}",
+                    MSG_DELETE_BATCH_RES,
+                    msg_type
+                );
+            }
+            Ok(payload)
+        })
+        .await?;
     let res = proto::decode_delete_batch_res(&payload, expected)?;
     let mut errors = Vec::new();
     let mut idx = 0usize;
@@ -1425,6 +1769,37 @@ mod tests {
         // remote_dir con trailing '/'.
         let joined_slash = join_remote_path("/tmp/remote/", "file.txt");
         assert_eq!(joined_slash, "/tmp/remote/file.txt");
+    }
+
+    // --- Esclusioni --exclude (glob semplice) -------------------------------
+
+    #[test]
+    fn exclude_basename_and_path_patterns() {
+        let pats = vec!["*.log".to_string(), "data/postgres".to_string(), "cache".to_string()];
+        // Pattern basename-only: matcha ovunque nel path.
+        assert!(is_excluded("sub/debug.log", &pats));
+        assert!(is_excluded("debug.log", &pats));
+        // Pattern con '/': match sul rel_path e sul subtree.
+        assert!(is_excluded("data/postgres", &pats));
+        assert!(is_excluded("data/postgres/base/PG_VERSION", &pats));
+        // Componente dir esclusa -> subtree escluso.
+        assert!(is_excluded("a/cache/b/c.txt", &pats));
+        // Non esclusi.
+        assert!(!is_excluded("src/main.rs", &pats));
+        assert!(!is_excluded("data/postgres2/x", &pats));
+        assert!(!is_excluded("cached/file", &pats));
+    }
+
+    #[test]
+    fn glob_match_basics() {
+        assert!(glob_match("*.log", "a.log"));
+        assert!(glob_match("*.log", "a/b.log"));
+        assert!(glob_match("a/*/c", "a/b/c"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(glob_match("x", "x"));
+        assert!(!glob_match("x", "xy"));
+        assert!(glob_match("", ""));
     }
 
     // --- Helper di test ----------------------------------------------------

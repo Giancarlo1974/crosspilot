@@ -167,12 +167,12 @@ pub async fn remote_build_info(
     let stdout = String::from_utf8_lossy(&out.stdout);
     let info = version::parse_remote_info(&stdout);
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] remote_build_info: exe_present={} ts={:?} linux_present={} exit_code={}",
         info.exe_present, info.build_ts, info.linux_present, out.exit_code
     );
     if let Some(h) = &info.exe_sha256 {
-        eprintln!("[DEBUG] remote_build_info: exe_sha256={}", &h[..16.min(h.len())]);
+        crate::qprintln!("[DEBUG] remote_build_info: exe_sha256={}", &h[..16.min(h.len())]);
     }
 
     Ok(info)
@@ -253,7 +253,7 @@ pub async fn deploy_exe(
         let linux_path = linux_sidecar_path(remote_exe_path);
         let remote_linux_hash = remote_file_hash(client, host, &linux_path).await?;
         let aligned = remote_linux_hash.as_deref() == Some(linux_hash.as_str());
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] deploy: sidecar linux remoto hash={:?} atteso={}",
             remote_linux_hash.as_deref().map(|h| &h[..16.min(h.len())]),
             &linux_hash[..16]
@@ -535,7 +535,7 @@ async fn upload_artifact(
                 remote_ts = version::parse_version_ts(v);
             }
         }
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] functional check staged: exit_ok={} ts={:?} atteso={}",
             exit_ok, remote_ts, version::BUILD_TS
         );

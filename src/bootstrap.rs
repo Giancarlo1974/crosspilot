@@ -179,12 +179,12 @@ pub(crate) fn split_domain_user(raw: &str) -> (String, String) {
     if let Some(pos) = raw.rfind('@') {
         let user_part = raw[..pos].to_string();
         let domain_dns = raw[pos + 1..].to_string();
-        eprintln!("[DEBUG] split credenziali: UPN user={} domain_dns={}", user_part, domain_dns);
+        crate::qprintln!("[DEBUG] split credenziali: UPN user={} domain_dns={}", user_part, domain_dns);
         (user_part, String::new())
     } else if let Some(pos) = raw.rfind('\\') {
         let domain_part = raw[..pos].to_string();
         let user_part = raw[pos + 1..].to_string();
-        eprintln!("[DEBUG] split credenziali: DOMAIN\\user user={} domain={}", user_part, domain_part);
+        crate::qprintln!("[DEBUG] split credenziali: DOMAIN\\user user={} domain={}", user_part, domain_part);
         (user_part, domain_part)
     } else {
         (raw.to_string(), String::new())
@@ -206,7 +206,7 @@ fn winrm_context() -> Result<WinrmCtx> {
 
     // Parsing della porta WinRM (default 5985 per HTTP).
     let port = winrm_port_str.parse::<u16>().unwrap_or(5985);
-    eprintln!("[DEBUG] winrm_context: endpoint WinRM = {}:{} (HTTP, NTLMv2)", host, port);
+    crate::qprintln!("[DEBUG] winrm_context: endpoint WinRM = {}:{} (HTTP, NTLMv2)", host, port);
 
     // --- Costruzione client WinRM ---
     // HTTP (use_tls = false), NTLMv2 (default). Il dominio è lasciato vuoto:
@@ -463,7 +463,7 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
     let mut winrm_dead = false;
     match deploy::remote_build_info(&client, &host, exe_path).await {
         Ok(info) => {
-            eprintln!(
+            crate::qprintln!(
                 "[DEBUG] bootstrap_server: ts remoto={:?} locale={} exe_present={} linux_present={}",
                 info.build_ts, version::BUILD_TS, info.exe_present, info.linux_present
             );
@@ -574,7 +574,7 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
     // (Estratto in schtasks_start_script: condiviso col canale SSH-win —
     // spec ssh-unified §1.4, stessa catena SYSTEM->S4U->interattivo.)
     let ps_script = schtasks_start_script(exe_path, &schtasks_user);
-    eprintln!("[DEBUG] bootstrap_winrm: script PowerShell = {}", ps_script);
+    crate::qprintln!("[DEBUG] bootstrap_winrm: script PowerShell = {}", ps_script);
 
     // --- Esecuzione comando remoto ---
     // Skip se WinRM e' deterministicamente non utilizzabile: la chiamata
@@ -594,16 +594,16 @@ pub(crate) async fn bootstrap_winrm(exe_path: &str) -> Result<()> {
     // l'output del comando remoto. Ora controlliamo exit_code e stderr.
     match ps_result {
         Ok(output) => {
-            eprintln!("[DEBUG] bootstrap_server: exit_code={}", output.exit_code);
+            crate::qprintln!("[DEBUG] bootstrap_server: exit_code={}", output.exit_code);
 
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             let stderr_str = String::from_utf8_lossy(&output.stderr);
 
             if !stdout_str.trim().is_empty() {
-                eprintln!("[DEBUG] bootstrap_server: stdout={}", stdout_str.trim());
+                crate::qprintln!("[DEBUG] bootstrap_server: stdout={}", stdout_str.trim());
             }
             if !stderr_str.trim().is_empty() {
-                eprintln!("[DEBUG] bootstrap_server: stderr={}", stderr_str.trim());
+                crate::qprintln!("[DEBUG] bootstrap_server: stderr={}", stderr_str.trim());
             }
 
             // Modalita' di avvio scelta dalla catena di fallback nello

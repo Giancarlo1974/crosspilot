@@ -317,7 +317,7 @@ async fn update_remote(remote_ts: Option<u64>, remote_os_hint: Option<version::R
     // Risoluzione OS del remote (blocco preliminare a tutti gli altri).
     let remote_os = resolve_remote_os(remote_os_hint, &exe_path);
     let remote_windows = remote_os == version::RemoteOs::Windows;
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] update_remote: os_dichiarato={:?} exe_path='{}' -> remote_os={:?}",
         remote_os_hint, exe_path, remote_os
     );

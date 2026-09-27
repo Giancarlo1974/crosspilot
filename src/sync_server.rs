@@ -58,7 +58,7 @@ pub async fn list_server(stream: &mut Link, req: &ListReq) -> Result<()> {
     let with_hash = req.with_hash == 1;
     let recursive = req.recursive == 1;
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] list_server: path={} recursive={} with_hash={}",
         req.path, req.recursive, req.with_hash
     );
@@ -67,7 +67,7 @@ pub async fn list_server(stream: &mut Link, req: &ListReq) -> Result<()> {
     // sync su dest nuovo è il caso più comune; lista vuota = tutto NEW).
     let base_exists = base.exists();
     if !base_exists {
-        eprintln!("[DEBUG] list_server: directory non esistente, rispondo 0 entry");
+        crate::qprintln!("[DEBUG] list_server: directory non esistente, rispondo 0 entry");
         let res = ListRes::default();
         let payload = proto::encode_list_res(&res)?;
         proto::write_msg(stream, MSG_LIST_RES, &payload).await?;
@@ -75,11 +75,15 @@ pub async fn list_server(stream: &mut Link, req: &ListReq) -> Result<()> {
     }
 
     // Walk server con containment check (sync-spec §8.2).
-    let walk_result = walk_remote_dir(base, recursive, with_hash, base);
+    // skipped: sotto-directory illeggibili (es. Permission denied) — il
+    // walk continua invece di abortire e il client le vede come warning
+    // (trailer di LIST_RES). Fallisce solo la RADice illeggibile.
+    let mut skipped: Vec<String> = Vec::new();
+    let walk_result = walk_remote_dir(base, recursive, with_hash, base, &mut skipped);
     let mut entries = match walk_result {
         Ok(e) => e,
         Err(e) => {
-            // Errore IO durante il walk: ERR 3.
+            // Errore IO sulla radice del walk: ERR 3.
             let err = proto::ErrMsg {
                 code: ERR_IO,
                 message: format!("walk remoto fallito: {}", e),
@@ -107,19 +111,27 @@ pub async fn list_server(stream: &mut Link, req: &ListReq) -> Result<()> {
     // Ordina per rel_path (output deterministico, sync-spec §16).
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
-    let res = ListRes { entries };
+    let res = ListRes { entries, skipped };
     let payload = proto::encode_list_res(&res)?;
     proto::write_msg(stream, MSG_LIST_RES, &payload).await?;
-    eprintln!("[DEBUG] list_server: inviate {} entry", count);
+    crate::qprintln!("[DEBUG] list_server: inviate {} entry", count);
     Ok(())
 }
 
 /// Walk server ricorsivo con containment check (sync-spec §8.2).
 /// Salta le entry che canonicalizzano fuori da base (reparse point/junction/symlink).
 /// `base_canon` è la dir root per il check containment.
-fn walk_remote_dir(base: &Path, recursive: bool, with_hash: bool, base_canon: &Path) -> Result<Vec<Entry>> {
+/// `skipped` raccoglie i rel_path delle sotto-directory illeggibili
+/// (la radice illeggibile resta fatale: il walk non produrrebbe nulla).
+fn walk_remote_dir(
+    base: &Path,
+    recursive: bool,
+    with_hash: bool,
+    base_canon: &Path,
+    skipped: &mut Vec<String>,
+) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    walk_remote_recursive(base, Path::new(""), recursive, with_hash, base_canon, &mut entries)?;
+    walk_remote_recursive(base, Path::new(""), recursive, with_hash, base_canon, &mut entries, skipped)?;
     Ok(entries)
 }
 
@@ -131,13 +143,30 @@ fn walk_remote_recursive(
     with_hash: bool,
     base_canon: &Path,
     out: &mut Vec<Entry>,
+    skipped: &mut Vec<String>,
 ) -> Result<()> {
     let full = base.join(rel);
     let read_dir_result = fs::read_dir(&full);
     let dir_iter = match read_dir_result {
         Ok(it) => it,
         Err(e) => {
-            return Err(anyhow!("impossibile leggere directory {}: {}", full.display(), e));
+            // Radice illeggibile -> fatale (niente da listare). Una SOTTO-
+            // directory illeggibile -> warning + skip: prima abortiva tutto
+            // il sync (bug riportato: una dir root-only azzerava il mirror
+            // di un intero deploy/). La dir e' gia' stata enumerata come
+            // entry dal chiamante; qui si segnala solo l'impossibilita' di
+            // scendervi — il client la mostra come warning e, con --delete,
+            // sospende la cancellazione (contenuto remoto sconosciuto).
+            if rel.as_os_str().is_empty() {
+                return Err(anyhow!("impossibile leggere directory {}: {}", full.display(), e));
+            }
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            eprintln!(
+                "[WARN] walk_remote: directory non leggibile, skip contenuto: {} ({})",
+                rel_str, e
+            );
+            skipped.push(rel_str);
+            return Ok(());
         }
     };
     for entry in dir_iter {
@@ -189,7 +218,7 @@ fn walk_remote_recursive(
                 sha256: None,
             });
             if recursive {
-                walk_remote_recursive(base, &child_rel, recursive, with_hash, base_canon, out)?;
+                walk_remote_recursive(base, &child_rel, recursive, with_hash, base_canon, out, skipped)?;
             }
         } else {
             // File: calcola hash se with_hash (un solo passaggio, sync-spec §6.1).
@@ -272,7 +301,7 @@ fn mkdir_single(path_str: &str) -> BatchResult {
     let mkdir_result = fs::create_dir_all(p);
     match mkdir_result {
         Ok(()) => {
-            eprintln!("[DEBUG] mkdir_batch_server: creata/esistente: {}", path_str);
+            crate::qprintln!("[DEBUG] mkdir_batch_server: creata/esistente: {}", path_str);
             BatchResult::ok()
         }
         Err(e) => {
@@ -333,7 +362,7 @@ fn delete_single(item: &DeleteItem) -> BatchResult {
     };
     match delete_result {
         Ok(()) => {
-            eprintln!("[DEBUG] delete_batch_server: eliminato: {} (recursive={})", item.path, item.recursive);
+            crate::qprintln!("[DEBUG] delete_batch_server: eliminato: {} (recursive={})", item.path, item.recursive);
             BatchResult::ok()
         }
         Err(e) => {
@@ -414,14 +443,14 @@ mod tests {
         fs::create_dir_all(root.join("d")).unwrap();
         fs::write(root.join("d").join("f2.txt"), b"two").unwrap();
 
-        let entries = walk_remote_dir(&root, true, false, &root).unwrap();
+        let entries = walk_remote_dir(&root, true, false, &root, &mut Vec::new()).unwrap();
         let rels = entry_rel_paths(&entries);
         assert!(rels.contains(&"f1.txt".to_string()));
         assert!(rels.contains(&"d".to_string()));
         assert!(rels.contains(&"d/f2.txt".to_string()));
 
         // with_hash: i file hanno sha256.
-        let entries_hashed = walk_remote_dir(&root, true, true, &root).unwrap();
+        let entries_hashed = walk_remote_dir(&root, true, true, &root, &mut Vec::new()).unwrap();
         let f1 = find_entry(&entries_hashed, "f1.txt");
         assert!(f1.sha256.is_some());
 
@@ -439,11 +468,58 @@ mod tests {
         // Symlink che punta fuori da root.
         std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
 
-        let entries = walk_remote_dir(&root, true, false, &root).unwrap();
+        let entries = walk_remote_dir(&root, true, false, &root, &mut Vec::new()).unwrap();
         let rels = entry_rel_paths(&entries);
         // real.txt presente, escape skippato (containment).
         assert!(rels.contains(&"real.txt".to_string()));
         assert!(!rels.contains(&"escape".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_server_tolerates_unreadable_subdir() {
+        // Bugfix (report utente): una sotto-directory root-only abortiva
+        // TUTTO il sync ("impossibile leggere .../postgres"). Ora il walk
+        // continua: la dir resta enumerata (come dir) e finisce in skipped.
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("crosspilot_list_denied");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ok.txt"), b"x").unwrap();
+        let denied = root.join("denied");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("secret.txt"), b"s").unwrap();
+        let mut perms = fs::metadata(&denied).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&denied, perms).unwrap();
+
+        // Se il test gira come root read_dir ha comunque successo (i permessi
+        // non fermano UID 0): in quel caso il test non e' significativo.
+        if fs::read_dir(&denied).is_ok() {
+            let mut restore = fs::metadata(&denied).unwrap().permissions();
+            restore.set_mode(0o755);
+            let _ = fs::set_permissions(&denied, restore);
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let mut skipped = Vec::new();
+        let result = walk_remote_dir(&root, true, false, &root, &mut skipped);
+
+        // Ripristina i permessi PRIMA delle assert (cleanup garantito).
+        let mut perms2 = fs::metadata(&denied).unwrap().permissions();
+        perms2.set_mode(0o755);
+        let _ = fs::set_permissions(&denied, perms2);
+
+        let entries = result.unwrap();
+        let rels = entry_rel_paths(&entries);
+        // ok.txt e la dir denied sono enumerate; secret.txt no (illeggibile).
+        assert!(rels.contains(&"ok.txt".to_string()));
+        assert!(rels.contains(&"denied".to_string()));
+        assert!(!rels.contains(&"denied/secret.txt".to_string()));
+        assert_eq!(skipped, vec!["denied".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }

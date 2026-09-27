@@ -864,7 +864,7 @@ pub async fn client_wrap(
     link.write_all(auth_line.as_bytes())
         .await
         .context("invio riga AUTH")?;
-    eprintln!("[DEBUG] tls: handshake+AUTH ok verso {} (pin verificato)", addr);
+    crate::qprintln!("[DEBUG] tls: handshake+AUTH ok verso {} (pin verificato)", addr);
     Ok(link)
 }
 

@@ -67,7 +67,7 @@ pub fn read_segment_size_env() -> Result<u64> {
             let parsed = s
                 .parse::<u64>()
                 .with_context(|| format!("CROSSPILOT_SEGMENT_SIZE non è un numero valido: {}", s))?;
-            eprintln!(
+            crate::qprintln!(
                 "[DEBUG] transfer: CROSSPILOT_SEGMENT_SIZE override = {} byte",
                 parsed
             );
@@ -407,7 +407,7 @@ async fn sender_segment_loop(
         };
         proto::send_delta(stream, &delta_msg).await?;
 
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] transfer sender: segmento {}/{} ({} byte), delta {} byte",
             i + 1,
             count,
@@ -538,7 +538,7 @@ async fn receiver_segment_loop(
             .context("receiver: scrittura segmento su .part fallita")?;
         total_written += output.len() as u64;
 
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] transfer receiver: segmento {}/{} ({} byte scritti a offset {})",
             i + 1,
             count,
@@ -576,7 +576,7 @@ pub async fn put_client(stream: &mut Link, local_src: &str, remote_dst: &str) ->
     let block_size = compute_block_size(total_new_size);
     let segment_size = read_segment_size_env()?;
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer put_client: src={} ({} byte), dst={}, block_size={}, segment_size={}",
         local_src, total_new_size, remote_dst, block_size, segment_size
     );
@@ -608,7 +608,7 @@ pub async fn put_client(stream: &mut Link, local_src: &str, remote_dst: &str) ->
     // Verifica whole-file e invia conferma al server (che farà il rename).
     send_confirmation(stream, source_hash, &ack).await?;
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer put_client: completato. {} byte, hash={}",
         ack.total_bytes_written,
         hex(&source_hash)
@@ -648,7 +648,7 @@ pub async fn put_server(stream: &mut Link, req: PutReq) -> Result<()> {
     // Costruisce il path .part in modo robusto: <dest>.part
     let part_path = make_part_path(dest_path);
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer put_server: dst={} ({} byte), block_size={}, segment_size={}",
         req.path, req.total_new_size, req.block_size, req.segment_size
     );
@@ -722,7 +722,7 @@ pub async fn put_server(stream: &mut Link, req: PutReq) -> Result<()> {
         return Err(e);
     }
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer put_server: completato. {} byte scritti in {}",
         total_bytes,
         req.path
@@ -746,7 +746,7 @@ pub async fn get_client(
     // block_size nel GET_REQ: placeholder valido (il client ricalcola dopo META).
     let placeholder_block_size: u32 = 8192;
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer get_client: src={}, dst={}, segment_size={}",
         remote_src, local_dst, segment_size
     );
@@ -774,7 +774,7 @@ pub async fn get_client(
     // Ricalcola block_size ottimale ora che conosciamo total_new_size.
     let block_size = compute_block_size(total_new_size);
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer get_client: total_new_size={} byte, block_size={}",
         total_new_size, block_size
     );
@@ -840,7 +840,7 @@ pub async fn get_client(
         return Err(e);
     }
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer get_client: completato. {} byte scritti in {}",
         total_bytes, local_dst
     );
@@ -934,7 +934,7 @@ pub async fn get_server(stream: &mut Link, req: GetReq, grace_only: bool) -> Res
         .with_context(|| format!("impossibile leggere metadata di {}", req.path))?
         .len();
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer get_server: src={} ({} byte), segment_size={}",
         req.path, total_new_size, req.segment_size
     );
@@ -975,7 +975,7 @@ pub async fn get_server(stream: &mut Link, req: GetReq, grace_only: bool) -> Res
     // Verifica whole-file e invia conferma al client (che farà il rename).
     send_confirmation(stream, source_hash, &ack).await?;
 
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] transfer get_server: completato. {} byte, hash={}",
         ack.total_bytes_written,
         hex(&source_hash)

@@ -276,7 +276,7 @@ async fn agent_impl() -> Option<DynAgent> {
     match agent {
         Ok(a) => Some(a.dynamic()),
         Err(e) => {
-            eprintln!("[DEBUG] ssh auth: agent SSH_AUTH_SOCK non raggiungibile: {}", e);
+            crate::qprintln!("[DEBUG] ssh auth: agent SSH_AUTH_SOCK non raggiungibile: {}", e);
             None
         }
     }
@@ -290,14 +290,14 @@ async fn agent_impl() -> Option<DynAgent> {
     match pipe {
         Ok(a) => return Some(a.dynamic()),
         Err(e) => {
-            eprintln!("[DEBUG] ssh auth: named pipe openssh-agent non raggiungibile: {}", e);
+            crate::qprintln!("[DEBUG] ssh auth: named pipe openssh-agent non raggiungibile: {}", e);
         }
     }
     let pageant = AgentClient::connect_pageant().await;
     match pageant {
         Ok(a) => Some(a.dynamic()),
         Err(e) => {
-            eprintln!("[DEBUG] ssh auth: Pageant non raggiungibile: {}", e);
+            crate::qprintln!("[DEBUG] ssh auth: Pageant non raggiungibile: {}", e);
             None
         }
     }
@@ -350,7 +350,7 @@ impl SshSession {
         };
         let config = Arc::new(config);
         let target = (ctx.host.as_str(), ctx.port);
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] ssh connect: {}@{}:{} (timeout {}s)",
             ctx.user,
             ctx.host,
@@ -370,7 +370,7 @@ impl SshSession {
                         return Err(HostKeyMismatch(msg.clone()).into());
                     }
                 }
-                eprintln!("[DEBUG] ssh handshake fallito: {}", e);
+                crate::qprintln!("[DEBUG] ssh handshake fallito: {}", e);
                 let err = anyhow::Error::from(bootstrap::ChannelUnreachable("SSH"));
                 return Err(err.context(format!(
                     "handshake SSH verso {}:{}",
@@ -378,7 +378,7 @@ impl SshSession {
                 )));
             }
             Err(_) => {
-                eprintln!(
+                crate::qprintln!(
                     "[DEBUG] ssh connect timeout {}s verso {}:{}",
                     CONNECT_TIMEOUT.as_secs(),
                     ctx.host,
@@ -553,7 +553,7 @@ async fn authenticate(handle: &mut Handle<SshHandler>, ctx: &SshCtx) -> Result<(
         let identities = agent.request_identities().await;
         match identities {
             Ok(list) => {
-                eprintln!("[DEBUG] ssh auth: agent espone {} identita'", list.len());
+                crate::qprintln!("[DEBUG] ssh auth: agent espone {} identita'", list.len());
                 for identity in &list {
                     // Solo chiavi plain: i certificati OpenSSH richiedono
                     // authenticate_openssh_cert (fuori scope v1).
@@ -567,12 +567,12 @@ async fn authenticate(handle: &mut Handle<SshHandler>, ctx: &SshCtx) -> Result<(
                         .await;
                     match res {
                         Ok(r) if r.success() => return Ok(()),
-                        Ok(_) => eprintln!("[DEBUG] ssh auth: identita' agent rifiutata"),
-                        Err(e) => eprintln!("[DEBUG] ssh auth: errore agent: {}", e),
+                        Ok(_) => crate::qprintln!("[DEBUG] ssh auth: identita' agent rifiutata"),
+                        Err(e) => crate::qprintln!("[DEBUG] ssh auth: errore agent: {}", e),
                     }
                 }
             }
-            Err(e) => eprintln!("[DEBUG] ssh auth: request_identities fallita: {}", e),
+            Err(e) => crate::qprintln!("[DEBUG] ssh auth: request_identities fallita: {}", e),
         }
     }
 
@@ -595,7 +595,7 @@ async fn authenticate(handle: &mut Handle<SshHandler>, ctx: &SshCtx) -> Result<(
         let key = match key {
             Ok(k) => k,
             Err(e) => {
-                eprintln!(
+                crate::qprintln!(
                     "[DEBUG] ssh auth: chiave {} non caricabile: {}",
                     path.display(),
                     e
@@ -611,11 +611,11 @@ async fn authenticate(handle: &mut Handle<SshHandler>, ctx: &SshCtx) -> Result<(
             .await;
         match res {
             Ok(r) if r.success() => {
-                eprintln!("[DEBUG] ssh auth: OK con chiave {}", path.display());
+                crate::qprintln!("[DEBUG] ssh auth: OK con chiave {}", path.display());
                 return Ok(());
             }
-            Ok(_) => eprintln!("[DEBUG] ssh auth: chiave {} rifiutata", path.display()),
-            Err(e) => eprintln!(
+            Ok(_) => crate::qprintln!("[DEBUG] ssh auth: chiave {} rifiutata", path.display()),
+            Err(e) => crate::qprintln!(
                 "[DEBUG] ssh auth: errore con chiave {}: {}",
                 path.display(),
                 e
@@ -630,11 +630,11 @@ async fn authenticate(handle: &mut Handle<SshHandler>, ctx: &SshCtx) -> Result<(
             .await;
         match res {
             Ok(r) if r.success() => {
-                eprintln!("[DEBUG] ssh auth: OK con password (SSH_PASS/PASS)");
+                crate::qprintln!("[DEBUG] ssh auth: OK con password (SSH_PASS/PASS)");
                 return Ok(());
             }
-            Ok(_) => eprintln!("[DEBUG] ssh auth: password rifiutata"),
-            Err(e) => eprintln!("[DEBUG] ssh auth: errore password: {}", e),
+            Ok(_) => crate::qprintln!("[DEBUG] ssh auth: password rifiutata"),
+            Err(e) => crate::qprintln!("[DEBUG] ssh auth: errore password: {}", e),
         }
     }
 

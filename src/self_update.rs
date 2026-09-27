@@ -198,7 +198,7 @@ async fn finish_update(
         .with_context(|| format!("esecuzione staged {}", new_path.display()))?;
     let ver_out = String::from_utf8_lossy(&check.stdout);
     let staged_ts = version::parse_version_ts(&ver_out);
-    eprintln!(
+    crate::qprintln!(
         "[DEBUG] self-update functional check: exit={} output={} ts={:?} atteso={}",
         check.status,
         ver_out.trim(),

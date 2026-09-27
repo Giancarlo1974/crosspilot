@@ -145,7 +145,7 @@ pub(crate) async fn deploy_exe(
                 staged_ts = Some(ts);
             }
         }
-        eprintln!(
+        crate::qprintln!(
             "[DEBUG] deploy-smb functional check: ts={:?} atteso={} out={:?}",
             staged_ts,
             version::BUILD_TS,
