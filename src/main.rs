@@ -62,6 +62,9 @@ mod log;
 // Costruzione command-line remota: quoting POSIX, tmp path di `run`,
 // marker exit-code (runcmd.rs).
 mod runcmd;
+// Subcomando `sql`: query MySQL read-only su DB configurati via
+// CROSSPILOT_DB_<NOME>_* (connessione diretta locale, sql.rs).
+mod sql;
 
 #[cfg(target_os = "windows")]
 mod win_job {
@@ -385,6 +388,26 @@ enum Commands {
         #[arg(long)]
         console: bool,
     },
+    /// Interroga un database MySQL configurato nel .env come
+    /// CROSSPILOT_DB_<NOME>_{HOST,PORT,USER,PASSWORD,NAME,SSL}.
+    /// Connessione diretta dalla macchina locale (nessun server remoto);
+    /// solo query di lettura: keyword di scrittura e multi-statement
+    /// rifiutate, LIMIT 100 auto-aggiunto ai SELECT senza limite.
+    ///
+    ///   crosspilot sql                          # elenca i DB configurati
+    ///   crosspilot sql NEXTCLOUD query.sql      # query da file
+    ///   crosspilot sql NEXTCLOUD -e "select 1"  # query inline
+    ///   cat q.sql | crosspilot sql NEXTCLOUD -  # query da stdin
+    Sql {
+        /// Nome del DB (case-insensitive). Omesso -> lista dei configurati.
+        db: Option<String>,
+        /// File .sql con la query, oppure '-' per stdin. Omesso con stdin
+        /// in pipe -> lettura da stdin.
+        source: Option<String>,
+        /// Query inline (alternativa a file/stdin).
+        #[arg(short = 'e', long = "exec", value_name = "QUERY")]
+        exec: Option<String>,
+    },
     /// Gestione degli ambienti (configurazioni host) nel file .env.
     ///
     /// Il .env può contenere N ambienti come CROSSPILOT_<NOME>_<CAMPO>
@@ -550,6 +573,11 @@ async fn main() -> Result<()> {
                 update::run_updater(target, wait_pid, port, wait_secs, relaunch_args, console)
                     .await?;
             }
+            // Query MySQL read-only sui DB CROSSPILOT_DB_* (connessione
+            // diretta locale: nessun handshake/connessione al server remoto).
+            Some(Commands::Sql { db, source, exec }) => {
+                sql::run(db.as_deref(), source.as_deref(), exec.as_deref()).await?;
+            }
             // CRUD ambienti host nel .env (nessuna connessione richiesta).
             Some(Commands::Env { action }) => {
                 envs::run(&action)?;
@@ -590,6 +618,10 @@ async fn main() -> Result<()> {
                 println!("  crosspilot env use <nome>            # seleziona l'attivo");
                 println!("  crosspilot env remove <nome>         # elimina ambiente");
                 println!("  (dettagli: crosspilot env -h; override ad-hoc: CROSSPILOT_ENV=<nome>)");
+                println!();
+                println!("MySQL (CROSSPILOT_DB_<NOME>_* nel .env, connessione diretta):");
+                println!("  crosspilot sql                       # database configurati");
+                println!("  crosspilot sql <DB> <file.sql|-|-e 'query'>  # query read-only");
                 println!();
                 println!("The -- form passes everything after it literally to cmd.exe on the");
                 println!("remote Windows host, with no shell escaping. Use single quotes around");

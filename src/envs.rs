@@ -429,6 +429,14 @@ fn parse_key(key: &str) -> ParsedKey {
     if rest == "ENV" {
         return ParsedKey::Selector;
     }
+    // Carve-out del namespace dei database (subcomando `sql`, sql.rs):
+    // CROSSPILOT_DB_<NOME>_<CAMPO> NON e' un campo d'ambiente — senza
+    // questa guardia il suffix-match leggerebbe CROSSPILOT_DB_PROD_HOST
+    // come env "DB_PROD" campo "HOST" (env fantasma in `env list` e
+    // target di connessione fasullo via CROSSPILOT_ENV=DB_PROD).
+    if rest == "DB" || rest.starts_with("DB_") {
+        return ParsedKey::Other;
+    }
     for field in FIELDS {
         if rest == *field {
             return ParsedKey::Field(None, field);
@@ -549,6 +557,14 @@ fn validate_name(name: &str) -> Result<String> {
     if RESERVED.contains(&upper.as_str()) {
         bail!(
             "nome ambiente '{}' riservato (colliderebbe con chiavi CROSSPILOT_* esistenti)",
+            upper
+        );
+    }
+    // Un env "DB" o "DB_*" produrrebbe chiavi CROSSPILOT_DB_*: namespace
+    // riservato ai database del subcomando `sql` (carve-out in parse_key).
+    if upper == "DB" || upper.starts_with("DB_") {
+        bail!(
+            "nome ambiente '{}' riservato: il prefisso DB_ e' usato dai database (CROSSPILOT_DB_<NOME>_*, subcomando sql)",
             upper
         );
     }
