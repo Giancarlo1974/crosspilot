@@ -58,6 +58,15 @@ base64 = "0.23"
 russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "3.0.0"
 
+# Subcomando `sql` (query MySQL read-only, connessione diretta locale):
+# mysql_async e' pure Rust async su tokio. default-features=false +
+# default-rustls-ring seleziona il backend TLS rustls/ring (gia' compilato
+# per musl+windows-gnu via rustls) + flate2/rust_backend (miniz_oxide,
+# niente zlib C): nessuna dipendenza nativa, niente aws-lc-rs/native-tls.
+# CAVEAT upstream: rustls non accetta IP come SNI — SSL=auto (default)
+# usa TLS solo quando HOST e' un hostname DNS, non un IP (vedi sql.rs).
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+
 [patch.crates-io]
 # PATCH LOCALE: winrm-rs 1.2.2 ha un bug in create_shell_request (soap/envelope.rs):
 # emette <wsman:OptionSet> FUORI da </s:Header>, producendo un envelope SOAP 1.2
