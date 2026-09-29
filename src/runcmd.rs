@@ -27,6 +27,16 @@
 //!      Un token come `a&&b` (testo + metacaratteri) resta quotato:
 //!      e' un argomento letterale, non un operatore.
 //!
+//! 4. **Quoting cmd.exe (bug report)**: su remote Windows i token erano
+//!    solo uniti con spazi — i single quote NON raggruppano per cmd
+//!    (`dir 'D:\a b'` -> cmd vedeva due argomenti) e i metacaratteri cmd
+//!    (`|`, `&`) dentro un argomento venivano interpretati da cmd invece
+//!    di arrivare al processo figlio (powershell). Ora i token con
+//!    whitespace sono ri-quotati con i DOPPI apici (`cmd_requote`), la
+//!    sola forma di raggruppamento che cmd riconosce; un `"` gia'
+//!    presente nel token disattiva il re-quote (l'utente ha fatto il
+//!    quoting lui stesso — cmd non ha escape affidabile per `"` innestati).
+//!
 //! 2. **Subcommand `run`**: upload script in tmp remoto + esecuzione +
 //!    cleanup. Path tmp e interprete dipendono dall'OS remoto.
 //!
@@ -119,19 +129,19 @@ fn is_shell_operator_token(token: &str) -> bool {
 /// - `unix = true`  -> ogni token e' posix_quote()-ato e unito con spazi:
 ///   il raggruppamento della shell locale sopravvive al transito (fix del
 ///   bug "sleep: missing operand" / "docker ps accepts no arguments").
-///   Eccezioni (fix "niente comandi composti"):
+/// - `unix = false` -> cmd_requote(): doppi apici sui token con whitespace
+///   (fix "dir 'D:\a b'" splittato da cmd — i single quote NON raggruppano
+///   per cmd.exe, ci vogliono i doppi apici).
+///   Eccezioni COMUNI ai due OS (fix "niente comandi composti"):
 ///   - UN token solo -> raw: e' una command-line completa
 ///     (`crosspilot -- "a && b"`), quotarla la rende un nome di comando;
 ///   - operatori shell puri (`&&`, `;`, `|`...) -> raw: sono operatori,
 ///     non argomenti.
-/// - `unix = false` -> join con spazi nudi (semantica cmd.exe, invariata).
 pub fn rejoin_command(tokens: &[String], unix: bool) -> String {
-    if !unix {
-        return tokens.join(" ");
-    }
-    // Token singolo su remote unix: nessun raggruppamento da preservare —
-    // quotarlo forzerebbe sh a cercare un comando letterale (con spazi e
-    // metacaratteri inclusi) che non esiste. Raw = l'unica lettura sensata.
+    // Token singolo (unix E windows): nessun raggruppamento da preservare —
+    // quotarlo forzerebbe la shell remota a cercare un comando letterale
+    // (con spazi e metacaratteri inclusi) che non esiste. Raw = l'unica
+    // lettura sensata.
     if tokens.len() == 1 {
         let only = &tokens[0];
         return only.clone();
@@ -144,12 +154,62 @@ pub fn rejoin_command(tokens: &[String], unix: bool) -> String {
         if is_operator {
             let raw = t.clone();
             parts.push(raw);
-        } else {
+        } else if unix {
             let q = posix_quote(t);
+            parts.push(q);
+        } else {
+            let q = cmd_requote(t);
             parts.push(q);
         }
     }
     parts.join(" ")
+}
+
+/// True se il carattere forza il quoting cmd.exe: whitespace (spezza gli
+/// argomenti) o metacaratteri cmd (`& | < > ^` e i blocchi `()`). I `"` sono
+/// gestiti dal chiamante (token con `"` interno passano raw). `%` NON forza
+/// quoting: cmd espande %VAR% anche dentro i doppi apici, quindi il quoting
+/// non proteggerebbe comunque — e `*`/`?` devono restare glob remoti.
+fn cmd_needs_quote(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')')
+}
+
+/// Quota un token per cmd.exe remoto (fix bug report su quoting Windows):
+/// i doppi apici sono l'UNICO raggruppamento che cmd riconosce — i single
+/// quote sono caratteri normali (`dir 'D:\a b'` era splittato sullo
+/// spazio, dando "D:\a" + "b'" come due path).
+///
+/// Regole (deliberatamente conservative):
+/// - nessun carattere da `cmd_needs_quote` -> invariato;
+/// - token con `"` interno -> invariato: l'utente ha fatto quoting a mano
+///   (es. `dir "\"D:\a b\""`) e cmd non ha un escape affidabile per
+///   apici innestati — raddoppiare romperebbe i builtin cmd, `\"` non e'
+///   un escape per cmd (solo per CommandLineToArgvW dei figli);
+/// - altrimenti `"token"`: dentro gli apici spazi e `& | < > ^` restano
+///   letterali per cmd (fix "powershell -Command X | Y" dove la pipe era
+///   intercettata da cmd) e il figlio li rivede dopo CommandLineToArgvW.
+///
+/// Il backslash FINALE prima della chiusura e' raddoppiato:
+/// `"C:\dir\"` -> CommandLineToArgvW legge `\"` come apice escaped e
+/// mangia il quoting (l'exe figlio riceverebbe `C:\dir"` troncato).
+/// `"C:\dir\\"` e' corretta per entrambi: il figlio vede `C:\dir\` e i
+/// builtin cmd / fs Windows collassano `\\` a `\` comunque.
+pub fn cmd_requote(token: &str) -> String {
+    if token.is_empty() {
+        return "\"\"".to_string();
+    }
+    let needs = token.chars().any(cmd_needs_quote);
+    if !needs || token.contains('"') {
+        return token.to_string();
+    }
+    let mut out = String::with_capacity(token.len() + 3);
+    out.push('"');
+    out.push_str(token);
+    if token.ends_with('\\') {
+        out.push('\\');
+    }
+    out.push('"');
+    out
 }
 
 /// Quota un argomento per cmd.exe remoto (doppie virgolette + escape di ").
@@ -410,8 +470,81 @@ mod tests {
 
         let tokens2 = vec!["docker".to_string(), "ps".to_string()];
         assert_eq!(rejoin_command(&tokens2, true), "docker ps");
-        // Windows: join nudo invariato (legacy).
-        assert_eq!(rejoin_command(&tokens, false), "sh -c sleep 8; docker ps");
+        // Windows: i token con spazi sono ri-quotati coi doppi apici
+        // (fix "dir 'D:\a b'" splittato da cmd — i single quote non
+        // raggruppano per cmd.exe). Token sicuri restano nudi.
+        assert_eq!(
+            rejoin_command(&tokens, false),
+            "sh -c \"sleep 8; docker ps\""
+        );
+    }
+
+    #[test]
+    fn rejoin_windows_quotes_only_when_needed() {
+        // Bug report: `crosspilot -- dir 'D:\Progetti\[DELPHI SORGENTI]'`
+        // -> bash toglie i single quote -> token "D:\Progetti\[DELPHI
+        // SORGENTI]" -> il join nudo lo riconsegnava a cmd come DUE
+        // argomenti ("File non trovato"). Ora i doppi apici raggruppano.
+        let tokens = vec![
+            "dir".to_string(),
+            "D:\\Progetti\\[DELPHI SORGENTI]".to_string(),
+        ];
+        assert_eq!(
+            rejoin_command(&tokens, false),
+            "dir \"D:\\Progetti\\[DELPHI SORGENTI]\""
+        );
+        // Token senza spazi: nessun quoting aggiunto (invariato).
+        let tokens2 = vec!["dir".to_string(), "c:\\".to_string()];
+        assert_eq!(rejoin_command(&tokens2, false), "dir c:\\");
+        // Token singolo: raw su entrambi gli OS (command-line completa).
+        let single = vec!["dir c:\\ && echo ok".to_string()];
+        assert_eq!(rejoin_command(&single, false), "dir c:\\ && echo ok");
+    }
+
+    #[test]
+    fn rejoin_windows_powershell_command() {
+        // Bug report: `powershell -Command "Get-Item 'p' | Select"` — la
+        // pipe nel token veniva interpretata da cmd. Col re-quote i
+        // metacaratteri restano letterali dentro i doppi apici e arrivano
+        // intatti a powershell.exe come unico argomento di -Command.
+        let tokens = vec![
+            "powershell".to_string(),
+            "-Command".to_string(),
+            "Get-Item 'D:\\a b' | Select-Object FullName".to_string(),
+        ];
+        assert_eq!(
+            rejoin_command(&tokens, false),
+            "powershell -Command \"Get-Item 'D:\\a b' | Select-Object FullName\""
+        );
+    }
+
+    #[test]
+    fn cmd_requote_rules() {
+        // Nessun metacarattere: invariato.
+        assert_eq!(cmd_requote("c:\\dir"), "c:\\dir");
+        assert_eq!(cmd_requote("%PATH%"), "%PATH%");
+        assert_eq!(cmd_requote("*.txt"), "*.txt");
+        // Spazi/metacaratteri cmd -> doppi apici.
+        assert_eq!(cmd_requote("a b"), "\"a b\"");
+        assert_eq!(cmd_requote("a|b"), "\"a|b\"");
+        assert_eq!(cmd_requote("a&&b"), "\"a&&b\"");
+        assert_eq!(cmd_requote("x>y"), "\"x>y\"");
+        // Backslash finale: raddoppiato prima della quote di chiusura
+        // (CommandLineToArgvW leggerebbe \" come apice escaped).
+        assert_eq!(cmd_requote("C:\\a b\\"), "\"C:\\a b\\\\\"");
+        // Apice interno: l'utente ha gia' quotato -> raw (niente escape
+        // affidabile per " innestati via cmd).
+        assert_eq!(cmd_requote("\"D:\\a b\""), "\"D:\\a b\"");
+        // Token vuoto -> quoting vuoto esplicito.
+        assert_eq!(cmd_requote(""), "\"\"");
+    }
+
+    #[test]
+    fn rejoin_windows_pure_operators_unquoted() {
+        // Gli operatori puri restano raw anche su remote Windows:
+        // `crosspilot -- a '&&' b` deve restare un composto cmd.
+        let tokens = vec!["dir".to_string(), "&&".to_string(), "echo".to_string(), "ok".to_string()];
+        assert_eq!(rejoin_command(&tokens, false), "dir && echo ok");
     }
 
     #[test]

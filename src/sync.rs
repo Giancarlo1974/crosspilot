@@ -1333,6 +1333,22 @@ impl SyncSession {
         }
     }
 
+    /// Come `new()`, ma parte da una connessione GIA' aperta (es. quella
+    /// appena usata per il probe LIST del tipo remoto): evita una
+    /// ri-handshake. `served_on_link` e' pre-marcato true: se il link
+    /// risulta gia' chiuso (server one-shot che chiude dopo ogni op) la
+    /// prima op fa reconnect e marca single_shot, come da protocollo.
+    pub fn new_with_link<F, Fut>(link: Link, connect: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Link>> + Send + 'static,
+    {
+        let mut session = Self::new(connect);
+        session.link = Some(link);
+        session.served_on_link = true;
+        session
+    }
+
     /// Esegue un'operazione framed sulla connessione corrente.
     /// Su drop di trasporto: una riconnessione + retry (le op sync sono
     /// idempotenti). Errori di protocollo: propagati subito, mai ritentati.

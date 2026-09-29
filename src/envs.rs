@@ -168,6 +168,15 @@ pub fn env_file_path() -> PathBuf {
 /// Carica il primo .env trovato nei path candidati (dotenvy).
 /// Le variabili già presenti nel processo NON vengono sovrascritte:
 /// `CROSSPILOT_ENV=staging crosspilot ...` funziona come override ad-hoc.
+///
+/// Bug fix (report: .env "non trovato" pur essendo presente): dotenvy
+/// rifiuta TUTTO il file se una riga contiene un valore non quotato con
+/// backslash singolo (es. `CROSSPILOT_EXE_PATH=C:\Users\...` — `\U` non
+/// e' un escape valido per dotenvy). Risultato: warning "no .env found"
+/// fuorviante e TUTTA la config ignorata a runtime, mentre i comandi
+/// `env` (parse line-based) la vedevano. Fallback: se from_path fallisce
+/// si caricano le righe con lo STESSO parser dei CRUD — warning chiaro
+/// al posto del falso "file assente".
 pub fn load_dotenv() -> bool {
     let tried: Vec<PathBuf> = candidate_paths();
     for path in &tried {
@@ -180,7 +189,20 @@ pub fn load_dotenv() -> bool {
                 return true;
             }
             Err(e) => {
-                crate::qprintln!("[DEBUG] Failed to load .env from {}: {}", path.display(), e);
+                eprintln!(
+                    "[WARNING] .env trovato ({}) ma dotenvy non lo parsa: {}",
+                    path.display(),
+                    e
+                );
+                eprintln!("          Carico le righe KEY=VALUE con il parser tollerante.");
+                if load_dotenv_raw(path) {
+                    return true;
+                }
+                crate::qprintln!(
+                    "[DEBUG] Failed to load .env from {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -191,6 +213,39 @@ pub fn load_dotenv() -> bool {
     }
     eprintln!("Using defaults or system environment variables.");
     false
+}
+
+/// Loader .env tollerante (line-based): usa `parse_line` — lo stesso
+/// parser dei comandi `env` — e setta solo le variabili assenti dal
+/// processo (priorita' all'ambiente, come dotenvy). Ritorna true se il
+/// file e' stato letto e conteneva almeno una riga utile.
+fn load_dotenv_raw(path: &Path) -> bool {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[WARNING] impossibile leggere {}: {}", path.display(), e);
+            return false;
+        }
+    };
+    let mut loaded = 0usize;
+    for line in content.lines() {
+        if let Some((key, value)) = parse_line(line) {
+            if env::var_os(&key).is_none() {
+                env::set_var(&key, &value);
+                loaded += 1;
+            }
+        }
+    }
+    if loaded > 0 {
+        crate::qprintln!(
+            "[DEBUG] .env caricato col parser tollerante: {} chiavi da {}",
+            loaded,
+            path.display()
+        );
+        true
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,9 +766,15 @@ pub struct EnvFields {
     /// Porta WinRM (campo PORT, es. 5985 o la porta mappata 47320).
     #[arg(long)]
     pub winrm_port: Option<u16>,
-    /// Utente WinRM (campo USER).
+    /// Utente WinRM (campo USER). Accetta anche la forma dominata
+    /// `DOMINIO\utente` o `utente@dominio` scritta direttamente.
     #[arg(long)]
     pub user: Option<String>,
+    /// Dominio Windows/NT dell'utente: combinato nel campo USER come
+    /// `DOMINIO\<user>` (equivale a --user 'DOMINIO\user'). Richiede
+    /// --user (o un USER gia' presente sull'ambiente, per `env set`).
+    #[arg(long)]
+    pub domain: Option<String>,
     /// Password WinRM (campo PASS).
     #[arg(long)]
     pub pass: Option<String>,
@@ -821,6 +882,58 @@ impl EnvFields {
             out.push(("BOOTSTRAP", v.clone()));
         }
         out
+    }
+
+    /// Coppie (campo, valore) finali, con --domain riassorbito in USER
+    /// (`DOMAIN\user`). `existing_user` e' il valore USER gia' presente
+    /// sull'ambiente nel .env: permette a `env set --domain X` di
+    /// dominare l'utente corrente senza ripetere --user.
+    ///
+    /// Errori:
+    /// - --domain senza alcun utente (ne' flag ne' esistente);
+    /// - utente gia' dominato (`DOM\u` o `u@dom`): concatenare un
+    ///   secondo dominio produrrebbe un USER corrotto.
+    fn provided_pairs(&self, existing_user: Option<&str>) -> Result<Vec<(&'static str, String)>> {
+        let mut out = self.provided();
+        if self.domain.is_none() {
+            return Ok(out);
+        }
+        let domain = self.domain.as_ref().map(|d| d.trim().to_string());
+        let domain = match domain {
+            Some(d) if !d.is_empty() => d,
+            _ => bail!("--domain vuoto"),
+        };
+        // L'utente effettivo: --user esplicito, altrimenti quello gia'
+        // nel .env per l'ambiente (set --domain senza --user).
+        let user = match &self.user {
+            Some(u) => u.clone(),
+            None => match existing_user {
+                Some(u) => u.to_string(),
+                None => bail!(
+                    "--domain richiede --user (o un USER gia' impostato sull'ambiente)"
+                ),
+            },
+        };
+        if user.contains('\\') || user.contains('@') {
+            bail!(
+                "--domain: l'utente '{}' dichiara gia' un dominio (DOM\\user o user@dom)",
+                user
+            );
+        }
+        let combined = format!("{}\\{}", domain, user);
+        // Rimpiazza la coppia USER prodotta da --user, o la inserisce se
+        // l'utente veniva solo dal .env esistente.
+        let mut replaced = false;
+        for pair in out.iter_mut() {
+            if pair.0 == "USER" {
+                pair.1 = combined.clone();
+                replaced = true;
+            }
+        }
+        if !replaced {
+            out.push(("USER", combined));
+        }
+        Ok(out)
     }
 }
 
@@ -1019,21 +1132,117 @@ fn cmd_add(lines: &mut Vec<String>, name: &str, host: &str, fields: &EnvFields) 
             name
         );
     }
+    // Risolve le coppie campo=valore PRIMA di scrivere: un --domain
+    // invalido non deve lasciare un blocco "# env:" orfano nel file.
+    let pairs = fields.provided_pairs(None)?;
 
     // Blocco nuovo in coda al file: commento + righe campo.
     lines.push(format!("# env: {}", upper));
     upsert_field(lines, Some(&upper), "HOST", host);
-    for (field, value) in fields.provided() {
-        upsert_field(lines, Some(&upper), field, &value);
+    for (field, value) in &pairs {
+        upsert_field(lines, Some(&upper), field, value);
     }
+
+    // Guardrail eredita' EXE_PATH (bug report): se l'env non ha EXE_PATH
+    // proprio, var() cadra' sul default globale — che tipicamente punta
+    // al profilo dell'utente del DEFAULT (es. C:\Users\alice\...). Sul
+    // remote l'exe finirebbe nella home di un utente diverso da quello
+    // dell'ambiente: funziona (server come SYSTEM) ma e' sporco.
+    // Avvisa solo su mismatch comprovato (segmento Users\<nome> diverso
+    // dall'utente dell'env) — un path neutro tipo D:\tools e' legittimo.
+    warn_inherited_exe_path(lines, &upper, fields, &pairs);
 
     println!(
         "Ambiente '{}' creato ({} campi).",
         upper,
-        1 + fields.provided().len()
+        1 + pairs.len()
     );
     println!("Attivalo con: crosspilot env use {}", name);
     Ok(())
+}
+
+/// Nome "nudo" dell'utente: senza prefisso dominio `DOM\` e senza
+/// suffisso UPN `@dom`. Usato dal confronto col profilo in EXE_PATH.
+fn bare_user_name(user: &str) -> &str {
+    let after_domain = match user.rfind('\\') {
+        Some(pos) => &user[pos + 1..],
+        None => user,
+    };
+    match after_domain.find('@') {
+        Some(pos) => &after_domain[..pos],
+        None => after_domain,
+    }
+}
+
+/// Estrae il nome del profilo da un path Windows del tipo
+/// `[<drive>:\]Users\<nome>\...` (entrambi i separatori). None se il
+/// path non passa per una directory Users — i path neutri (D:\tools\...)
+/// non fanno scattare il warning di eredita'.
+fn exe_path_profile_user(exe_path: &str) -> Option<String> {
+    let lower = exe_path.to_lowercase();
+    let pos = match lower.find("users\\") {
+        Some(p) => p + "users\\".len(),
+        None => {
+            let p = lower.find("users/")?;
+            p + "users/".len()
+        }
+    };
+    let rest = &exe_path[pos..];
+    let end = match rest.find(['\\', '/']) {
+        Some(e) => e,
+        None => rest.len(),
+    };
+    let name = &rest[..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Warning in `env add` (bug report §8): se il nuovo env NON ha --exe-path
+/// proprio, ereditera' il CROSSPILOT_EXE_PATH del default — che puo'
+/// puntare al profilo di un ALTRO utente (C:\Users\alice\... mentre USER
+/// dell'env e' bob). Il deploy in quel caso scrive l'exe nella home
+/// sbagliata della macchina remote.
+fn warn_inherited_exe_path(
+    lines: &[String],
+    upper: &str,
+    fields: &EnvFields,
+    pairs: &[(&'static str, String)],
+) {
+    if fields.exe_path.is_some() {
+        return;
+    }
+    let map = values_map(lines);
+    let inherited = match map.get(&key_for(None, "EXE_PATH")) {
+        Some(v) => v,
+        None => return,
+    };
+    let profile = match exe_path_profile_user(inherited) {
+        Some(p) => p,
+        None => return,
+    };
+    // USER dell'env appena creato (gia' combinata con --domain).
+    let mut env_user: Option<&str> = None;
+    for pair in pairs {
+        if pair.0 == "USER" {
+            env_user = Some(pair.1.as_str());
+        }
+    }
+    let env_user = match env_user {
+        Some(u) => u,
+        None => return,
+    };
+    let bare = bare_user_name(env_user);
+    if !bare.is_empty() && !bare.eq_ignore_ascii_case(&profile) {
+        eprintln!(
+            "[WARN] env {}: EXE_PATH non impostato — sara' ereditato il default '{}' \
+             che punta al profilo di '{}' (utente env: '{}'). \
+             Valuta --exe-path 'C:\\Users\\{}\\...\\crosspilot.exe'.",
+            upper, inherited, profile, env_user, bare
+        );
+    }
 }
 
 // --- set ------------------------------------------------------------------
@@ -1054,7 +1263,14 @@ fn cmd_set(
         );
     }
 
-    let mut updates = fields.provided();
+    // USER esistente dell'env (o fallback globale): serve a --domain per
+    // dominare l'utente corrente senza ripetere --user.
+    let map = values_map(lines);
+    let existing_user = map
+        .get(&key_for(name_opt.as_deref(), "USER"))
+        .or_else(|| map.get(&key_for(None, "USER")))
+        .map(|s| s.as_str());
+    let mut updates = fields.provided_pairs(existing_user)?;
     if let Some(h) = host {
         updates.push(("HOST", h.clone()));
     }
@@ -1565,5 +1781,102 @@ mod tests {
         // Le altre chiavi non sono toccate.
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[1], "CROSSPILOT_PROD_HOST=10.0.0.1");
+    }
+
+    #[test]
+    fn domain_combine_in_user() {
+        // --user bob --domain acs -> USER=acs\bob (fix #7: dominio non
+        // piu' incollato a mano dentro --user).
+        let fields = EnvFields {
+            user: Some("bob".to_string()),
+            domain: Some("acs".to_string()),
+            ..Default::default()
+        };
+        let pairs = fields.provided_pairs(None).unwrap();
+        assert!(pairs
+            .iter()
+            .any(|(f, v)| *f == "USER" && v == "acs\\bob"));
+        // Senza --domain il comportamento e' invariato.
+        let fields2 = EnvFields {
+            user: Some("bob".to_string()),
+            ..Default::default()
+        };
+        let pairs2 = fields2.provided_pairs(None).unwrap();
+        assert!(pairs2.iter().any(|(f, v)| *f == "USER" && v == "bob"));
+    }
+
+    #[test]
+    fn domain_errors() {
+        // --domain senza utente ne' esistente -> errore chiaro.
+        let fields = EnvFields {
+            domain: Some("acs".to_string()),
+            ..Default::default()
+        };
+        assert!(fields.provided_pairs(None).is_err());
+        // Utente gia' dominato -> errore (mai DOM\DOM\user).
+        let fields = EnvFields {
+            user: Some("acs\\bob".to_string()),
+            domain: Some("corp".to_string()),
+            ..Default::default()
+        };
+        assert!(fields.provided_pairs(None).is_err());
+        let fields = EnvFields {
+            user: Some("bob@corp.local".to_string()),
+            domain: Some("corp".to_string()),
+            ..Default::default()
+        };
+        assert!(fields.provided_pairs(None).is_err());
+    }
+
+    #[test]
+    fn domain_su_user_esistente() {
+        // `env set --domain acs` con USER gia' nel .env: domina
+        // l'esistente senza ripetere --user (cmd_set passa existing_user).
+        let fields = EnvFields {
+            domain: Some("acs".to_string()),
+            ..Default::default()
+        };
+        let pairs = fields.provided_pairs(Some("bob")).unwrap();
+        assert!(pairs
+            .iter()
+            .any(|(f, v)| *f == "USER" && v == "acs\\bob"));
+    }
+
+    #[test]
+    fn exe_path_profile_e_user_nudo() {
+        // Estrae il profilo dai path Windows con entrambi i separatori.
+        assert_eq!(
+            exe_path_profile_user("C:\\Users\\gianca\\repos\\x.exe").as_deref(),
+            Some("gianca")
+        );
+        assert_eq!(
+            exe_path_profile_user("C:/Users/bob/x.exe").as_deref(),
+            Some("bob")
+        );
+        // Path neutri (nessun segmento Users\) -> nessun warning possibile.
+        assert_eq!(exe_path_profile_user("D:\\tools\\x.exe"), None);
+        assert_eq!(exe_path_profile_user("C:\\Users\\"), None);
+        // bare_user_name: DOM\user e user@dom -> user.
+        assert_eq!(bare_user_name("acs\\ferruccio"), "ferruccio");
+        assert_eq!(bare_user_name("ferruccio@acs.local"), "ferruccio");
+        assert_eq!(bare_user_name("ferruccio"), "ferruccio");
+    }
+
+    #[test]
+    fn exe_path_profile_dal_valore_env() {
+        // Il warning di cmd_add scatta solo su mismatch Users\<nome> vs
+        // USER dell'env: qui si verifica che il valore .env quotato
+        // (formato di upsert_field) passi dal parser al helper intatto.
+        let lines: Vec<String> = vec![
+            "CROSSPILOT_EXE_PATH=\"C:\\\\Users\\\\alice\\\\crosspilot.exe\"".to_string(),
+        ];
+        let map = values_map(&lines);
+        let exe = map.get(&key_for(None, "EXE_PATH")).unwrap();
+        // Profilo "alice" vs utente env "bob" -> mismatch -> warn.
+        let profile = exe_path_profile_user(exe);
+        assert_eq!(profile.as_deref(), Some("alice"));
+        assert!(!bare_user_name("bob").eq_ignore_ascii_case(profile.as_deref().unwrap()));
+        // Stesso nome -> niente warn.
+        assert!(bare_user_name("alice").eq_ignore_ascii_case(profile.as_deref().unwrap()));
     }
 }

@@ -92,11 +92,15 @@ pub const ERR_FILE_NOT_FOUND: u16 = 2;
 pub const ERR_IO: u16 = 3;
 pub const ERR_CHECKSUM_MISMATCH: u16 = 4;
 pub const ERR_PROTO: u16 = 5;
-/// Riservato, non usato.
-pub const ERR_RESERVED: u16 = 6;
+/// Codice 6: ex riservato (spec §14), ora "GET su una directory".
+/// Bug report utente: `get` su una directory remota riceveva
+/// ERR 2 "file non trovato" — fuorviante (la directory esisteva).
+/// Riusare lo slot riservato e' wire-compatibile: i client stampano
+/// comunque "ERR <code>: <messaggio>" e i server vecchi non lo emettono.
+pub const ERR_IS_DIRECTORY: u16 = 6;
 
 /// Restituisce una descrizione umana del codice di errore (per log server/client).
-/// Referenzia tutti i codici definiti, incluso ERR_RESERVED (documentato ma non usato).
+/// Referenzia tutti i codici definiti.
 pub fn error_code_description(code: u16) -> &'static str {
     match code {
         ERR_PATH_FORBIDDEN => "path vietato",
@@ -104,7 +108,7 @@ pub fn error_code_description(code: u16) -> &'static str {
         ERR_IO => "errore di I/O",
         ERR_CHECKSUM_MISMATCH => "checksum mismatch",
         ERR_PROTO => "errore di protocollo (magic/version/parametri invalidi)",
-        ERR_RESERVED => "riservato (non usato)",
+        ERR_IS_DIRECTORY => "e' una directory",
         _ => "codice errore sconosciuto",
     }
 }
@@ -1552,7 +1556,7 @@ mod tests {
     }
 
     /// Verifica che i codici di errore del protocollo siano tutti distinti e
-    /// che ERR_RESERVED = 6 (spec §14: riservato, non usato).
+    /// che ERR_IS_DIRECTORY = 6 (ex slot riservato di spec §14).
     #[test]
     fn error_codes_are_distinct_and_reserved_is_6() {
         let codes = [
@@ -1561,7 +1565,7 @@ mod tests {
             ERR_IO,
             ERR_CHECKSUM_MISMATCH,
             ERR_PROTO,
-            ERR_RESERVED,
+            ERR_IS_DIRECTORY,
         ];
         // Ogni codice deve essere nel range 1..=6 e univoco.
         for (i, &c) in codes.iter().enumerate() {
@@ -1572,8 +1576,8 @@ mod tests {
                 i
             );
         }
-        // ERR_RESERVED è esplicitamente 6 (non usato, ma documentato).
-        assert_eq!(ERR_RESERVED, 6);
+        // Il codice 6 era lo slot riservato: ora ERR_IS_DIRECTORY.
+        assert_eq!(ERR_IS_DIRECTORY, 6);
     }
 
     /// Verifica che error_code_description mappi tutti i codici noti.
@@ -1594,8 +1598,8 @@ mod tests {
             "errore di protocollo (magic/version/parametri invalidi)"
         );
         assert_eq!(
-            error_code_description(ERR_RESERVED),
-            "riservato (non usato)"
+            error_code_description(ERR_IS_DIRECTORY),
+            "e' una directory"
         );
         assert_eq!(error_code_description(999), "codice errore sconosciuto");
     }

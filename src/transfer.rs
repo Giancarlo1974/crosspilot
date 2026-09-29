@@ -142,6 +142,39 @@ fn segment_count(total_new_size: u64, segment_size: u64) -> u64 {
     (total_new_size + segment_size - 1) / segment_size
 }
 
+/// Soglia oltre la quale un transfer emette progressi percentuali:
+/// report utente — un download da ~300 MB restava muto per minuti
+/// (quiet di default). Sotto 16 MB il transfer e' comunque rapido.
+const PROGRESS_MIN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Progresso minimale per transfer grandi: una riga [DEBUG] ogni ~10%
+/// di segmenti completati (gateata da qprintln: visibile con -v).
+/// `next_pct` e' la prossima soglia da stampare (stato del chiamante).
+fn log_segment_progress(
+    tag: &str,
+    seg_index: u64,
+    seg_count: u64,
+    bytes_done: u64,
+    total_new_size: u64,
+    next_pct: &mut u64,
+) {
+    if total_new_size < PROGRESS_MIN_BYTES || seg_count == 0 {
+        return;
+    }
+    let pct = ((seg_index + 1) * 100) / seg_count;
+    if pct < *next_pct {
+        return;
+    }
+    crate::qprintln!(
+        "[transfer] {}: {} / {} byte ({}%)",
+        tag,
+        bytes_done,
+        total_new_size,
+        pct
+    );
+    *next_pct = pct + 10;
+}
+
 // ---------------------------------------------------------------------------
 // Helper I/O su file (sync, memoria contante per segmento).
 // ---------------------------------------------------------------------------
@@ -337,6 +370,8 @@ async fn sender_segment_loop(
     let count = segment_count(total_new_size, segment_size);
 
     let mut hasher = Sha256::new();
+    // Prossima soglia percentuale per il progresso (file grandi, -v).
+    let mut next_progress_pct: u64 = 10;
 
     for i in 0..count {
         // 1. Riceve la SIGNATURE del segmento base i.
@@ -402,6 +437,14 @@ async fn sender_segment_loop(
             new_segment.len(),
             delta_msg.blob.len()
         );
+        log_segment_progress(
+            "invio",
+            i,
+            count,
+            total_new_size.min(end),
+            total_new_size,
+            &mut next_progress_pct,
+        );
     }
 
     // Finalizza l'hash whole-file del file nuovo.
@@ -443,6 +486,8 @@ async fn receiver_segment_loop(
     };
 
     let mut total_written: u64 = 0;
+    // Prossima soglia percentuale per il progresso (file grandi, -v).
+    let mut next_progress_pct: u64 = 10;
 
     for i in 0..count {
         let start = i * segment_size;
@@ -532,6 +577,14 @@ async fn receiver_segment_loop(
             count,
             output.len(),
             start
+        );
+        log_segment_progress(
+            "ricezione",
+            i,
+            count,
+            total_written,
+            total_new_size,
+            &mut next_progress_pct,
         );
     }
 
@@ -931,8 +984,27 @@ pub async fn get_server(stream: &mut Link, req: GetReq, grace_only: bool) -> Res
         return Err(e.into());
     }
 
-    // Apre il file sorgente (remoto). Deve esistere.
+    // Bug fix (report utente): GET su una DIRECTORY produceva ERR 2
+    // "file non trovato" — fuorviante perche' la directory esiste.
+    // Su Windows File::open(dir) fallisce e cadeva nel ramo not-found;
+    // su Unix open(dir) RIESCE e il transfer partiva su metadata di una
+    // dir. Ora il tipo e' controllato prima dell'open: ERR_IS_DIRECTORY
+    // esplicito (il client nuovo scarica le dir ricorsivamente e non
+    // manda mai GET su dir; questo errore serve ai client vecchi).
     let src_path = Path::new(&req.path);
+    if src_path.is_dir() {
+        let err_msg = ErrMsg {
+            code: proto::ERR_IS_DIRECTORY,
+            message: format!(
+                "e' una directory, non un file: {} (i client recenti scaricano le directory ricorsivamente)",
+                req.path
+            ),
+        };
+        proto::send_err(stream, &err_msg).await?;
+        return Err(anyhow!("get su directory rifiutato: {}", req.path));
+    }
+
+    // Apre il file sorgente (remoto). Deve esistere.
     let mut new_file = match File::open(src_path) {
         Ok(f) => f,
         Err(_) => {

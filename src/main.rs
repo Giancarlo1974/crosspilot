@@ -22,6 +22,8 @@ mod verify;
 mod transfer;
 // Modulo directory sync (vedi docs/sync-spec.md).
 mod sync;
+// Download ricorsivo di directory remote (`get` dir-aware, pull.rs).
+mod pull;
 // File .crosspilotignore nel source (pattern di esclusione automatici).
 mod sync_ignore;
 // Handler server per sync (separato da sync.rs per dimensione, best-practice < 1000 righe).
@@ -168,9 +170,12 @@ mod win_job {
       crosspilot put|get|status|sync  File transfer and directory sync\n\
       crosspilot quit           Shut down the remote server\n\
       crosspilot --ephemeral -- <CMD>  Run, then server self-shuts down (agentless)\n\n\
-    The -- form passes everything after it literally to cmd.exe on the remote\n\
-    Windows host, with no shell escaping. Use single quotes around paths with\n\
-    trailing backslashes: crosspilot -- dir 'c:\\'"
+    The -- form passes the tokens to cmd.exe on the remote Windows host.\n\
+    Tokens containing spaces are auto-wrapped in double quotes — single\n\
+    quotes are NOT grouping for cmd.exe: crosspilot -- dir 'D:\\a b'\n\
+    Inside powershell -Command use SINGLE quotes for remote paths (double\n\
+    quotes are lost in PowerShell's -Command rejoin). For complex scripts\n\
+    prefer: crosspilot run script.ps1  or  powershell -EncodedCommand."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -244,11 +249,15 @@ struct Cli {
     /// Tutto ciò che segue `--` viene preso letteralmente. Su remote UNIX
     /// i token sono ri-quotati stile POSIX (il raggruppamento fatto dalla
     /// shell locale sopravvive: `crosspilot -- sh -c "sleep 8; docker ps"`
-    /// funziona). Su remote Windows i token sono uniti con spazi e inviati
-    /// a cmd.exe.
+    /// funziona). Su remote Windows i token con spazi sono ri-quotati coi
+    /// doppi apici (i single quote NON raggruppano per cmd.exe); dentro
+    /// `powershell -Command` usare single quote per i path remoti — i
+    /// doppi apici vanno persi nel re-join di PowerShell. Per script
+    /// complessi: `crosspilot run file.ps1` o `powershell -EncodedCommand`.
     ///
     /// Esempi:
     ///   crosspilot -- dir 'c:\\'
+    ///   crosspilot -- dir 'D:\\Progetti\\DELPHI SORGENTI'
     ///   crosspilot -- sh -c "sleep 8; docker ps"
     ///   crosspilot -- docker ps --format '{{.Names}} {{.Status}}'
     #[arg(
@@ -285,11 +294,13 @@ enum Commands {
         #[arg(long)]
         exec: bool,
     },
-    /// Download (get) di un file remoto verso un path locale (transfer delta stile rsync).
+    /// Download (get) di un file O directory remota verso un path locale
+    /// (transfer delta stile rsync; le directory sono scaricate
+    /// ricorsivamente: local_dst diventa il mirror del contenuto remoto).
     Get {
-        /// Path sorgente remoto (Windows, es. C:\ci\log.txt).
+        /// Path sorgente remoto (Windows, es. C:\ci\log.txt o C:\dir).
         remote_src: String,
-        /// Path destinazione locale (Linux).
+        /// Path destinazione locale (file o directory specchio).
         local_dst: String,
     },
     /// Diff read-only tra directory locale e remota (vedi docs/sync-spec.md).
@@ -604,7 +615,7 @@ async fn main() -> Result<()> {
                 println!("  crosspilot -- <COMMAND>   # Execute command remotely (Linux side)");
                 println!("  crosspilot --server       # Run in Server Mode (Windows side)");
                 println!("  crosspilot put <local> <remote>   # Upload file (rsync delta)");
-                println!("  crosspilot get <remote> <local>   # Download file (rsync delta)");
+                println!("  crosspilot get <remote> <local>   # Download file/dir (rsync delta, ricorsivo)");
                 println!("  crosspilot status <local> <remote>  # Diff directory (read-only)");
                 println!("  crosspilot sync   <local> <remote>  # Mirror directory (upload)");
                 println!("  crosspilot quit                 # Shut down the remote server");
@@ -623,9 +634,10 @@ async fn main() -> Result<()> {
                 println!("  crosspilot sql                       # database configurati");
                 println!("  crosspilot sql <DB> <file.sql|-|-e 'query'>  # query read-only");
                 println!();
-                println!("The -- form passes everything after it literally to cmd.exe on the");
-                println!("remote Windows host, with no shell escaping. Use single quotes around");
-                println!("paths with trailing backslashes.");
+                println!("The -- form passes the tokens to cmd.exe on the remote Windows host.");
+                println!("Tokens containing spaces are auto-wrapped in double quotes (single");
+                println!("quotes are NOT grouping for cmd.exe). Inside powershell -Command use");
+                println!("single quotes for remote paths; for complex scripts: run file.ps1");
                 println!();
                 println!("Examples:");
                 println!("  1. Check remote IP:");
@@ -646,8 +658,9 @@ async fn main() -> Result<()> {
                 println!("  5. Upload a file:");
                 println!("     crosspilot put ./app.exe C:\\ci\\app.exe");
                 println!();
-                println!("  6. Download a file:");
+                println!("  6. Download a file or directory (recursive pull):");
                 println!("     crosspilot get  C:\\ci\\log.txt ./log.txt");
+                println!("     crosspilot get  C:\\ci\\artifacts ./artifacts");
                 println!();
                 println!("  7. Diff directory (status):");
                 println!("     crosspilot status ./artifacts C:\\ci\\artifacts");
@@ -781,6 +794,13 @@ async fn server_mode(port: u16) -> Result<()> {
     // Self-describing: (ri)scrive crosspilot.ver (ts + hash exe + sidecar)
     // e ripulisce gli artefatti staged/residui dell'auto-update via TCP.
     update::self_describe();
+
+    // Warm-up della cache INFO_RES: l'hash dell'exe (costoso su binari
+    // grandi) si paga qui, non dentro il budget INFO_TIMEOUT del primo
+    // client che chiede self-describe (bug e2e: debug build ~250MB ->
+    // ~12s di hashing -> il client scadeva a 5s e droppava -> Broken pipe
+    // lato server + fetch() cacheava None per sempre).
+    server_info::warm_up();
 
     // TLS 1.3 post-quantum (spec tls-pq): cert self-signed generato alla
     // prima esecuzione (crosspilot-server.{key,crt} accanto all'exe) e
@@ -1576,7 +1596,7 @@ async fn handle_file_mode(mut socket: tls::Link, grace_only: bool) -> Result<()>
                         res.exe_path,
                         res.build_ts
                     );
-                    proto::send_info_res(&mut socket, &res).await?;
+                    proto::send_info_res(&mut socket, res).await?;
                 }
                 Err(e) => {
                     let err = proto::ErrMsg {
@@ -1986,10 +2006,12 @@ async fn client_transfer_put(
         ephemeral_quit_best_effort().await;
     }
     result?;
-    crate::qprintln!(
-        "put: trasferimento completato ({} -> {})",
-        local_src,
-        remote_dst
+    // Riga di conferma SEMPRE visibile (println = risultato, non
+    // diagnostica — vedi bug report sul download silenzioso in quiet).
+    let bytes = std::fs::metadata(local_src).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "put: trasferimento completato ({} -> {}, {} byte)",
+        local_src, remote_dst, bytes
     );
     Ok(())
 }
@@ -2018,21 +2040,86 @@ async fn remote_chmod_exec(remote_dst: &str) {
     }
 }
 
-/// Lato client: GET (download) di un file remoto verso un path locale.
-/// Stabilisce la connessione, handshake, poi delega a transfer::get_client.
-/// Exit code: 0 ok, 1 errore protocollo/IO, 2 path invalido.
+/// Lato client: GET (download) di un path remoto verso un path locale.
+/// Stabilisce la connessione, handshake, poi:
+/// - remote FILE      -> transfer::get_client (delta rsync, invariato);
+/// - remote DIRECTORY -> pull ricorsivo (pull.rs): LIST + mkdir locali +
+///   GET per file (bug report: `get` su directory rispondeva ERR 2
+///   "file non trovato" pur essendo la dir esistente).
+///   La stessa connessione del probe e' riusata dalla sessione di pull.
+///   Exit code: 0 ok, 1 errore protocollo/IO (o errori per-file nel pull),
+///   2 path invalido.
 async fn client_transfer_get(remote_src: &str, local_dst: &str, quit_after: bool) -> Result<()> {
     let mut socket = connect_and_handshake().await?;
-    let result = transfer::get_client(&mut socket, remote_src, local_dst).await;
+
+    // Probe del tipo remoto: LIST non-ricorsiva del parent (la stessa
+    // risoluzione di `sync <file>`: '/' finale o dir esistente -> Dir;
+    // inesistente/file -> File e l'eventuale errore emerge alla GET).
+    let resolved = sync::resolve_remote_file_dest(&mut socket, remote_src).await;
+    let remote_dir = match resolved {
+        // Dir(porta il path NORMALIZZATO, senza il separatore finale).
+        Ok(sync::RemoteFileDest::Dir(dir)) => Some(dir),
+        Ok(sync::RemoteFileDest::File(_)) => None,
+        Err(e) => {
+            // Probe LIST non riuscito: un server legacy (pre-LIST) risponde
+            // ERR_PROTO. Compat: NON e' fatale — si ricade sul GET singolo
+            // come faceva il client vecchio. La connessione del probe puo'
+            // essere gia' chiusa dal server -> reconnect fresco.
+            crate::qprintln!(
+                "[DEBUG] get: probe LIST fallita ({}) — fallback GET singolo",
+                e
+            );
+            socket = connect_and_handshake().await?;
+            None
+        }
+    };
+
+    // Remote file (o probe fallita su server legacy): GET singolo.
+    let Some(remote_dir) = remote_dir else {
+        let result = transfer::get_client(&mut socket, remote_src, local_dst).await;
+        if quit_after {
+            ephemeral_quit_best_effort().await;
+        }
+        result?;
+        // Riga di conferma SEMPRE visibile (println = risultato
+        // dell'operazione, non diagnostica — bug report: download da
+        // 300+ MB terminava a schermo vuoto in quiet di default).
+        let bytes = std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "get: trasferimento completato ({} -> {}, {} byte)",
+            remote_src, local_dst, bytes
+        );
+        return Ok(());
+    };
+
+    // Remote e' una directory -> download ricorsivo. local_dst E' la
+    // directory specchio del contenuto remoto (semantica rovesciata di
+    // `sync <local> <remote>`). `remote_dir` e' il path normalizzato.
+    let local_path = std::path::Path::new(local_dst);
+    if local_path.exists() && !local_path.is_dir() {
+        if quit_after {
+            ephemeral_quit_best_effort().await;
+        }
+        eprintln!(
+            "[ERROR] get: la destinazione locale esiste e non e' una directory: {}",
+            local_dst
+        );
+        std::process::exit(2);
+    }
+    // OS remoto per il join dei path (INFO_RES poi env).
+    let remote_unix = remote_is_unix_resolved().await;
+    let mut session = sync::SyncSession::new_with_link(socket, || async {
+        connect_and_handshake().await
+    });
+    let result = pull::pull_remote_dir(&mut session, &remote_dir, local_path, remote_unix).await;
     if quit_after {
         ephemeral_quit_best_effort().await;
     }
-    result?;
-    crate::qprintln!(
-        "get: trasferimento completato ({} -> {})",
-        remote_src,
-        local_dst
-    );
+    let report = result?;
+    pull::print_pull_report(&report, &remote_dir, local_path);
+    if !report.errors.is_empty() {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -2153,10 +2240,9 @@ async fn client_sync(
             ephemeral_quit_best_effort().await;
         }
         put_result?;
-        crate::qprintln!(
+        println!(
             "sync file: trasferimento completato ({} -> {})",
-            local_dir,
-            remote_dst
+            local_dir, remote_dst
         );
         return Ok(());
     }

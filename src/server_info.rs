@@ -23,11 +23,41 @@ use crate::{bootstrap, envs, path, proto, update, version};
 // Lato server: costruzione del payload INFO_RES.
 // ---------------------------------------------------------------------------
 
+/// Cache dell'INFO_RES: l'exe in esecuzione non cambia per la vita del
+/// processo -> l'hash e' calcolato UNA sola volta.
+///
+/// Bug trovato in e2e (debug build ~250 MB): l'hash a OGNI INFO_REQ
+/// impiegava ~12s > INFO_TIMEOUT (5s) del client -> il client dropava
+/// e il server loggava "Broken pipe"; peggio, fetch() cacheava il None
+/// per tutto il processo e `remote_is_unix_resolved` restava sempre
+/// sul fallback env (remote unix visto come windows -> quoting cmd).
+/// Con la cache (piu' warm-up all'avvio) ogni INFO_REQ risponde subito.
+static INFO_RES: std::sync::OnceLock<proto::InfoRes> = std::sync::OnceLock::new();
+
 /// Payload di self-describe (lato server): OS compile-time, path
 /// canonico dell'exe in esecuzione, BUILD_TS e SHA-256 (hex minuscolo)
 /// dell'exe — i dati che un .ver scritto "a posteriori" non puo'
 /// garantire perche' l'exe potrebbe essere stato sostituito a mano.
-pub(crate) fn info_res_payload() -> Result<proto::InfoRes> {
+/// Risultato cacheato: sicuro e veloce da riusare a ogni INFO_REQ.
+pub(crate) fn info_res_payload() -> Result<&'static proto::InfoRes> {
+    if let Some(res) = INFO_RES.get() {
+        return Ok(res);
+    }
+    let built = build_info_res()?;
+    Ok(INFO_RES.get_or_init(|| built))
+}
+
+/// Warm-up della cache INFO_RES all'avvio del server: la prima
+/// interrogazione client trova la risposta gia' pronta (il costo dell'
+/// hash si paga in init, non dentro il budget INFO_TIMEOUT del client).
+pub(crate) fn warm_up() {
+    if let Err(e) = info_res_payload() {
+        crate::qprintln!("[DEBUG] server_info warm-up fallito: {}", e);
+    }
+}
+
+/// Costruisce il payload INFO_RES (eseguito una volta, poi cacheato).
+fn build_info_res() -> Result<proto::InfoRes> {
     let exe = std::env::current_exe().context("current_exe")?;
     // canonicalize risolve symlink e '.' — il path e' la verita' del
     // filesystem, non quella dichiarata in EXE_PATH.
@@ -452,7 +482,7 @@ mod tests {
         assert_eq!(res.build_ts, version::BUILD_TS);
         assert_eq!(res.exe_sha256.len(), 64);
         // Roundtrip completo: encode -> decode -> ServerInfo.
-        let payload = proto::encode_info_res(&res).unwrap();
+        let payload = proto::encode_info_res(res).unwrap();
         let raw = proto::decode_info_res(&payload).unwrap();
         let info = version::ServerInfo::from_info_res(&raw).unwrap();
         assert_eq!(info.exe_path, res.exe_path);
