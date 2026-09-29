@@ -107,6 +107,8 @@ fallback for missing fields. Manage them directly from the tool:
 ```bash
 crosspilot env add prod --host 10.0.0.5 --user admin --pass secret \
     --winrm-port 5985 --exe-path 'C:\tools\crosspilot.exe'
+crosspilot env add delphi --host 10.0.0.9 --user ferruccio --domain acs \
+    --pass secret            # domain: USER becomes ACS\ferruccio
 crosspilot env list            # list environments (* = active)
 crosspilot env show prod       # effective config (password masked)
 crosspilot env set prod --host 10.0.0.9
@@ -120,17 +122,68 @@ You can also override the selection for a single run without editing the file:
 ## 5. Run Windows commands from Linux
 
 Once the client is installed, use it to run commands on the Windows side.
-Everything after `--` is passed literally to `cmd.exe` on the remote host:
+Everything after `--` is sent to `cmd.exe` on the remote host; tokens
+containing spaces are automatically re-wrapped in **double** quotes, because
+single quotes are NOT grouping characters for `cmd.exe`:
 
 ```bash
 crosspilot -- ipconfig
+crosspilot -- dir 'C:\'
+crosspilot -- dir 'D:\Progetti\DELPHI SORGENTI'   # space-safe
 ```
 
-Or run any other command, for example:
+PowerShell note: inside `powershell -Command`, quote remote paths with
+**single** quotes — double quotes are lost when PowerShell re-joins the
+command string:
 
 ```bash
-crosspilot -- dir 'C:\'
+crosspilot -- powershell -Command "Compress-Archive -LiteralPath 'D:\dir with space' -DestinationPath 'D:\out.zip' -Force"
 ```
+
+For anything more complex, upload and run a script file instead — it skips
+the quoting layers entirely (also works for `.ps1` via `powershell -File`):
+
+```bash
+crosspilot run ./collect.ps1
+```
+
+On **Linux/Unix remotes** the tokens after `--` are re-quoted POSIX-style, so
+grouping made by your local shell survives the trip:
+
+```bash
+crosspilot -- sh -c "sleep 8; docker ps"
+crosspilot -- docker ps --format '{{.Names}} {{.Status}}'
+```
+
+The remote exit code becomes CrossPilot's own exit code. Connection/debug
+noise is suppressed **by default** — pass `-v`/`--verbose` to see it:
+
+```bash
+crosspilot -- sh -c "exit 7"; echo $?    # prints 7, no debug output
+crosspilot -v -- docker ps               # shows [DEBUG]/Connecting... on stderr
+```
+
+## 5.1 Files, scripts and directories
+
+```bash
+# Upload a file (delta transfer, rsync-style); --exec makes it executable on unix remotes
+crosspilot put ./app /opt/app/app --exec
+
+# Run a local script remotely: upload to a temp path, execute, clean up
+crosspilot run ./deploy.sh --env prod
+
+# Mirror a directory (single connection, tolerant of unreadable subdirs)
+crosspilot sync deploy/ /var/docker/ --exclude 'data/postgres'
+crosspilot sync single-file.txt /var/docker/   # a single file works too
+
+# Download: get a file, or a whole directory recursively (pull)
+crosspilot get 'D:\ci\log.txt' ./log.txt
+crosspilot get 'D:\Progetti\SpeedyCall_XE2' ./SpeedyCall_XE2   # dir -> recursive pull
+```
+
+`sync` skips unreadable subdirectories with a warning instead of aborting; in
+that case `--delete` is suspended for safety (rsync semantics: an incomplete
+walk must never delete unseen content). See `docs/sync-spec.md`.
 
 ## 6. Support the project (aka "The Star Section" ⭐)
 
