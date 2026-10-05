@@ -55,7 +55,7 @@ base64 = "0.23"
 # default-features=false: i default attivano aws-lc-rs (cmake/C++, rischio
 # cross-compile) e flate2; "ring" e' il backend crypto gia' compilato per
 # musl via rustls, "rsa" serve per autenticare chiavi id_rsa esistenti.
-russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.64.0", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "3.0.0"
 
 # Subcomando `sql` (query MySQL read-only, connessione diretta locale):
