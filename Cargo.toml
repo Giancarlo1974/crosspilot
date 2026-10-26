@@ -18,7 +18,7 @@ sha2 = "0.11"
 # Sostituisce evil-winrm (shell Ruby interattiva) che non gestiva lo stdin piped
 # in modo deterministico, causando il bug "server did not come up within 30s".
 # Vedi bootstrap_server() in src/bootstrap.rs per i dettagli del bug.
-winrm-rs = "1.2.2"
+winrm-rs = "2.0.0"
 
 # Canale di bootstrap alternativo SMB/SCM per remote Windows senza WinRM
 # (spec docs/smb-scm-bootstrap-spec.md): smb2-client = trasporto SMB2
